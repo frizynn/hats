@@ -159,22 +159,26 @@ fn a_rate_limit_error_moves_the_default_without_limit_data() {
 /// Ends a turn of `label`'s session with a rate limit error, as Claude Code's
 /// `StopFailure` hook does.
 fn rate_limited(sb: &Sandbox, label: &str) -> std::process::Child {
-    let mut child = sb
-        .cmd(&["hook", "stop"])
+    let mut child = waiting_hook(sb, label);
+    release(&mut child, label);
+    child
+}
+
+/// A `StopFailure` hook started but still waiting for its input.
+fn waiting_hook(sb: &Sandbox, label: &str) -> std::process::Child {
+    sb.cmd(&["hook", "stop"])
         .env("CLAUDE_CONFIG_DIR", sb.claude_dir(label))
         .stdin(Stdio::piped())
         .spawn()
-        .unwrap();
+        .unwrap()
+}
+
+fn release(child: &mut std::process::Child, label: &str) {
     let input = format!(
         r#"{{"session_id":"s-{label}","hook_event_name":"StopFailure","error":"rate_limit"}}"#
     );
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
-    child
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(input.as_bytes()).unwrap();
 }
 
 #[test]
@@ -226,6 +230,42 @@ fn a_rate_limit_counts_as_full_until_the_status_line_says_otherwise() {
     assert_eq!(listed(&sb, "side")["usedPercent"], 12.0);
     sb.repaint("work", 96.0, 0.0);
     assert_eq!(sb.current(), "side");
+}
+
+#[test]
+fn hooks_failing_at_the_same_moment_move_the_default_once() {
+    let sb = three_accounts();
+    // As large as a real `.claude.json`, so deciding takes as long as it does.
+    for label in ["work", "side", "spare"] {
+        let path = sb.claude_dir(label).join(".claude.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        config["projects"] = (0..700)
+            .map(|i| (format!("/home/user/src/p{i:04}"), serde_json::json!({"history": [], "lastCost": 1.5, "allowedTools": ["Bash", "Read", "Edit"]})))
+            .collect::<serde_json::Map<_, _>>()
+            .into();
+        std::fs::write(&path, config.to_string()).unwrap();
+    }
+    sb.repaint("side", 10.0, 10.0);
+    sb.repaint("spare", 20.0, 20.0);
+    let rounds = 10;
+    for _ in 0..rounds {
+        sb.ok(&["use", "work"]);
+        // Sixteen sessions of `work` hit the limit together: every hook reads
+        // its input at the same moment.
+        let mut hooks: Vec<_> = (0..16).map(|_| waiting_hook(&sb, "work")).collect();
+        for hook in &mut hooks {
+            release(hook, "work");
+        }
+        for mut hook in hooks {
+            assert!(hook.wait().unwrap().success());
+        }
+    }
+    let moves = reasons(&sb)
+        .into_iter()
+        .filter(|(_, reason)| reason == "limit")
+        .count();
+    assert_eq!(moves, rounds, "one move per round");
 }
 
 #[test]
