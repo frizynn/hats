@@ -19,7 +19,7 @@ use crate::account::{DEFAULT_LABEL, Harness};
 use crate::auto::{self, Status};
 use crate::config::{self, Config, Mode, Relaunch, Strategy};
 use crate::limits::unix_secs;
-use crate::policy::{self, Reason};
+use crate::policy;
 use crate::store::Store;
 use crate::view;
 
@@ -430,7 +430,7 @@ impl<'a> App<'a> {
             ));
             return Step::Redraw;
         };
-        match auto::make_default(self.store, &account, &id, Reason::Manual, SystemTime::now()) {
+        match auto::choose(self.store, &account, &id, SystemTime::now()) {
             Ok(()) => self.info(format!(
                 "New {} sessions use '{}'.",
                 account.harness.name(),
@@ -1020,7 +1020,7 @@ mod tests {
         let work = account(&store, "work", Some(42.0));
         account(&store, "personal", None);
         let id = work.provider_id(&store).unwrap().unwrap();
-        auto::make_default(&store, &work, &id, Reason::Manual, SystemTime::now()).unwrap();
+        auto::choose(&store, &work, &id, SystemTime::now()).unwrap();
 
         let mut app = App::new(&store, true);
         let screen = text(&app);

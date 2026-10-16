@@ -98,9 +98,14 @@ pub fn stop(
         if let Some(id) = account.provider_id(store).map_err(|e| e.to_string())? {
             limits::mark_limited(store, &account, &id, now).map_err(|e| e.to_string())?;
         }
-        if store.current(Harness::Claude)?.label == account.label {
-            auto::check_default(store, Harness::Claude, config, now, Some(Reason::Limit))?;
-        }
+        auto::check_default(
+            store,
+            Harness::Claude,
+            config,
+            now,
+            Some(Reason::Limit),
+            Some(&account.label),
+        )?;
     }
     supervisor::mark_idle(store, &input.session_id, rate_limited, now).map_err(|e| e.to_string())
 }

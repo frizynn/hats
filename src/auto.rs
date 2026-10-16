@@ -92,19 +92,25 @@ pub fn next_account<'a>(
 }
 
 /// In auto mode, moves the default account off one that passed the
-/// threshold, or off one `forced` says must go. Returns the new default when
-/// it changed.
+/// threshold, or off one `forced` says must go; with `only_from`, only while
+/// that account is still the default. Returns the new default when it
+/// changed.
 pub fn check_default(
     store: &Store,
     harness: Harness,
     config: &HarnessConfig,
     now: SystemTime,
     forced: Option<Reason>,
+    only_from: Option<&str>,
 ) -> Result<Option<(Account, Reason)>, String> {
     if config.mode != Mode::Auto {
         return Ok(None);
     }
+    let _lock = store.lock_current().map_err(|e| e.to_string())?;
     let current = store.current(harness)?;
+    if only_from.is_some_and(|from| from != current.label) {
+        return Ok(None);
+    }
     let statuses = statuses(store, harness, config)?;
     let Some((next, reason)) = next_account(&statuses, &current.label, config, now, forced) else {
         return Ok(None);
@@ -114,8 +120,15 @@ pub fn check_default(
     Ok(Some((next.account.clone(), reason)))
 }
 
-/// Makes `account` the default for new sessions and records why.
-pub fn make_default(
+/// The user's choice of default account, recorded as `manual`.
+pub fn choose(store: &Store, account: &Account, id: &str, now: SystemTime) -> Result<(), String> {
+    let _lock = store.lock_current().map_err(|e| e.to_string())?;
+    make_default(store, account, id, Reason::Manual, now)
+}
+
+/// Makes `account` the default for new sessions and records why. The caller
+/// holds `lock_current`.
+fn make_default(
     store: &Store,
     account: &Account,
     id: &str,

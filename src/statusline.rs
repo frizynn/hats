@@ -92,9 +92,14 @@ fn apply(
         return Ok(());
     };
     limits::save(store, account, &id, windows, now).map_err(|e| e.to_string())?;
-    if store.current(Harness::Claude)?.label == account.label {
-        auto::check_default(store, Harness::Claude, config, now, None)?;
-    }
+    auto::check_default(
+        store,
+        Harness::Claude,
+        config,
+        now,
+        None,
+        Some(&account.label),
+    )?;
     if let Some(session) = session {
         supervisor::request_move(store, config, account, session, now)?;
     }

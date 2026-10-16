@@ -24,7 +24,6 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
 use account::{Account, DEFAULT_LABEL, Harness};
 use config::Config;
-use policy::Reason;
 use store::Store;
 
 const EXAMPLES: &str = "\
@@ -253,7 +252,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             let id = account
                 .provider_id(&store)?
                 .ok_or_else(|| not_logged_in(&account))?;
-            auto::make_default(&store, &account, &id, Reason::Manual, SystemTime::now())?;
+            auto::choose(&store, &account, &id, SystemTime::now())?;
             println!("New {} sessions use '{label}'.", harness.name());
         }
         Cmd::Run { label, args } => {
@@ -357,7 +356,7 @@ fn launch(
     let settings = config.for_harness(harness);
     if label.is_none() {
         // A new session should not start on an account that is already spent.
-        auto::check_default(store, harness, settings, SystemTime::now(), None)?;
+        auto::check_default(store, harness, settings, SystemTime::now(), None, None)?;
     }
     let account = chosen(store, harness, label)?;
     // Picks up shared files the user created since the account was added.
