@@ -63,6 +63,22 @@ fn add_rejects_bad_and_duplicate_labels() {
 }
 
 #[test]
+fn run_links_shared_entries_created_after_add() {
+    let sb = Sandbox::new();
+    sb.ok(&["add", "work"]);
+    let claude = sb.home.join(".claude");
+    fs::write(claude.join("CLAUDE.md"), "# rules\n").unwrap();
+
+    sb.ok(&["run", "work"]);
+
+    let dir = sb.data().join("claude/work");
+    assert_eq!(
+        fs::read_link(dir.join("CLAUDE.md")).unwrap(),
+        claude.join("CLAUDE.md")
+    );
+}
+
+#[test]
 fn run_execs_the_harness_with_the_account_directory() {
     let sb = Sandbox::new();
     sb.ok(&["add", "work"]);
