@@ -9,6 +9,7 @@ use std::fs;
 use std::io::Read;
 use std::os::fd::FromRawFd;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -83,6 +84,8 @@ fn run_in_pty(sb: &Sandbox, fake: &str, during: impl FnOnce(u32)) -> Run {
         .stdin(Stdio::from(slave.try_clone().unwrap()))
         .stdout(Stdio::from(slave.try_clone().unwrap()))
         .stderr(Stdio::from(slave))
+        // Its own process group, so a timeout can stop the agent with it.
+        .process_group(0)
         .spawn()
         .unwrap();
 
@@ -100,7 +103,8 @@ fn run_in_pty(sb: &Sandbox, fake: &str, during: impl FnOnce(u32)) -> Run {
             break status;
         }
         if started.elapsed() > Duration::from_secs(20) {
-            child.kill().unwrap();
+            // SAFETY: the process group created for this child.
+            unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
             panic!(
                 "hats run did not finish; log:\n{}",
                 fs::read_to_string(&log).unwrap_or_default()
