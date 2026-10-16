@@ -209,3 +209,132 @@ fn refuses_invalid_settings_without_touching_them() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("not valid JSON"));
     assert_eq!(fs::read_to_string(settings).unwrap(), "{ not json");
 }
+
+fn setup(sb: &Sandbox, args: &[&str]) -> String {
+    let out = sb.cmd(args).env("SHELL", "/bin/zsh").output().unwrap();
+    common::assert_success(&out, args);
+    String::from_utf8(out.stdout).unwrap()
+}
+
+fn backups(sb: &Sandbox) -> Vec<String> {
+    let mut names: Vec<_> = fs::read_dir(sb.home.join(".claude"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.starts_with("settings.json.hats-backup-"))
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn undo_puts_back_the_exact_bytes() {
+    let sb = Sandbox::new();
+    let settings = sb.home.join(".claude/settings.json");
+    // Not the layout serde_json writes: four spaces, inline arrays, no final newline.
+    let original = "{\n    \"model\": \"opus\",\n    \"env\": {\"A\": \"1\"},\n    \"permissions\": {\"allow\": [\"Bash(ls)\", \"Read\"]},\n    \"cleanupPeriodDays\": 1.0\n}";
+    fs::write(&settings, original).unwrap();
+    let rc = sb.home.join(".zshrc");
+    fs::write(&rc, "export EDITOR=vi").unwrap();
+
+    setup(&sb, &["setup"]);
+    setup(&sb, &["setup", "--undo"]);
+
+    assert_eq!(fs::read_to_string(&settings).unwrap(), original);
+    assert_eq!(fs::read_to_string(&rc).unwrap(), "export EDITOR=vi");
+}
+
+#[test]
+fn a_backup_is_never_overwritten() {
+    let (sb, settings, _) = setup_sandbox();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // Whatever second setup runs in, a backup with that name already exists.
+    for stamp in now - 2..now + 60 {
+        fs::write(
+            sb.home
+                .join(format!(".claude/settings.json.hats-backup-{stamp}")),
+            format!("older {stamp}"),
+        )
+        .unwrap();
+    }
+    setup(&sb, &["setup"]);
+    setup(&sb, &["setup", "--undo"]);
+
+    for stamp in now - 2..now + 60 {
+        let path = sb
+            .home
+            .join(format!(".claude/settings.json.hats-backup-{stamp}"));
+        assert_eq!(fs::read_to_string(path).unwrap(), format!("older {stamp}"));
+    }
+    let originals = backups(&sb)
+        .iter()
+        .filter(|n| fs::read_to_string(sb.home.join(".claude").join(n)).unwrap() == ORIGINAL)
+        .count();
+    assert_eq!(originals, 1, "{:?}", backups(&sb));
+    assert_eq!(fs::read_to_string(settings).unwrap(), ORIGINAL);
+}
+
+#[test]
+fn undo_restores_the_status_line_without_its_own_state() {
+    let (sb, settings, _) = setup_sandbox();
+    setup(&sb, &["setup"]);
+    fs::remove_dir_all(sb.home.join(".local/state/hats")).unwrap();
+    setup(&sb, &["setup", "--undo"]);
+    assert_eq!(
+        json(&settings)["statusLine"]["command"],
+        "bun /opt/demo/status.ts | head -1"
+    );
+}
+
+#[test]
+fn setup_from_a_moved_binary_updates_its_entries() {
+    let (sb, settings, rc) = setup_sandbox();
+    setup(&sb, &["setup"]);
+    let moved = sb.home.join("bin2/hats");
+    fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_hats"), &moved).unwrap();
+    let run_moved = |args: &[&str]| {
+        let mut cmd = sb.cmd(args);
+        cmd.get_program();
+        let out = std::process::Command::new(&moved)
+            .args(args)
+            .env_clear()
+            .envs(cmd.get_envs().filter_map(|(k, v)| Some((k, v?))))
+            .env("SHELL", "/bin/zsh")
+            .output()
+            .unwrap();
+        common::assert_success(&out, args);
+    };
+    run_moved(&["setup"]);
+
+    let v = json(&settings);
+    let quoted = format!("'{}'", moved.display());
+    for event in ["SessionStart", "UserPromptSubmit", "Stop", "StopFailure"] {
+        let commands: Vec<&str> = v["hooks"][event]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap())
+            .map(|h| h["command"].as_str().unwrap())
+            .filter(|c| c.contains("hats"))
+            .collect();
+        assert_eq!(commands.len(), 1, "{event}: {commands:?}");
+        assert!(commands[0].starts_with(&quoted), "{event}: {commands:?}");
+    }
+    assert_eq!(
+        v["statusLine"]["command"],
+        format!("{quoted} statusline -- /bin/sh -c 'bun /opt/demo/status.ts | head -1'")
+    );
+    let rc_text = fs::read_to_string(&rc).unwrap();
+    assert_eq!(rc_text.matches("# >>> hats >>>").count(), 1, "{rc_text}");
+    assert!(
+        rc_text.contains(&format!("claude() {{ {quoted} run")),
+        "{rc_text}"
+    );
+
+    run_moved(&["setup", "--undo"]);
+    assert_eq!(fs::read_to_string(&settings).unwrap(), ORIGINAL);
+    assert_eq!(fs::read_to_string(&rc).unwrap(), "export EDITOR=vi\n");
+}
