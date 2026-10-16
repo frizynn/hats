@@ -490,3 +490,32 @@ fn help_describes_the_label_argument() {
         assert!(help.contains("Account label"), "{command}: {help}");
     }
 }
+
+#[test]
+fn concurrent_runs_link_a_new_shared_entry_once() {
+    let sb = Sandbox::new();
+    sb.ok(&["add", "work"]);
+    // A shared entry that appeared after `add`: every run tries to link it.
+    fs::write(sb.home.join(".claude/CLAUDE.md"), "# rules\n").unwrap();
+    let children: Vec<_> = (0..16)
+        .map(|_| {
+            sb.cmd(&["run", "work"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for child in children {
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    assert_eq!(
+        fs::read_link(sb.claude_dir("work").join("CLAUDE.md")).unwrap(),
+        sb.home.join(".claude/CLAUDE.md")
+    );
+}
