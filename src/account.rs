@@ -246,11 +246,12 @@ impl Account {
     /// Stable id of the logged-in provider account, or `None` before login.
     /// Reads only identity fields, never credentials.
     pub fn provider_id(&self, store: &Store) -> io::Result<Option<String>> {
-        let key = match self.harness {
-            Harness::Claude => claude_identity(&self.claude_global_config(store))?,
-            Harness::Codex => codex_identity(&self.dir.join("sessions"))?,
-        };
-        Ok(key.map(|key| short_hash(&key)))
+        match self.harness {
+            Harness::Claude => claude_id(&self.claude_global_config(store)),
+            Harness::Codex => {
+                Ok(codex_identity(&self.dir.join("sessions"))?.map(|k| short_hash(&k)))
+            }
+        }
     }
 
     /// Claude Code keeps its global config at `$CLAUDE_CONFIG_DIR/.claude.json`,
@@ -309,6 +310,12 @@ struct ClaudeOauthAccount {
     account_uuid: String,
     #[serde(rename = "organizationUuid", default)]
     organization_uuid: Option<String>,
+}
+
+/// The registry's account id of the login in a Claude Code global config
+/// (`.claude.json`, or a copy of it), or `None` before login.
+pub fn claude_id(global_config: &Path) -> io::Result<Option<String>> {
+    Ok(claude_identity(global_config)?.map(|key| short_hash(&key)))
 }
 
 /// `"<accountUuid>:<organizationUuid>"`: one login can belong to several

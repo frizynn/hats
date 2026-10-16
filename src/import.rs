@@ -1,7 +1,8 @@
 //! `hats import claude-swap`: takes claude-swap's account order, aliases and
-//! switching settings. It reads only `sequence.json` and `settings.json`;
-//! claude-swap's stored tokens stay where they are, and each account signs in
-//! again through the harness's own login.
+//! switching settings. It reads `sequence.json`, `settings.json` and the
+//! identity in claude-swap's copies of each account's `.claude.json`; its
+//! stored tokens stay where they are, and each account signs in again
+//! through the harness's own login, except the one already in `~/.claude`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -9,7 +10,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::account::{Account, Harness, validate_label};
+use crate::account::{self, Account, DEFAULT_LABEL, Harness, validate_label};
 use crate::config;
 use crate::store::Store;
 
@@ -64,6 +65,12 @@ pub fn claude_swap(store: &Store, from: &Path) -> Result<(), String> {
         }
     }
 
+    // The login already in ~/.claude is one of claude-swap's accounts: it
+    // stays `default` instead of signing in to it a second time.
+    let mut signed_in = Account::default_for(Harness::Claude, store)
+        .provider_id(store)
+        .ok()
+        .flatten();
     let mut order = Vec::new();
     let mut to_sign_in = Vec::new();
     let mut skipped = Vec::new();
@@ -78,6 +85,15 @@ pub fn claude_swap(store: &Store, from: &Path) -> Result<(), String> {
             .map_or_else(|| format!("account-{n}"), str::to_owned);
         if swap.disabled {
             skipped.push(format!("{label} ({})", swap.email));
+            continue;
+        }
+        if signed_in.is_some() && swap_account_id(from, n, &swap.email) == signed_in {
+            println!(
+                "Kept    {DEFAULT_LABEL}: claude-swap's {label} ({}) is already signed in at ~/.claude",
+                swap.email
+            );
+            order.push(DEFAULT_LABEL.to_owned());
+            signed_in = None;
             continue;
         }
         let account = Account::managed(Harness::Claude, &label, store)?;
@@ -128,4 +144,13 @@ pub fn claude_swap(store: &Store, from: &Path) -> Result<(), String> {
         "\nWhen they are all signed in, stop `cswap auto` and run `cswap purge` to delete claude-swap's stored tokens."
     );
     Ok(())
+}
+
+/// The account id in claude-swap's copy of an account's `.claude.json`. Its
+/// credentials folder is never read.
+fn swap_account_id(from: &Path, number: u32, email: &str) -> Option<String> {
+    let copy = from
+        .join("configs")
+        .join(format!(".claude-config-{number}-{email}.json"));
+    account::claude_id(&copy).ok().flatten()
 }
