@@ -5,8 +5,9 @@
 //! `config.toml` is configuration (`$XDG_CONFIG_HOME/hats`).
 
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 use crate::account::{Account, DEFAULT_LABEL, Harness, create_private_dir};
@@ -75,6 +76,20 @@ impl Store {
             Err(e) => return Err(e.to_string()),
         };
         Account::find(harness, &label, self)
+    }
+
+    /// Held while a process reads the current account, decides and writes the
+    /// change: hooks that fire at the same moment then move it once.
+    pub fn lock_current(&self) -> io::Result<File> {
+        self.ensure_state()?;
+        let lock = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(self.state.join(".current.lock"))?;
+        lock.lock()?;
+        Ok(lock)
     }
 
     pub fn set_current(&self, account: &Account) -> io::Result<()> {

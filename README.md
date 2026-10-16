@@ -14,11 +14,16 @@ session starts with and, if you want, moves to another account when one gets
 close to its plan limit.
 
 ```
-$ hats
-CLAUDE  auto · threshold 90 % · headroom
-  * work            5h ▰▰▰▰▰▰▰▰▱▱  81% 14:20      7d ▰▰▱▱▱▱▱▱▱▱  23% Thu 09:00  seen now
-    personal        5h ▰▱▱▱▱▱▱▱▱▱  12% 16:05      7d ▰▰▰▰▱▱▱▱▱▱  41% Mon 11:00  seen 2h
-    default         not signed in: hats login default
+$ hats list
+CLAUDE CODE · new sessions start in ● work
+Auto: at 90 % of either limit, it moves to the account with the most room.
+  ACCOUNT   5-HOUR LIMIT               WEEKLY LIMIT               UPDATED
+● work      ▰▰▰▰▰▰▰▰▱▱  81% 14:20      ▰▰▱▱▱▱▱▱▱▱  23% Thu 09:00  just now
+    sam@acme.example · Team · Acme
+  personal  ▰▱▱▱▱▱▱▱▱▱  12% 16:05      ▰▰▰▰▱▱▱▱▱▱  41% Mon 11:00  2 h ago
+    sam@example.com · Max
+  default   not signed in: hats login default
+    ~/.claude
 ```
 
 ## Install
@@ -115,7 +120,10 @@ hats knows each account's limits only from what the harness already shows:
 - Codex writes `rate_limits` into every `token_count` event of its rollouts;
   hats reads the newest one of each account.
 - A turn that ends with a rate limit error (`StopFailure` with
-  `error: "rate_limit"`) counts as reaching the limit even without data.
+  `error: "rate_limit"`) counts that account as full for five hours, or until
+  its status line reports other numbers: the hook input carries no reset time.
+- `hats import claude-swap` takes claude-swap's last reading of each account,
+  with the time claude-swap took it.
 
 A window whose reset time already passed counts as empty, so an old reading
 still says when an account is usable again.
@@ -124,7 +132,8 @@ still says when an account is usable again.
 of the 5-hour or weekly limit, whichever is higher), the default moves to
 another signed-in account that is at least 10 points under the threshold:
 the one with the most room (`strategy = "headroom"`) or the next in `order`
-(`strategy = "next"`). This happens in the status line wrapper, in the
+(`strategy = "next"`). An account with no numbers yet may be the spent one, so
+it is taken only when no account with numbers has room, the first in `order`. This happens in the status line wrapper, in the
 `StopFailure` hook and when `hats run` starts. If no account has room, nothing
 moves.
 
@@ -168,16 +177,17 @@ Every change of account is recorded in the registry with its reason
 | Command | What it does |
 |---|---|
 | `hats`, `hats tui` | interactive view: accounts, limits, switch, add, sign in, remove, settings |
-| `hats list [--json]` | accounts with their limits; `*` marks the current one |
+| `hats list [--json]` | accounts with their limits; `●` marks the one new sessions start with |
 | `hats add <label>` | create an account directory that shares your settings |
 | `hats login <label> [-- args]` | `claude auth login` (or `codex login`) inside that account |
 | `hats use <label>` | make it the default for new sessions |
+| `hats auto [on\|off]` | say whether accounts switch by themselves and the last change, or turn it on or off; nothing has to stay open |
 | `hats run [label] [-- args]` | start the harness with that account (default: the current one) |
 | `hats env [label]` | print `export CLAUDE_CONFIG_DIR=...` for `eval` or a terminal multiplexer pane |
 | `hats remove <label>` | sign out with the harness, then delete the directory (links only, never the shared files) |
 | `hats config [list\|get\|set\|edit\|path]` | settings; `hats config` lists every key with its meaning |
 | `hats setup [--dry-run\|--undo]` | install or remove the hooks, the status line wrapper and the shell functions; run it again after moving the binary |
-| `hats import claude-swap [--from <dir>]` | take claude-swap's account order and settings (never its tokens) |
+| `hats import claude-swap [--from <dir>]` | take claude-swap's account order, settings and last limits (never its tokens) |
 | `hats completions <shell>` | shell completions |
 | `hats statusline [-- your command]` | the status line wrapper `setup` installs |
 
@@ -244,7 +254,7 @@ on an `O_APPEND` descriptor so concurrent writers never interleave.
 
 The format is fixed by `tests/registry_format.rs` and
 `tests/fixtures/switches.jsonl`. `limits.json` holds
-`{"v":1,"accounts":[{"harness","account","label","observedAt","windows":[{"name","usedPercent","resetsAt"}]}]}`.
+`{"v":1,"accounts":[{"harness","account","label","observedAt","windows":[{"name","usedPercent","resetsAt"}],"limitedUntil"?}]}`.
 
 ## Migrating from claude-swap
 

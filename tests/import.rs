@@ -120,3 +120,129 @@ fn the_account_already_signed_in_at_home_stays_default() {
         assert!(stdout.contains(&format!("hats login {label}")), "{stdout}");
     }
 }
+
+/// `cache/usage.json` as claude-swap 0.26 writes it: per account number, the
+/// last good reading and when it was fetched (seconds). Also the mail, which
+/// hats never reads.
+fn usage(slots: &[(u32, f64, f64, Option<f64>)]) -> String {
+    let accounts: serde_json::Map<String, serde_json::Value> = slots
+        .iter()
+        .map(|&(n, fetched, five, seven)| {
+            let window = |pct: f64, at: &str| serde_json::json!({"pct": pct, "resets_at": at, "clock": "10:00", "countdown": "1h"});
+            let good = serde_json::json!({
+                // Two ways of writing 2099-01-01T10:00:00Z.
+                "five_hour": window(five, "2099-01-01T10:00:00.097241+00:00"),
+                "seven_day": seven.map(|p| window(p, "2099-01-01T12:00:00.5+02:00")),
+                "scoped": [],
+            });
+            let slot = serde_json::json!({"email": format!("n{n}@example.com"), "fetchedAt": fetched, "lastGood": good, "consecutiveFailures": 0});
+            (n.to_string(), slot)
+        })
+        .collect();
+    serde_json::json!({"schemaVersion": 2, "accounts": accounts}).to_string()
+}
+
+#[test]
+fn takes_claude_swaps_last_limits_so_a_move_never_goes_to_a_spent_account() {
+    let sb = Sandbox::new();
+    // claude-swap's account 1 is the one signed in at ~/.claude.
+    sb.login_claude(&sb.home.join(".claude.json"));
+    let swap = sb.home.join(".claude-swap-backup");
+    fs::create_dir_all(swap.join("configs")).unwrap();
+    fs::create_dir_all(swap.join("cache")).unwrap();
+    fs::write(
+        swap.join("sequence.json"),
+        r#"{"activeAccountNumber":1,"sequence":[1,2,3,4,5],"accounts":{
+            "1":{"email":"n1@example.com"},"2":{"email":"n2@example.com"},
+            "3":{"email":"n3@example.com"},"4":{"email":"n4@example.com"},
+            "5":{"email":"n5@example.com"}}}"#,
+    )
+    .unwrap();
+    let org = |n: u32| {
+        if n == 1 {
+            common::ORG_UUID.to_owned()
+        } else {
+            format!("00000000-0000-4000-8000-00000000000{n}")
+        }
+    };
+    for n in 1..=5 {
+        fs::write(
+            swap.join(format!("configs/.claude-config-{n}-n{n}@example.com.json")),
+            format!(
+                r#"{{"oauthAccount":{{"accountUuid":"{}","organizationUuid":"{}"}}}}"#,
+                common::ACCOUNT_UUID,
+                org(n)
+            ),
+        )
+        .unwrap();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    let fetched = now - 60.25;
+    // What claude-swap showed: account 1 at 13 %, accounts 2 to 5 spent.
+    let mut slots = vec![(1, fetched, 13.0, Some(20.0))];
+    slots.extend((2..=5).map(|n| (n, fetched, 100.0, None)));
+    fs::write(swap.join("cache/usage.json"), usage(&slots)).unwrap();
+
+    sb.ok(&["import", "claude-swap"]);
+    for n in 2..=5 {
+        let label = format!("account-{n}");
+        let out = sb
+            .cmd(&["login", &label])
+            .env("FAKE_ORG_UUID", org(n))
+            .output()
+            .unwrap();
+        common::assert_success(&out, &["login", &label]);
+    }
+    let listed = |label: &str| {
+        let doc: serde_json::Value = serde_json::from_str(&sb.ok(&["list", "--json"])).unwrap();
+        doc["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["harness"] == "claude" && a["label"] == label)
+            .unwrap()
+            .clone()
+    };
+    let default = listed("default");
+    assert_eq!(default["usedPercent"], 20.0, "{default}");
+    assert_eq!(
+        default["limits"]["observedAt"],
+        (fetched * 1000.0) as u64,
+        "claude-swap's own time"
+    );
+    let spent = listed("account-2");
+    assert_eq!(spent["usedPercent"], 100.0, "{spent}");
+    assert_eq!(spent["limits"]["windows"][0]["resetsAt"], 4_070_944_800_i64);
+    let state = fs::read_to_string(sb.home.join(".local/state/hats/limits.json")).unwrap();
+    assert!(!state.contains('@'), "no mails in hats' files: {state}");
+
+    // A rate limit error on `default` (sessions that still held another
+    // login) finds no account with room: the spent ones are known as spent.
+    let mut hook = sb
+        .cmd(&["hook", "stop"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(
+        &mut hook.stdin.take().unwrap(),
+        br#"{"session_id":"s-1","hook_event_name":"StopFailure","error":"rate_limit"}"#,
+    )
+    .unwrap();
+    assert!(hook.wait().unwrap().success());
+    assert_eq!(sb.current(), "default");
+
+    // Running it again only refreshes: newer numbers replace the stored ones,
+    // older ones do not.
+    slots[1] = (2, now - 10.0, 40.0, None);
+    fs::write(swap.join("cache/usage.json"), usage(&slots)).unwrap();
+    let again = sb.ok(&["import", "claude-swap"]);
+    assert!(!again.contains("Created"), "{again}");
+    assert_eq!(listed("account-2")["usedPercent"], 40.0);
+    slots[1] = (2, now - 3600.0, 90.0, None);
+    fs::write(swap.join("cache/usage.json"), usage(&slots)).unwrap();
+    sb.ok(&["import", "claude-swap"]);
+    assert_eq!(listed("account-2")["usedPercent"], 40.0);
+}

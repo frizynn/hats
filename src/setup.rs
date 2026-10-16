@@ -157,6 +157,16 @@ fn settings_path(store: &Store) -> PathBuf {
     store.home.join(".claude/settings.json")
 }
 
+/// Whether Claude Code runs the hooks and the status line that switch.
+pub fn installed(store: &Store) -> bool {
+    let Ok(text) = fs::read_to_string(settings_path(store)) else {
+        return false;
+    };
+    ["hook stop\"", "statusline"]
+        .iter()
+        .all(|needle| text.contains(needle))
+}
+
 /// The interactive startup file of the user's shell.
 fn rc_path(store: &Store) -> PathBuf {
     let shell = std::env::var("SHELL").unwrap_or_default();

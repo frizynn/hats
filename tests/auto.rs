@@ -156,6 +156,118 @@ fn a_rate_limit_error_moves_the_default_without_limit_data() {
     assert_eq!(reasons(&sb).last().unwrap().1, "limit");
 }
 
+/// Ends a turn of `label`'s session with a rate limit error, as Claude Code's
+/// `StopFailure` hook does.
+fn rate_limited(sb: &Sandbox, label: &str) -> std::process::Child {
+    let mut child = waiting_hook(sb, label);
+    release(&mut child, label);
+    child
+}
+
+/// A `StopFailure` hook started but still waiting for its input.
+fn waiting_hook(sb: &Sandbox, label: &str) -> std::process::Child {
+    sb.cmd(&["hook", "stop"])
+        .env("CLAUDE_CONFIG_DIR", sb.claude_dir(label))
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+fn release(child: &mut std::process::Child, label: &str) {
+    let input = format!(
+        r#"{{"session_id":"s-{label}","hook_event_name":"StopFailure","error":"rate_limit"}}"#
+    );
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(input.as_bytes()).unwrap();
+}
+
+#[test]
+fn an_account_never_seen_comes_after_one_with_room() {
+    let sb = three_accounts();
+    // `side` was never seen: it may be the spent one.
+    sb.repaint("spare", 30.0, 30.0);
+    assert!(rate_limited(&sb, "work").wait().unwrap().success());
+    assert_eq!(sb.current(), "spare");
+}
+
+fn listed(sb: &Sandbox, label: &str) -> serde_json::Value {
+    let doc: serde_json::Value = serde_json::from_str(&sb.ok(&["list", "--json"])).unwrap();
+    doc["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["harness"] == "claude" && a["label"] == label)
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn a_rate_limit_counts_as_full_until_the_status_line_says_otherwise() {
+    let sb = three_accounts();
+    sb.repaint("side", 10.0, 10.0);
+    sb.repaint("spare", 40.0, 40.0);
+    // `side` hits its limit while `work` is the default: nothing moves, but
+    // `side` is known to be full although its last numbers said 10 %.
+    assert!(rate_limited(&sb, "side").wait().unwrap().success());
+    assert_eq!(sb.current(), "work");
+    let side = listed(&sb, "side");
+    assert_eq!(side["usedPercent"], 100.0, "{side}");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let until = side["limits"]["limitedUntil"]
+        .as_i64()
+        .expect("limitedUntil");
+    assert!((until - (now + 5 * 3600)).abs() < 60, "{side}");
+
+    sb.repaint("work", 95.0, 0.0);
+    assert_eq!(sb.current(), "spare", "side is full");
+
+    // New numbers from `side`'s status line replace what was learned.
+    sb.ok(&["use", "work"]);
+    sb.repaint("side", 12.0, 10.0);
+    assert_eq!(listed(&sb, "side")["usedPercent"], 12.0);
+    sb.repaint("work", 96.0, 0.0);
+    assert_eq!(sb.current(), "side");
+}
+
+#[test]
+fn hooks_failing_at_the_same_moment_move_the_default_once() {
+    let sb = three_accounts();
+    // As large as a real `.claude.json`, so deciding takes as long as it does.
+    for label in ["work", "side", "spare"] {
+        let path = sb.claude_dir(label).join(".claude.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        config["projects"] = (0..700)
+            .map(|i| (format!("/home/user/src/p{i:04}"), serde_json::json!({"history": [], "lastCost": 1.5, "allowedTools": ["Bash", "Read", "Edit"]})))
+            .collect::<serde_json::Map<_, _>>()
+            .into();
+        std::fs::write(&path, config.to_string()).unwrap();
+    }
+    sb.repaint("side", 10.0, 10.0);
+    sb.repaint("spare", 20.0, 20.0);
+    let rounds = 10;
+    for _ in 0..rounds {
+        sb.ok(&["use", "work"]);
+        // Sixteen sessions of `work` hit the limit together: every hook reads
+        // its input at the same moment.
+        let mut hooks: Vec<_> = (0..16).map(|_| waiting_hook(&sb, "work")).collect();
+        for hook in &mut hooks {
+            release(hook, "work");
+        }
+        for mut hook in hooks {
+            assert!(hook.wait().unwrap().success());
+        }
+    }
+    let moves = reasons(&sb)
+        .into_iter()
+        .filter(|(_, reason)| reason == "limit")
+        .count();
+    assert_eq!(moves, rounds, "one move per round");
+}
+
 #[test]
 fn another_accounts_session_does_not_move_the_default() {
     let sb = three_accounts();
@@ -222,4 +334,82 @@ fn codex_new_sessions_move_using_rollout_limits() {
         ),
         (Some("codex"), Some("alt"), Some("threshold"))
     );
+}
+
+#[test]
+fn auto_says_what_it_does_and_turns_it_on_and_off() {
+    let sb = three_accounts();
+    // Wide, so each sentence stays on one line.
+    let auto = |args: &[&str]| {
+        let out = sb.cmd(args).env("COLUMNS", "1000").output().unwrap();
+        common::assert_success(&out, args);
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let out = auto(&["auto"]);
+    for line in [
+        "Claude Code: automatic switching is on.",
+        "When the account in use reaches 90 % of its 5-hour or weekly limit, new sessions start in the account with the most room, and sessions started with `hats run` move there once their turn ends.",
+        "New sessions start in 'work'.",
+        ": default → work: you chose it.",
+        "Not active yet: run `hats setup` to install the hooks and the status line that switch.",
+    ] {
+        assert!(out.contains(line), "{line:?} in\n{out}");
+    }
+
+    // Once setup installed the hooks and the status line, nothing else is needed.
+    std::fs::write(
+        sb.home.join(".claude/settings.json"),
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"'/bin/hats' hook stop"}]}]},"statusLine":{"type":"command","command":"'/bin/hats' statusline"}}"#,
+    )
+    .unwrap();
+    sb.repaint("spare", 5.0, 5.0);
+    sb.repaint("work", 95.0, 0.0);
+    let out = auto(&["auto"]);
+    assert!(
+        out.contains(": work → spare: work passed the threshold."),
+        "{out}"
+    );
+    assert!(out.contains("Nothing needs to stay open"), "{out}");
+    assert!(!out.contains("hats setup"), "{out}");
+
+    let out = auto(&["auto", "off"]);
+    assert!(
+        out.starts_with("Claude Code: automatic switching is off."),
+        "{out}"
+    );
+    assert!(out.contains("`hats auto on` turns it on."), "{out}");
+    assert_eq!(sb.ok(&["config", "get", "claude.mode"]).trim(), "manual");
+    assert!(auto(&["auto", "on"]).starts_with("Claude Code: automatic switching is on."));
+    assert_eq!(sb.ok(&["config", "get", "claude.mode"]).trim(), "auto");
+
+    // Codex has its own switch.
+    let out = auto(&["--codex", "auto", "off"]);
+    assert!(
+        out.starts_with("Codex: automatic switching is off."),
+        "{out}"
+    );
+    assert!(out.contains("No change of account yet."), "{out}");
+    assert_eq!(sb.ok(&["config", "get", "codex.mode"]).trim(), "manual");
+    assert_eq!(sb.ok(&["config", "get", "claude.mode"]).trim(), "auto");
+}
+
+#[test]
+fn a_learned_limit_that_expired_is_not_data() {
+    let sb = three_accounts();
+    sb.repaint("spare", 50.0, 50.0);
+    // `side` hit its limit five hours ago and has reported nothing since.
+    assert!(rate_limited(&sb, "side").wait().unwrap().success());
+    let path = sb.home.join(".local/state/hats/limits.json");
+    let mut limits: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    for entry in limits["accounts"].as_array_mut().unwrap() {
+        if let Some(until) = entry.get("limitedUntil").and_then(|u| u.as_i64()) {
+            entry["limitedUntil"] = (until - 5 * 3600 - 1).into();
+        }
+    }
+    std::fs::write(&path, limits.to_string()).unwrap();
+    assert_eq!(listed(&sb, "side")["usedPercent"], serde_json::Value::Null);
+    // `spare` has numbers and room: it goes first.
+    sb.repaint("work", 95.0, 0.0);
+    assert_eq!(sb.current(), "spare");
 }

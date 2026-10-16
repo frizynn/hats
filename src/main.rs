@@ -12,6 +12,7 @@ mod store;
 mod supervisor;
 mod tui;
 mod view;
+mod watch;
 
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Read, Write};
@@ -24,7 +25,6 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
 use account::{Account, DEFAULT_LABEL, Harness};
 use config::Config;
-use policy::Reason;
 use store::Store;
 
 const EXAMPLES: &str = "\
@@ -56,7 +56,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// List accounts with their limits; `*` marks the current one.
+    /// List accounts with their limits; `●` marks the one new sessions start with.
     #[command(visible_alias = "ls")]
     List {
         /// Print JSON (schema `v: 1`) for scripts.
@@ -103,6 +103,14 @@ enum Cmd {
     Remove {
         /// Account label, as `hats list` shows it.
         label: String,
+    },
+    /// Say whether accounts switch by themselves, and turn it on or off.
+    ///
+    /// Nothing needs to stay running: Claude Code's hooks and status line do
+    /// the switching. To watch it happen, leave `hats` open.
+    Auto {
+        /// `on` or `off`; without it, only say how it is.
+        state: Option<OnOff>,
     },
     /// Show or change settings (`hats config` lists them all).
     Config {
@@ -157,6 +165,12 @@ enum ConfigCmd {
     Edit,
     /// Print where config.toml lives.
     Path,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum OnOff {
+    On,
+    Off,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -253,7 +267,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             let id = account
                 .provider_id(&store)?
                 .ok_or_else(|| not_logged_in(&account))?;
-            auto::make_default(&store, &account, &id, Reason::Manual, SystemTime::now())?;
+            auto::choose(&store, &account, &id, SystemTime::now())?;
             println!("New {} sessions use '{label}'.", harness.name());
         }
         Cmd::Run { label, args } => {
@@ -264,6 +278,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             shell_line(&chosen(&store, harness, label.as_deref())?)
         ),
         Cmd::Remove { label } => remove(&store, find(&store, harness, &label)?)?,
+        Cmd::Auto { state } => auto_command(&store, harness, state)?,
         Cmd::Config { action } => config_command(&store, &config, action)?,
         Cmd::Setup { dry_run, undo } => setup::run(&store, dry_run, undo)?,
         Cmd::Import {
@@ -357,7 +372,7 @@ fn launch(
     let settings = config.for_harness(harness);
     if label.is_none() {
         // A new session should not start on an account that is already spent.
-        auto::check_default(store, harness, settings, SystemTime::now(), None)?;
+        auto::check_default(store, harness, settings, SystemTime::now(), None, None)?;
     }
     let account = chosen(store, harness, label)?;
     // Picks up shared files the user created since the account was added.
@@ -387,17 +402,43 @@ pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
+/// Columns of the terminal on stdout, else `$COLUMNS`, else 80.
+fn width() -> usize {
+    let mut size = std::mem::MaybeUninit::<libc::winsize>::zeroed();
+    // SAFETY: TIOCGWINSZ fills a winsize; on failure it is left zeroed.
+    let size = unsafe {
+        libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, size.as_mut_ptr());
+        size.assume_init()
+    };
+    if size.ws_col > 0 {
+        return usize::from(size.ws_col);
+    }
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|c| c.parse().ok())
+        .filter(|c| *c > 0)
+        .unwrap_or(80)
+}
+
 fn list(store: &Store, json: bool) -> Result<(), Failure> {
     let config = Config::load(&store.config)?;
     let now = SystemTime::now();
+    let width = width();
     let mut out = io::stdout().lock();
     let mut rows = Vec::new();
     let mut any = false;
-    for harness in Harness::ALL {
+    let groups = Harness::ALL
+        .into_iter()
+        .map(|h| Ok((h, auto::statuses(store, h, config.for_harness(h))?)))
+        .collect::<Result<Vec<_>, String>>()?;
+    let layout = view::Layout::new(groups.iter().map(|(h, s)| (*h, s.as_slice())), width);
+    for (harness, statuses) in groups {
         let settings = config.for_harness(harness);
-        let statuses = auto::statuses(store, harness, settings)?;
         if statuses.is_empty() {
             continue;
+        }
+        if any && !json {
+            writeln!(out)?;
         }
         any = true;
         let current = store.current(harness).ok().map(|a| a.label);
@@ -411,53 +452,34 @@ fn list(store: &Store, json: bool) -> Result<(), Failure> {
                     "current": current.as_deref() == Some(s.account.label.as_str()),
                     "configDir": s.account.dir,
                     "usedPercent": s.used(now),
-                    "limits": s.reading.as_ref().map(|r| serde_json::json!({
-                        "observedAt": r.observed_at,
-                        "windows": r.windows,
-                    })),
+                    "email": s.identity.email,
+                    "plan": s.identity.plan,
+                    "organization": s.identity.organization,
+                    "limits": s.reading.as_ref().map(|r| {
+                        let mut limits = serde_json::json!({
+                            "observedAt": r.observed_at,
+                            "windows": r.windows,
+                        });
+                        if let Some(until) = r.limited_until {
+                            limits["limitedUntil"] = until.into();
+                        }
+                        limits
+                    }),
                 }));
             }
             continue;
         }
-        writeln!(
-            out,
-            "{}  {} · threshold {} % · {}",
-            harness.name().to_uppercase(),
-            settings.mode.as_str(),
-            settings.threshold,
-            settings.strategy.as_str()
-        )?;
-        for s in &statuses {
-            let marker = if current.as_deref() == Some(s.account.label.as_str()) {
-                "*"
-            } else {
-                " "
-            };
-            write!(out, "  {marker} {:<14}", s.account.label)?;
-            match (&s.id, &s.reading) {
-                (None, _) => write!(
-                    out,
-                    " not signed in: hats{} login {}",
-                    flag(harness),
-                    s.account.label
-                )?,
-                (Some(_), None) => write!(out, " no limits seen yet")?,
-                (Some(_), Some(r)) => {
-                    for w in &r.windows {
-                        let used = view::used_now(w, now);
-                        write!(
-                            out,
-                            "  {} {} {:>3.0}% {:<9}",
-                            view::window_short(&w.name),
-                            view::bar(used, 10),
-                            used,
-                            view::reset_label(w.resets_at, now)
-                        )?;
-                    }
-                    write!(out, "  seen {}", view::age(r.observed_at, now))?;
-                }
-            }
-            writeln!(out)?;
+        let block = view::block(
+            harness,
+            settings,
+            &statuses,
+            current.as_deref(),
+            &layout,
+            now,
+            view::Hints::Commands,
+        );
+        for row in block.header.iter().chain(block.accounts.iter().flatten()) {
+            writeln!(out, "{}", view::plain(row))?;
         }
     }
     if json {
@@ -466,6 +488,41 @@ fn list(store: &Store, json: bool) -> Result<(), Failure> {
         writeln!(out)?;
     } else if !any {
         writeln!(out, "No accounts yet. Add one with `hats add <label>`.")?;
+    }
+    Ok(())
+}
+
+fn auto_command(store: &Store, harness: Harness, state: Option<OnOff>) -> Result<(), Failure> {
+    if let Some(state) = state {
+        let mode = match state {
+            OnOff::On => config::Mode::Auto,
+            OnOff::Off => config::Mode::Manual,
+        };
+        config::set(
+            &store.config,
+            &format!("{}.mode", harness.name()),
+            mode.as_str(),
+        )?;
+    }
+    let config = Config::load(&store.config)?;
+    let current = store.current(harness)?;
+    let last = registry::recent(&store.registry(), usize::MAX)
+        .into_iter()
+        .rfind(|c| c.harness == harness);
+    let now = SystemTime::now();
+    let lines = view::auto_report(
+        harness,
+        config.for_harness(harness),
+        &current.label,
+        setup::installed(store),
+        last.as_ref(),
+        now,
+    );
+    let width = width();
+    for line in &lines {
+        for part in view::wrap(line, width) {
+            println!("{part}");
+        }
     }
     Ok(())
 }
