@@ -169,6 +169,34 @@ pub fn save(
     })
 }
 
+/// Stores a reading taken elsewhere at `observed_at` (Unix milliseconds),
+/// unless the stored one is as new or newer. Returns whether it was stored.
+pub fn seed(
+    store: &Store,
+    account: &Account,
+    id: &str,
+    observed_at: u64,
+    windows: Vec<LimitWindow>,
+) -> io::Result<bool> {
+    let mut stored = false;
+    update(store, account.harness, id, |entry| {
+        if entry.as_ref().is_some_and(|e| e.observed_at >= observed_at) {
+            return false;
+        }
+        *entry = Some(AccountLimits {
+            harness: account.harness,
+            account: id.to_owned(),
+            label: account.label.clone(),
+            observed_at,
+            windows,
+            limited_until: None,
+        });
+        stored = true;
+        true
+    })?;
+    Ok(stored)
+}
+
 /// A turn of the account ended with a rate limit error: it counts as full
 /// for `LIMIT_HOLD`, whatever its last numbers said.
 pub fn mark_limited(store: &Store, account: &Account, id: &str, now: SystemTime) -> io::Result<()> {

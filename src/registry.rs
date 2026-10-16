@@ -100,6 +100,56 @@ pub fn utc_millis(t: SystemTime) -> String {
     )
 }
 
+/// Unix seconds of an RFC 3339 time such as `2026-10-16T19:29:59.824674+00:00`
+/// or `2026-01-02T03:04:05.678Z`; the fraction is dropped.
+pub fn parse_utc(text: &str) -> Option<i64> {
+    let num = |range: std::ops::Range<usize>| -> Option<i64> {
+        let part = text.get(range)?;
+        part.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| part.parse().ok())?
+    };
+    let b = text.as_bytes();
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
+    }
+    let (month, day) = (num(5..7)?, num(8..10)?);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let days = days_from_civil(num(0..4)?, month as u32, day as u32);
+    let secs = days * 86_400 + num(11..13)? * 3600 + num(14..16)? * 60 + num(17..19)?;
+    let zone = text[19..].trim_start_matches(|c: char| c == '.' || c.is_ascii_digit());
+    let offset = match zone.as_bytes() {
+        [b'Z' | b'z'] => 0,
+        [sign @ (b'+' | b'-'), _, _, b':', _, _] => {
+            let at = text.len() - 5;
+            let minutes = num(at..at + 2)? * 60 + num(at + 3..at + 5)?;
+            if *sign == b'+' { minutes } else { -minutes }
+        }
+        _ => return None,
+    };
+    Some(secs - offset * 60)
+}
+
+/// A proleptic Gregorian date to days since 1970-01-01 (Howard Hinnant,
+/// "chrono-Compatible Low-Level Date Algorithms").
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let yoe = year.rem_euclid(400);
+    let mp = i64::from((month + 9) % 12);
+    let doy = (153 * mp + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 /// Days since 1970-01-01 to a proleptic Gregorian date (Howard Hinnant,
 /// "chrono-Compatible Low-Level Date Algorithms").
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
@@ -133,5 +183,26 @@ mod tests {
             utc_millis(at(4_102_444_799, 999)),
             "2099-12-31T23:59:59.999Z"
         );
+    }
+
+    #[test]
+    fn parses_what_it_writes_and_offsets() {
+        for secs in [0, 951_782_400, 1_767_323_045, 4_102_444_799] {
+            let text = utc_millis(UNIX_EPOCH + Duration::from_secs(secs));
+            assert_eq!(parse_utc(&text), Some(secs as i64), "{text}");
+        }
+        let at = Some(1_792_179_000);
+        assert_eq!(parse_utc("2026-10-16T19:30:00.824674+00:00"), at);
+        assert_eq!(parse_utc("2026-10-16T21:30:00+02:00"), at);
+        assert_eq!(parse_utc("2026-10-16T16:30:00-03:00"), at);
+        for bad in [
+            "",
+            "2026-10-16",
+            "2026-13-01T00:00:00Z",
+            "2026-10-16T19:30:00",
+            "x026-10-16T19:30:00Z",
+        ] {
+            assert_eq!(parse_utc(bad), None, "{bad}");
+        }
     }
 }
