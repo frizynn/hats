@@ -47,38 +47,35 @@ pub fn rotation<'a>(labels: impl IntoIterator<Item = &'a str>, order: &[String])
 }
 
 /// The account to switch to from `current`, or `None` if no account has
-/// enough room. An account never seen counts as unused.
+/// enough room. An account never seen may be the spent one, so it is taken
+/// only when no account with data has room, the first in the order.
 pub fn pick<'a>(
     current: &str,
     candidates: &'a [Candidate],
     config: &HarnessConfig,
 ) -> Option<&'a str> {
     let ceiling = f64::from(config.threshold) - MARGIN;
-    let eligible =
-        |c: &Candidate| c.logged_in && c.label != current && c.used.unwrap_or(0.0) <= ceiling;
     let ring = rotation(candidates.iter().map(|c| c.label.as_str()), &config.order);
-    let by_label = |label: &str| {
-        candidates
-            .iter()
-            .find(|c| c.label == label)
-            .expect("label from candidates")
+    // `next` walks the order from the account after the current one.
+    let start = match config.strategy {
+        Strategy::Next => ring.iter().position(|l| *l == current).map_or(0, |i| i + 1),
+        Strategy::Headroom => 0,
     };
-    match config.strategy {
-        Strategy::Next => {
-            let start = ring.iter().position(|l| *l == current).map_or(0, |i| i + 1);
-            (0..ring.len())
-                .map(|i| ring[(start + i) % ring.len()])
-                .find(|l| eligible(by_label(l)))
-        }
-        Strategy::Headroom => ring
-            .iter()
-            .copied()
-            .filter(|l| eligible(by_label(l)))
-            .min_by(|a, b| {
-                let used = |l: &str| by_label(l).used.unwrap_or(0.0);
-                used(a).total_cmp(&used(b))
-            }),
-    }
+    let others: Vec<&Candidate> = (0..ring.len())
+        .map(|i| ring[(start + i) % ring.len()])
+        .filter_map(|l| candidates.iter().find(|c| c.label == l))
+        .filter(|c| c.logged_in && c.label != current)
+        .collect();
+    let with_room = others
+        .iter()
+        .filter_map(|c| Some((*c, c.used.filter(|u| *u <= ceiling)?)));
+    let seen = match config.strategy {
+        Strategy::Next => with_room.map(|(c, _)| c).next(),
+        // The first of equals, so ties follow the order.
+        Strategy::Headroom => with_room.min_by(|a, b| a.1.total_cmp(&b.1)).map(|(c, _)| c),
+    };
+    seen.or_else(|| others.iter().copied().find(|c| c.used.is_none()))
+        .map(|c| c.label.as_str())
 }
 
 #[cfg(test)]
