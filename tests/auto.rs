@@ -186,6 +186,46 @@ fn an_account_never_seen_comes_after_one_with_room() {
     assert_eq!(sb.current(), "spare");
 }
 
+fn listed(sb: &Sandbox, label: &str) -> serde_json::Value {
+    let doc: serde_json::Value = serde_json::from_str(&sb.ok(&["list", "--json"])).unwrap();
+    doc["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["harness"] == "claude" && a["label"] == label)
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn a_rate_limit_counts_as_full_until_the_status_line_says_otherwise() {
+    let sb = three_accounts();
+    sb.repaint("side", 10.0, 10.0);
+    sb.repaint("spare", 40.0, 40.0);
+    // `side` hits its limit while `work` is the default: nothing moves, but
+    // `side` is known to be full although its last numbers said 10 %.
+    assert!(rate_limited(&sb, "side").wait().unwrap().success());
+    assert_eq!(sb.current(), "work");
+    let side = listed(&sb, "side");
+    assert_eq!(side["usedPercent"], 100.0, "{side}");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let until = side["limits"]["limitedUntil"].as_i64().expect("limitedUntil");
+    assert!((until - (now + 5 * 3600)).abs() < 60, "{side}");
+
+    sb.repaint("work", 95.0, 0.0);
+    assert_eq!(sb.current(), "spare", "side is full");
+
+    // New numbers from `side`'s status line replace what was learned.
+    sb.ok(&["use", "work"]);
+    sb.repaint("side", 12.0, 10.0);
+    assert_eq!(listed(&sb, "side")["usedPercent"], 12.0);
+    sb.repaint("work", 96.0, 0.0);
+    assert_eq!(sb.current(), "side");
+}
+
 #[test]
 fn another_accounts_session_does_not_move_the_default() {
     let sb = three_accounts();
