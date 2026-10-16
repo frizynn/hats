@@ -5,6 +5,7 @@
 
 use std::fs;
 use std::io::{self, BufRead, BufReader};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -87,12 +88,18 @@ impl Harness {
         }
     }
 
-    /// The shared transcript directory, created up front so the first session
-    /// of a new account already writes into the common history.
-    fn history_dir(self) -> Option<&'static str> {
+    /// The shared history, created up front so the first session of a new
+    /// account already writes into it: whatever an account writes before the
+    /// shared entry exists stays out of the common history and is deleted with
+    /// the account. Codex's own directory may not exist, and creating it would
+    /// add an account the user never had.
+    fn history(self) -> (&'static [&'static str], &'static [&'static str]) {
         match self {
-            Harness::Claude => Some("projects"),
-            Harness::Codex => None,
+            Harness::Claude => (
+                &["history.jsonl"],
+                &["projects", "file-history", "todos", "plans"],
+            ),
+            Harness::Codex => (&[], &[]),
         }
     }
 
@@ -199,8 +206,16 @@ impl Account {
         }
         create_private_dir(&self.dir)?;
         let source = Self::default_for(self.harness, store).dir;
-        if let Some(history) = self.harness.history_dir() {
-            fs::create_dir_all(source.join(history))?;
+        let (history_files, history_dirs) = self.harness.history();
+        for name in history_dirs {
+            fs::create_dir_all(source.join(name))?;
+        }
+        for name in history_files {
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(source.join(name))?;
         }
         let (files, dirs) = self.harness.shared();
         for name in files.iter().chain(dirs) {
