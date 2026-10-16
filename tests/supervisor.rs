@@ -69,8 +69,11 @@ fn two_accounts() -> Sandbox {
 fn run_in_pty(sb: &Sandbox, fake: &str, during: impl FnOnce(u32)) -> Run {
     let bin = sb.home.join("fake-bin");
     fs::create_dir_all(&bin).unwrap();
-    fs::write(bin.join("claude"), fake).unwrap();
-    fs::set_permissions(bin.join("claude"), fs::Permissions::from_mode(0o755)).unwrap();
+    // Replaced by rename, so a session already running it is not disturbed.
+    let tmp = bin.join(format!("claude.{:?}", std::thread::current().id()));
+    fs::write(&tmp, fake).unwrap();
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::rename(&tmp, bin.join("claude")).unwrap();
     let log = sb.home.join("fake.log");
 
     let (mut master, slave) = pty();
@@ -315,4 +318,23 @@ impl Drop for KillGroupOnDrop<'_> {
             unsafe { libc::kill(-self.0.get(), libc::SIGKILL) };
         }
     }
+}
+
+#[test]
+fn two_sessions_on_the_same_account_move_independently() {
+    let sb = two_accounts();
+    let runs: Vec<Run> = std::thread::scope(|s| {
+        let a = s.spawn(|| run_in_pty(&sb, FAKE, |_| {}));
+        let b = s.spawn(|| run_in_pty(&sb, FAKE, |_| {}));
+        vec![a.join().unwrap(), b.join().unwrap()]
+    });
+    // Both write to the same log.
+    let log = fs::read_to_string(sb.home.join("fake.log")).unwrap();
+    for run in &runs {
+        assert!(run.status.success(), "{log}");
+    }
+    assert_eq!(log.matches("term").count(), 2, "{log}");
+    assert_eq!(log.matches("resumed").count(), 2, "{log}");
+    let run = sb.home.join(".local/state/hats/run");
+    assert!(fs::read_dir(&run).map(|d| d.count() == 0).unwrap_or(true));
 }
