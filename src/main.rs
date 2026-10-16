@@ -386,9 +386,28 @@ pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
+/// Columns of the terminal on stdout, else `$COLUMNS`, else 80.
+fn width() -> usize {
+    let mut size = std::mem::MaybeUninit::<libc::winsize>::zeroed();
+    // SAFETY: TIOCGWINSZ fills a winsize; on failure it is left zeroed.
+    let size = unsafe {
+        libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, size.as_mut_ptr());
+        size.assume_init()
+    };
+    if size.ws_col > 0 {
+        return usize::from(size.ws_col);
+    }
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|c| c.parse().ok())
+        .filter(|c| *c > 0)
+        .unwrap_or(80)
+}
+
 fn list(store: &Store, json: bool) -> Result<(), Failure> {
     let config = Config::load(&store.config)?;
     let now = SystemTime::now();
+    let width = width();
     let mut out = io::stdout().lock();
     let mut rows = Vec::new();
     let mut any = false;
@@ -397,6 +416,9 @@ fn list(store: &Store, json: bool) -> Result<(), Failure> {
         let statuses = auto::statuses(store, harness, settings)?;
         if statuses.is_empty() {
             continue;
+        }
+        if any && !json {
+            writeln!(out)?;
         }
         any = true;
         let current = store.current(harness).ok().map(|a| a.label);
@@ -410,6 +432,9 @@ fn list(store: &Store, json: bool) -> Result<(), Failure> {
                     "current": current.as_deref() == Some(s.account.label.as_str()),
                     "configDir": s.account.dir,
                     "usedPercent": s.used(now),
+                    "email": s.identity.email,
+                    "plan": s.identity.plan,
+                    "organization": s.identity.organization,
                     "limits": s.reading.as_ref().map(|r| {
                         let mut limits = serde_json::json!({
                             "observedAt": r.observed_at,
@@ -424,45 +449,17 @@ fn list(store: &Store, json: bool) -> Result<(), Failure> {
             }
             continue;
         }
-        writeln!(
-            out,
-            "{}  {} · threshold {} % · {}",
-            harness.name().to_uppercase(),
-            settings.mode.as_str(),
-            settings.threshold,
-            settings.strategy.as_str()
-        )?;
-        for s in &statuses {
-            let marker = if current.as_deref() == Some(s.account.label.as_str()) {
-                "*"
-            } else {
-                " "
-            };
-            write!(out, "  {marker} {:<14}", s.account.label)?;
-            match (&s.id, &s.reading) {
-                (None, _) => write!(
-                    out,
-                    " not signed in: hats{} login {}",
-                    flag(harness),
-                    s.account.label
-                )?,
-                (Some(_), None) => write!(out, " no limits seen yet")?,
-                (Some(_), Some(r)) => {
-                    for w in &r.windows {
-                        let used = view::used_now(w, now);
-                        write!(
-                            out,
-                            "  {} {} {:>3.0}% {:<9}",
-                            view::window_short(&w.name),
-                            view::bar(used, 10),
-                            used,
-                            view::reset_label(w.resets_at, now)
-                        )?;
-                    }
-                    write!(out, "  seen {}", view::age(r.observed_at, now))?;
-                }
-            }
-            writeln!(out)?;
+        let block = view::block(
+            harness,
+            settings,
+            &statuses,
+            current.as_deref(),
+            width,
+            now,
+            view::Hints::Commands,
+        );
+        for row in block.header.iter().chain(block.accounts.iter().flatten()) {
+            writeln!(out, "{}", view::plain(row))?;
         }
     }
     if json {

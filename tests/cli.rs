@@ -159,9 +159,12 @@ fn login_runs_the_harness_login_inside_the_account() {
     let work = account(&list, "work");
     assert_eq!(work["account"], "9ae25bfbd05c9e76");
     assert_eq!(work["signedIn"], true);
-    // The mail stays inside the harness's file.
-    assert!(!list.contains("example.com"), "{list}");
-    assert!(!sb.ok(&["list"]).contains("example.com"));
+    // The mail is shown to tell accounts apart, but never kept in hats' files.
+    assert_eq!(work["email"], "user@example.com");
+    assert!(sb.ok(&["list"]).contains("user@example.com"));
+    sb.ok(&["use", "work"]);
+    let registry = fs::read_to_string(sb.registry()).unwrap();
+    assert!(!registry.contains('@'), "{registry}");
 }
 
 #[test]
@@ -188,10 +191,7 @@ fn list_marks_the_current_account() {
     assert_eq!(account(&list, "work")["current"], true);
     assert_eq!(account(&list, "default")["current"], false);
     let text = sb.ok(&["list"]);
-    assert!(
-        text.lines().any(|l| l.trim_start().starts_with("* work")),
-        "{text}"
-    );
+    assert!(text.lines().any(|l| l.starts_with("● work")), "{text}");
     assert!(
         text.contains("not signed in: hats login personal"),
         "{text}"

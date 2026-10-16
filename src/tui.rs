@@ -18,16 +18,8 @@ use ratatui::{Frame, Terminal};
 use crate::account::{DEFAULT_LABEL, Harness};
 use crate::auto::{self, Status};
 use crate::config::{self, Config, Mode, Relaunch, Strategy};
-use crate::limits::unix_secs;
-use crate::policy;
 use crate::store::Store;
 use crate::view;
-
-/// A reading older than this is drawn dim: no session of that account has
-/// repainted its status line since, so the numbers may have moved.
-const STALE_SECS: i64 = 60 * 60;
-/// Columns of one limit window besides its bar: `5h ` and ` 42% Thu 09:00  `.
-const WINDOW_TEXT: usize = 3 + 17;
 
 pub fn run(store: &Store) -> Result<(), String> {
     let color = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
@@ -577,19 +569,9 @@ impl<'a> App<'a> {
     }
 
     fn draw_list(&self, frame: &mut Frame, area: Rect, now: SystemTime) {
-        let label_width = self
-            .groups
-            .iter()
-            .flat_map(|g| &g.statuses)
-            .map(|s| s.account.label.len())
-            .max()
-            .unwrap_or(0)
-            .max(7);
-        // The two bars share what the other columns leave.
-        let fixed = 2 + label_width + 2 + 12 + 2 * WINDOW_TEXT + 8;
-        let bar = (usize::from(area.width).saturating_sub(fixed) / 2).clamp(3, 10);
+        let width = usize::from(area.width);
         let mut lines = Vec::new();
-        let mut selected_line = 0;
+        let mut selected = 0..0;
         for (i, group) in self.groups.iter().enumerate() {
             let focused = i == self.focus;
             if !focused && group.statuses.is_empty() {
@@ -598,8 +580,11 @@ impl<'a> App<'a> {
             if !lines.is_empty() {
                 lines.push(Line::default());
             }
-            lines.push(self.header(group, focused));
             if group.statuses.is_empty() {
+                lines.push(Line::styled(
+                    view::title(group.harness),
+                    self.tone(view::Tone::Title, focused),
+                ));
                 lines.push(Line::styled(
                     format!(
                         "  No {} accounts yet. Press a to add one.",
@@ -607,108 +592,55 @@ impl<'a> App<'a> {
                     ),
                     self.dim(),
                 ));
+                continue;
             }
-            for (j, status) in group.statuses.iter().enumerate() {
-                let mut line = self.row(group, status, label_width, bar, now);
-                if focused && j == self.selected {
-                    selected_line = lines.len();
-                    line = line.patch_style(Style::new().add_modifier(Modifier::REVERSED));
+            let block = view::block(
+                group.harness,
+                self.config.for_harness(group.harness),
+                &group.statuses,
+                group.current.as_deref(),
+                width,
+                now,
+                view::Hints::Keys,
+            );
+            lines.extend(block.header.iter().map(|row| self.line(row, focused)));
+            for (j, rows) in block.accounts.iter().enumerate() {
+                let start = lines.len();
+                for row in rows {
+                    let mut line = self.line(row, focused);
+                    if focused && j == self.selected {
+                        line = line.patch_style(Style::new().add_modifier(Modifier::REVERSED));
+                    }
+                    lines.push(line);
                 }
-                lines.push(line);
+                if focused && j == self.selected {
+                    selected = start..lines.len();
+                }
             }
         }
-        let scroll = (selected_line + 1).saturating_sub(usize::from(area.height));
+        let scroll = selected.end.saturating_sub(usize::from(area.height));
         frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), area);
     }
 
-    fn header(&self, group: &Group, focused: bool) -> Line<'static> {
-        let c = self.config.for_harness(group.harness);
-        let text = format!(
-            "{}  {} · threshold {} % · {}",
-            group.harness.name().to_uppercase(),
-            c.mode.as_str(),
-            c.threshold,
-            c.strategy.as_str()
-        );
-        let style = if focused {
-            self.bold().patch(self.fg(Color::Cyan))
-        } else {
-            Style::new()
-        };
-        Line::styled(text, style)
+    fn line(&self, row: &view::Row, focused: bool) -> Line<'static> {
+        Line::from(
+            row.iter()
+                .map(|c| Span::styled(c.text.clone(), self.tone(c.tone, focused)))
+                .collect::<Vec<_>>(),
+        )
     }
 
-    fn row(
-        &self,
-        group: &Group,
-        s: &Status,
-        label_width: usize,
-        bar: usize,
-        now: SystemTime,
-    ) -> Line<'static> {
-        let threshold = self.config.for_harness(group.harness).threshold;
-        let current = group.current.as_deref() == Some(s.account.label.as_str());
-        let mut spans = vec![
-            Span::raw(if current { "* " } else { "  " }),
-            Span::styled(
-                format!("{:<label_width$}  ", s.account.label),
-                if current { self.bold() } else { Style::new() },
-            ),
-            Span::raw(format!(
-                "{:<12}",
-                if s.id.is_some() {
-                    "signed in"
-                } else {
-                    "signed out"
-                }
-            )),
-        ];
-        match (&s.id, &s.reading) {
-            (None, _) => spans.push(Span::styled("press l to sign in", self.dim())),
-            (Some(_), None) => spans.push(Span::styled("no limits seen yet", self.dim())),
-            (Some(_), Some(r)) => {
-                let stale = unix_secs(now) - (r.observed_at / 1000) as i64 > STALE_SECS;
-                for w in &r.windows {
-                    let used = view::used_now(w, now);
-                    let style = if stale || w.resets_at <= unix_secs(now) {
-                        self.dim()
-                    } else {
-                        Style::new()
-                    };
-                    spans.push(Span::styled(
-                        format!("{} ", view::window_short(&w.name)),
-                        style,
-                    ));
-                    spans.push(Span::styled(
-                        view::bar(used, bar),
-                        style.patch(self.level(used, threshold)),
-                    ));
-                    spans.push(Span::styled(
-                        format!(" {used:>3.0}% {:<9}  ", view::reset_label(w.resets_at, now)),
-                        style,
-                    ));
-                }
-                let style = if stale { self.dim() } else { Style::new() };
-                spans.push(Span::styled(
-                    format!("seen {}", view::age(r.observed_at, now)),
-                    style,
-                ));
-            }
+    fn tone(&self, tone: view::Tone, focused: bool) -> Style {
+        match tone {
+            view::Tone::Plain => Style::new(),
+            view::Tone::Dim => self.dim(),
+            view::Tone::Strong => self.bold(),
+            view::Tone::Title if focused => self.bold().patch(self.fg(Color::Cyan)),
+            view::Tone::Title => self.bold(),
+            view::Tone::Good => self.fg(Color::Green),
+            view::Tone::Warn => self.fg(Color::Yellow),
+            view::Tone::Bad => self.fg(Color::Red),
         }
-        Line::from(spans)
-    }
-
-    /// Red past the threshold; yellow within the margin under it, where the
-    /// account can no longer be picked to switch to; green below.
-    fn level(&self, used: f64, threshold: u8) -> Style {
-        let threshold = f64::from(threshold);
-        self.fg(if used >= threshold {
-            Color::Red
-        } else if used > threshold - policy::MARGIN {
-            Color::Yellow
-        } else {
-            Color::Green
-        })
     }
 
     fn draw_settings(&self, frame: &mut Frame, area: Rect, field: Field) {
@@ -945,7 +877,7 @@ mod tests {
 
     use super::*;
     use crate::account::Account;
-    use crate::limits::{self, LimitWindow};
+    use crate::limits::{self, LimitWindow, unix_secs};
 
     fn sandbox() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
@@ -964,8 +896,9 @@ mod tests {
         let account = Account::managed(Harness::Claude, label, store).unwrap();
         account.create(store).unwrap();
         if let Some(used) = used {
-            let identity =
-                format!(r#"{{"oauthAccount":{{"accountUuid":"{label}","organizationUuid":"o"}}}}"#);
+            let identity = format!(
+                r#"{{"oauthAccount":{{"accountUuid":"{label}","organizationUuid":"o","emailAddress":"{label}@example.com","organizationType":"claude_team","organizationName":"Acme"}}}}"#
+            );
             fs::write(account.dir.join(".claude.json"), identity).unwrap();
             let id = account.provider_id(store).unwrap().unwrap();
             let now = SystemTime::now();
@@ -995,7 +928,11 @@ mod tests {
     }
 
     fn text(app: &App) -> String {
-        let term = render(app, 100, 16);
+        text_at(app, 100)
+    }
+
+    fn text_at(app: &App, width: u16) -> String {
+        let term = render(app, width, 16);
         let buffer = term.backend().buffer();
         let area = buffer.area;
         (0..area.height)
@@ -1024,13 +961,27 @@ mod tests {
 
         let mut app = App::new(&store, true);
         let screen = text(&app);
-        assert!(screen.contains("CLAUDE  auto · threshold 90 % · headroom"));
-        let row = line_with(&screen, "work");
-        assert!(row.starts_with("* work"), "{row}");
-        for part in ["signed in", "5h ▰▰", " 42% ", "7d ", " 12% ", "seen now"] {
+        assert!(screen.contains("CLAUDE CODE · new sessions start in ● work"));
+        assert!(screen.contains(
+            "Auto: at 90 % of either limit, it moves to the account with the most room."
+        ));
+        for title in ["ACCOUNT", "5-HOUR LIMIT", "WEEKLY LIMIT", "UPDATED"] {
+            assert!(line_with(&screen, "ACCOUNT").contains(title), "{title}");
+        }
+        let row = line_with(&screen, " work ");
+        assert!(row.starts_with("● work"), "{row}");
+        for part in ["▰▰", " 42% ", " 12% ", "just now"] {
             assert!(row.contains(part), "{part:?} in {row}");
         }
-        assert!(line_with(&screen, "personal").contains("signed out"));
+        assert!(
+            screen.contains("work@example.com · Team · Acme"),
+            "{screen}"
+        );
+        assert!(
+            line_with(&screen, "personal").contains("not signed in: press l to sign in"),
+            "{screen}"
+        );
+        assert!(!screen.contains("signed in   "), "no status column");
         assert!(!screen.contains("CODEX"), "no codex accounts:\n{screen}");
         assert!(screen.lines().last().unwrap().contains("q quit"));
 
@@ -1059,7 +1010,7 @@ mod tests {
         assert_eq!(app.on_key(key(KeyCode::Right)), Step::Idle, "already 100");
         app.on_key(key(KeyCode::PageDown));
         assert_eq!(threshold(), 95);
-        assert!(text(&app).contains("threshold 95 %"));
+        assert!(text(&app).contains("Auto: at 95 % of either limit"));
 
         app.on_key(key(KeyCode::Up));
         app.on_key(key(KeyCode::Left));
@@ -1162,6 +1113,37 @@ mod tests {
         app.on_key(key(KeyCode::Char('w')));
         assert!(text(&app).contains("New claude account label: new"));
         assert_eq!(app.on_key(key(KeyCode::Enter)), child(Action::Add, "new"));
+    }
+
+    #[test]
+    fn fits_80_columns_and_uses_120() {
+        let (_dir, store) = sandbox();
+        account(&store, "work", Some(42.0));
+        account(&store, "personal", None);
+        let app = App::new(&store, true);
+
+        // 80 columns: who it is goes on a second line, nothing is cut.
+        let narrow = text_at(&app, 80);
+        let row = line_with(&narrow, " work ");
+        assert!(row.ends_with("just now"), "{row}");
+        assert!(!row.contains('@'), "{row}");
+        assert!(
+            narrow.contains("\n    work@example.com · Team · Acme"),
+            "{narrow}"
+        );
+        assert!(narrow.lines().all(|l| l.chars().count() <= 80));
+
+        // 120 columns: one line per account, with its own column.
+        let wide = text_at(&app, 120);
+        assert!(
+            line_with(&wide, "ACCOUNT").contains("SIGNED IN AS"),
+            "{wide}"
+        );
+        let row = line_with(&wide, " work ");
+        assert!(
+            row.contains("work@example.com · Team · Acme") && row.ends_with("just now"),
+            "{row}"
+        );
     }
 
     #[test]

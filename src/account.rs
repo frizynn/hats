@@ -246,11 +246,20 @@ impl Account {
     /// Stable id of the logged-in provider account, or `None` before login.
     /// Reads only identity fields, never credentials.
     pub fn provider_id(&self, store: &Store) -> io::Result<Option<String>> {
+        Ok(self.login(store)?.map(|login| login.id))
+    }
+
+    /// The login with what tells it apart, or `None` before login. Codex
+    /// keeps the mail only next to its tokens, so it has none here.
+    pub fn login(&self, store: &Store) -> io::Result<Option<Login>> {
         match self.harness {
-            Harness::Claude => claude_id(&self.claude_global_config(store)),
-            Harness::Codex => {
-                Ok(codex_identity(&self.dir.join("sessions"))?.map(|k| short_hash(&k)))
-            }
+            Harness::Claude => claude_login(&self.claude_global_config(store)),
+            Harness::Codex => Ok(
+                codex_identity(&self.dir.join("sessions"))?.map(|key| Login {
+                    id: short_hash(&key),
+                    identity: Identity::default(),
+                }),
+            ),
         }
     }
 
@@ -298,29 +307,64 @@ pub fn short_hash(key: &str) -> String {
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// A signed-in account: the registry's id and what a person recognizes it by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Login {
+    pub id: String,
+    pub identity: Identity,
+}
+
+/// What tells logins apart on screen. Never written to hats' own files.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Identity {
+    pub email: Option<String>,
+    /// `Max`, `Pro`, `Team`, `Enterprise`.
+    pub plan: Option<String>,
+    /// The organization's name when it is not just the person's own.
+    pub organization: Option<String>,
+}
+
+/// `claude_max` to `Max`, `pro` to `Pro`.
+pub fn plan_name(kind: &str) -> String {
+    let kind = kind.strip_prefix("claude_").unwrap_or(kind);
+    let mut chars = kind.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
 #[derive(Deserialize)]
 struct ClaudeGlobalConfig {
     #[serde(rename = "oauthAccount")]
     oauth_account: Option<ClaudeOauthAccount>,
 }
 
+/// `oauthAccount` holds who is signed in, not how: the tokens live in the
+/// Keychain or `.credentials.json`, which hats never opens.
 #[derive(Deserialize)]
 struct ClaudeOauthAccount {
     #[serde(rename = "accountUuid")]
     account_uuid: String,
     #[serde(rename = "organizationUuid", default)]
     organization_uuid: Option<String>,
+    #[serde(rename = "emailAddress", default)]
+    email_address: Option<String>,
+    #[serde(rename = "organizationName", default)]
+    organization_name: Option<String>,
+    #[serde(rename = "organizationType", default)]
+    organization_type: Option<String>,
 }
 
 /// The registry's account id of the login in a Claude Code global config
 /// (`.claude.json`, or a copy of it), or `None` before login.
 pub fn claude_id(global_config: &Path) -> io::Result<Option<String>> {
-    Ok(claude_identity(global_config)?.map(|key| short_hash(&key)))
+    Ok(claude_login(global_config)?.map(|login| login.id))
 }
 
-/// `"<accountUuid>:<organizationUuid>"`: one login can belong to several
-/// organizations, and plan limits are per organization.
-fn claude_identity(global_config: &Path) -> io::Result<Option<String>> {
+/// The id hashes `"<accountUuid>:<organizationUuid>"`: one login can belong
+/// to several organizations, and plan limits are per organization.
+fn claude_login(global_config: &Path) -> io::Result<Option<Login>> {
     let bytes = match fs::read(global_config) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -328,11 +372,23 @@ fn claude_identity(global_config: &Path) -> io::Result<Option<String>> {
     };
     let config: ClaudeGlobalConfig = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
     Ok(config.oauth_account.map(|a| {
-        format!(
+        let key = format!(
             "{}:{}",
             a.account_uuid,
             a.organization_uuid.unwrap_or_default()
-        )
+        );
+        // A personal organization is named after its owner: nothing to add.
+        let organization = a
+            .organization_name
+            .filter(|n| !n.is_empty() && !n.contains('@') && !n.ends_with("'s Organization"));
+        Login {
+            id: short_hash(&key),
+            identity: Identity {
+                email: a.email_address.filter(|e| !e.is_empty()),
+                plan: a.organization_type.as_deref().map(plan_name),
+                organization,
+            },
+        }
     }))
 }
 
@@ -409,6 +465,14 @@ mod tests {
         ] {
             assert!(validate_label(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn plan_names() {
+        assert_eq!(plan_name("claude_max"), "Max");
+        assert_eq!(plan_name("claude_team"), "Team");
+        assert_eq!(plan_name("pro"), "Pro");
+        assert_eq!(plan_name(""), "");
     }
 
     #[test]

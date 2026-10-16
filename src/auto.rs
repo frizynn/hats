@@ -3,7 +3,7 @@
 
 use std::time::SystemTime;
 
-use crate::account::{Account, Harness};
+use crate::account::{Account, Harness, Identity};
 use crate::config::{HarnessConfig, Mode};
 use crate::limits::{self, Reading};
 use crate::policy::{self, Candidate, Reason};
@@ -14,6 +14,7 @@ use crate::store::Store;
 pub struct Status {
     pub account: Account,
     pub id: Option<String>,
+    pub identity: Identity,
     pub reading: Option<Reading>,
 }
 
@@ -47,7 +48,10 @@ pub fn statuses(
         if account.is_default && !account.dir.exists() {
             continue;
         }
-        let id = account.provider_id(store).unwrap_or(None);
+        let (id, mut identity) = match account.login(store).unwrap_or(None) {
+            Some(login) => (Some(login.id), login.identity),
+            None => (None, Identity::default()),
+        };
         let reading = match (harness, &id) {
             (Harness::Claude, Some(id)) => claude.get(id).cloned(),
             (Harness::Codex, Some(_)) => limits::codex_reading(&account.dir.join("sessions"))
@@ -55,9 +59,13 @@ pub fn statuses(
                 .flatten(),
             _ => None,
         };
+        if let Some(plan) = reading.as_ref().and_then(|r| r.plan.clone()) {
+            identity.plan.get_or_insert(plan);
+        }
         all.push(Status {
             account,
             id,
+            identity,
             reading,
         });
     }

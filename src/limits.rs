@@ -57,6 +57,8 @@ pub struct Reading {
     pub windows: Vec<LimitWindow>,
     /// Unix seconds until which a rate limit error counts the account as full.
     pub limited_until: Option<i64>,
+    /// The plan the reading names (Codex only), such as `Pro`.
+    pub plan: Option<String>,
 }
 
 impl Reading {
@@ -130,6 +132,7 @@ pub fn claude_readings(store: &Store) -> HashMap<String, Reading> {
                 observed_at: a.observed_at,
                 windows: a.windows,
                 limited_until: a.limited_until,
+                plan: None,
             };
             (a.account, reading)
         })
@@ -276,6 +279,7 @@ struct CodexPayload {
 struct CodexRateLimits {
     primary: Option<CodexWindow>,
     secondary: Option<CodexWindow>,
+    plan_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -306,6 +310,7 @@ pub fn codex_reading(sessions: &Path) -> io::Result<Option<Reading>> {
         let Some(limits) = event.payload.rate_limits else {
             continue;
         };
+        let plan = limits.plan_type.as_deref().map(crate::account::plan_name);
         let windows = [limits.primary, limits.secondary]
             .into_iter()
             .flatten()
@@ -319,6 +324,7 @@ pub fn codex_reading(sessions: &Path) -> io::Result<Option<Reading>> {
             observed_at,
             windows,
             limited_until: None,
+            plan,
         }));
     }
     Ok(None)
