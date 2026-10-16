@@ -35,7 +35,7 @@ fn statusline(sb: &Sandbox, account: Option<&str>, args: &[&str], input: &str) -
 }
 
 fn limits_path(sb: &Sandbox) -> std::path::PathBuf {
-    sb.home.join(".local/state/agent-accounts/limits.json")
+    sb.home.join(".local/state/hats/limits.json")
 }
 
 fn logged_in(sb: &Sandbox, label: &str) {

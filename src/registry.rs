@@ -4,7 +4,7 @@
 //! Line format, version 1 (fixed by `tests/registry_format.rs`):
 //!
 //! ```json
-//! {"v":1,"at":"2026-01-02T03:04:05.678Z","harness":"claude","account":"0123456789abcdef","label":"work","configDir":"/home/user/.local/share/agent-accounts/claude/work","session":"<id>"}
+//! {"v":1,"at":"2026-01-02T03:04:05.678Z","harness":"claude","account":"0123456789abcdef","label":"work","configDir":"/home/user/.local/share/hats/claude/work","session":"<id>"}
 //! ```
 //!
 //! `session` is present when the line comes from a harness session hook and

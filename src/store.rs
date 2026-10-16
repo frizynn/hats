@@ -10,9 +10,9 @@ use std::path::PathBuf;
 
 use crate::account::{Account, DEFAULT_LABEL, Harness, create_private_dir};
 
-pub const DATA_ENV: &str = "AGENT_ACCOUNTS_HOME";
-pub const STATE_ENV: &str = "AGENT_ACCOUNTS_STATE_DIR";
-const APP: &str = "agent-accounts";
+pub const DATA_ENV: &str = "HATS_HOME";
+pub const STATE_ENV: &str = "HATS_STATE_DIR";
+const APP: &str = "hats";
 
 pub struct Store {
     pub home: PathBuf,

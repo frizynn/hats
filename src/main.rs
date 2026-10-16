@@ -16,9 +16,9 @@ use registry::Switch;
 use store::Store;
 
 const USAGE: &str = "\
-agent-accounts: one config directory per Claude Code or Codex account
+hats: one config directory per Claude Code or Codex account
 
-Usage: agent-accounts <command> [--codex] [args] [-- harness args]
+Usage: hats <command> [--codex] [args] [-- harness args]
 
 Commands:
   list                  accounts, their ids and the current one
@@ -41,11 +41,11 @@ fn main() -> ExitCode {
     match run(std::env::args_os().skip(1).collect()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(Failure::Usage(msg)) => {
-            eprintln!("agent-accounts: {msg}\n\n{USAGE}");
+            eprintln!("hats: {msg}\n\n{USAGE}");
             ExitCode::from(2)
         }
         Err(Failure::Error(msg)) => {
-            eprintln!("agent-accounts: {msg}");
+            eprintln!("hats: {msg}");
             ExitCode::FAILURE
         }
     }
@@ -132,7 +132,7 @@ fn run(argv: Vec<OsString>) -> Result<(), Failure> {
 
     match args.command.as_str() {
         "help" => print!("{USAGE}"),
-        "version" => println!("agent-accounts {}", env!("CARGO_PKG_VERSION")),
+        "version" => println!("hats {}", env!("CARGO_PKG_VERSION")),
         "list" | "ls" => list(&store)?,
         "add" => {
             let account = Account::managed(harness, label(true)?.unwrap(), &store)?;
@@ -141,11 +141,7 @@ fn run(argv: Vec<OsString>) -> Result<(), Failure> {
             }
             account.create(&store)?;
             println!("created {} account '{}'", harness.name(), account.label);
-            println!(
-                "next: agent-accounts login{} {}",
-                codex_flag(harness),
-                account.label
-            );
+            println!("next: hats login{} {}", codex_flag(harness), account.label);
         }
         "login" => {
             let account = Account::find(harness, label(true)?.unwrap(), &store)?;
@@ -187,7 +183,7 @@ fn run(argv: Vec<OsString>) -> Result<(), Failure> {
                 if let Err(e) =
                     hook::session_start(&store, config_dir, io::stdin().lock(), SystemTime::now())
                 {
-                    eprintln!("agent-accounts hook: {e}");
+                    eprintln!("hats hook: {e}");
                 }
             }
             _ => return Err(Failure::Usage("hook takes: session-start".to_owned())),
@@ -204,7 +200,7 @@ fn run(argv: Vec<OsString>) -> Result<(), Failure> {
             let (summary, saved) =
                 statusline::record(&store, config_dir, &input, SystemTime::now());
             if let Err(e) = saved {
-                eprintln!("agent-accounts statusline: {e}");
+                eprintln!("hats statusline: {e}");
             }
             match args.passthrough.split_first() {
                 None => println!("{summary}"),
@@ -226,7 +222,7 @@ fn codex_flag(harness: Harness) -> &'static str {
 
 fn not_logged_in(account: &Account) -> String {
     format!(
-        "'{}' is not logged in: run agent-accounts login{} {}",
+        "'{}' is not logged in: run hats login{} {}",
         account.label,
         codex_flag(account.harness),
         account.label

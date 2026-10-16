@@ -329,7 +329,7 @@ fn state_paths_follow_overrides() {
     let alt = sb.home.join("alt");
     let out = sb
         .cmd(&["add", "work"])
-        .env("AGENT_ACCOUNTS_HOME", alt.join("data"))
+        .env("HATS_HOME", alt.join("data"))
         .env("XDG_STATE_HOME", alt.join("xdg-state"))
         .output()
         .unwrap();

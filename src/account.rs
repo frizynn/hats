@@ -145,7 +145,7 @@ impl Account {
         let account = Self::managed(harness, label, store)?;
         if !account.dir.is_dir() {
             return Err(format!(
-                "no {} account named '{label}' (see `agent-accounts list`)",
+                "no {} account named '{label}' (see `hats list`)",
                 harness.name()
             ));
         }

@@ -55,7 +55,7 @@ impl Sandbox {
 
     /// The tool with a clean environment: nothing from the real HOME leaks in.
     pub fn cmd(&self, args: &[&str]) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_agent-accounts"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_hats"));
         cmd.args(args)
             .env_clear()
             .env("HOME", &self.home)
@@ -72,11 +72,11 @@ impl Sandbox {
     }
 
     pub fn data(&self) -> PathBuf {
-        self.home.join(".local/share/agent-accounts")
+        self.home.join(".local/share/hats")
     }
 
     pub fn registry(&self) -> PathBuf {
-        self.home.join(".local/state/agent-accounts/switches.jsonl")
+        self.home.join(".local/state/hats/switches.jsonl")
     }
 
     pub fn registry_lines(&self) -> Vec<serde_json::Value> {
