@@ -22,6 +22,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::mem::MaybeUninit;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::SystemTime;
@@ -303,8 +304,7 @@ impl SignalSet {
     }
 
     fn block(&self) {
-        // SAFETY: a valid set; the previous mask is not needed. std resets the
-        // mask in children, so the agent still receives these signals.
+        // SAFETY: a valid set; the previous mask is not needed.
         unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &self.0, std::ptr::null_mut()) };
     }
 
@@ -378,11 +378,29 @@ pub fn supervise(
         libc::SIGTERM,
     ]);
     waited.block();
+    // SIGCHLD is ignored by default, and the kernel drops an ignored signal
+    // even while it is blocked, so sigwait would never see the agent exit
+    // (measured on macOS). A no-op handler makes it a real, waitable signal.
+    extern "C" fn noop(_: libc::c_int) {}
+    // SAFETY: installs a handler that does nothing; it never runs while the
+    // signal is blocked and taken by sigwait.
+    unsafe { libc::signal(libc::SIGCHLD, noop as *const () as libc::sighandler_t) };
 
     loop {
         let mut cmd = Command::new(account.harness.program());
         cmd.args(&args).env(PID_ENV, me.to_string());
         account.select(&mut cmd);
+        // The agent must get every signal: a blocked mask survives exec, and
+        // std does not clear it on macOS (measured: SIGTERM never reached it).
+        // SAFETY: only async-signal-safe calls between fork and exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                let mut empty = MaybeUninit::<libc::sigset_t>::uninit();
+                libc::sigemptyset(empty.as_mut_ptr());
+                libc::pthread_sigmask(libc::SIG_SETMASK, empty.as_ptr(), std::ptr::null_mut());
+                Ok(())
+            });
+        }
         let child = cmd
             .spawn()
             .map_err(|e| format!("could not start {}: {e}", account.harness.program()))?;

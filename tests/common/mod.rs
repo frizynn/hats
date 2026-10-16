@@ -114,3 +114,56 @@ pub fn assert_success(out: &Output, args: &[&str]) {
 pub fn mode(path: &Path) -> u32 {
     fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
+
+impl Sandbox {
+    /// Adds a signed-in Claude account; each organization is a distinct
+    /// provider account.
+    pub fn signed_in(&self, label: &str, org: &str) {
+        self.ok(&["add", label]);
+        let out = self
+            .cmd(&["login", label])
+            .env("FAKE_ORG_UUID", org)
+            .output()
+            .unwrap();
+        assert_success(&out, &["login", label]);
+    }
+
+    pub fn claude_dir(&self, label: &str) -> PathBuf {
+        self.data().join("claude").join(label)
+    }
+
+    /// Runs the status line wrapper as Claude Code would for `label`, with the
+    /// given 5-hour and weekly use.
+    pub fn repaint(&self, label: &str, five_hour: f64, seven_day: f64) -> Output {
+        use std::io::Write;
+        let input = format!(
+            r#"{{"session_id":"s-{label}","rate_limits":{{"five_hour":{{"used_percentage":{five_hour},"resets_at":4102444800}},"seven_day":{{"used_percentage":{seven_day},"resets_at":4102444800}}}}}}"#
+        );
+        let mut child = self
+            .cmd(&["statusline"])
+            .env("CLAUDE_CONFIG_DIR", self.claude_dir(label))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    pub fn current(&self) -> String {
+        let doc: serde_json::Value = serde_json::from_str(&self.ok(&["list", "--json"])).unwrap();
+        doc["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["current"] == true && a["harness"] == "claude")
+            .map(|a| a["label"].as_str().unwrap().to_owned())
+            .unwrap()
+    }
+}
