@@ -1128,6 +1128,44 @@ mod tests {
     }
 
     #[test]
+    fn close_idle_is_a_claude_setting() {
+        let (_dir, store) = sandbox();
+        account(&store, "work", None);
+        let mut app = App::new(&store, true);
+        let close_idle = || {
+            Config::load(&store.config)
+                .unwrap()
+                .get("claude.close_idle")
+                .unwrap()
+        };
+
+        app.on_key(key(KeyCode::Char('c')));
+        for _ in 0..4 {
+            app.on_key(key(KeyCode::Down));
+        }
+        assert!(
+            line_with(&text(&app), "close_idle").contains("‹ 32h ›"),
+            "{}",
+            text(&app)
+        );
+        app.on_key(key(KeyCode::Right));
+        assert_eq!(close_idle(), "33h");
+        app.on_key(shift(KeyCode::Left));
+        assert_eq!(close_idle(), "28h");
+        config::set(&store.config, "claude.close_idle", "1h").unwrap();
+        app.reload();
+        app.on_key(key(KeyCode::Left));
+        assert_eq!(close_idle(), "off");
+        assert!(
+            text(&app).contains("never"),
+            "the help says how to turn it off"
+        );
+
+        app.on_key(key(KeyCode::Tab));
+        assert!(!text(&app).contains("close_idle"), "Codex has no parent");
+    }
+
+    #[test]
     fn order_moves_the_selected_account() {
         let (_dir, store) = sandbox();
         for label in ["a", "x", "y"] {

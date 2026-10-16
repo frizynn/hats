@@ -394,6 +394,55 @@ mod tests {
     }
 
     #[test]
+    fn close_idle_takes_hours_a_unit_or_off_and_only_for_claude() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let get = || {
+            Config::load(&path)
+                .unwrap()
+                .get("claude.close_idle")
+                .unwrap()
+        };
+        assert_eq!(get(), "32h", "the default, with no file");
+        for (raw, shown) in [
+            ("32", "32h"),
+            ("5h", "5h"),
+            ("90m", "90m"),
+            ("120m", "2h"),
+            ("30s", "30s"),
+            ("0", "off"),
+            ("off", "off"),
+            ("1", "1h"),
+        ] {
+            set(&path, "claude.close_idle", raw).unwrap();
+            assert_eq!(get(), shown, "{raw}");
+        }
+        for bad in ["-1", "1.5", "1.5h", "2d", "h", "", "never"] {
+            assert!(set(&path, "claude.close_idle", bad).is_err(), "{bad}");
+        }
+        let err = set(&path, "codex.close_idle", "1").unwrap_err();
+        assert!(err.contains("Claude Code only"), "{err}");
+        assert!(
+            Config::load(&path)
+                .unwrap()
+                .get("codex.close_idle")
+                .is_err()
+        );
+        assert!(
+            !Config::default()
+                .entries()
+                .iter()
+                .any(|(k, _)| k == "codex.close_idle")
+        );
+
+        fs::write(&path, "[claude]\nclose_idle = 12\n").unwrap();
+        assert_eq!(get(), "12h", "a bare number in the file is hours too");
+        fs::write(&path, "[claude]\nclose_idle = 1.5\n").unwrap();
+        let err = Config::load(&path).unwrap_err();
+        assert!(err.contains("claude.close_idle"), "{err}");
+    }
+
+    #[test]
     fn load_names_the_bad_key() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
