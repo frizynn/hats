@@ -348,3 +348,38 @@ fn two_sessions_on_the_same_account_move_independently() {
     let run = sb.home.join(".local/state/hats/run");
     assert!(fs::read_dir(&run).map(|d| d.count() == 0).unwrap_or(true));
 }
+
+#[test]
+fn a_threshold_seen_long_after_the_turn_ended_waits_for_the_next_turn() {
+    let sb = two_accounts();
+    // The turn ends below the threshold; much later, while the user may be
+    // typing, a repaint (a permission mode change, the prompt cache expiring)
+    // reports the threshold passed.
+    let fake = r#"#!/bin/sh
+echo "start dir=$CLAUDE_CONFIG_DIR args=$*" >> "$FAKE_LOG"
+case " $* " in *" --resume "*) echo resumed >> "$FAKE_LOG"; exit 0 ;; esac
+trap 'echo term >> "$FAKE_LOG"; exit 143' TERM
+s=s-1
+printf '{"session_id":"%s","source":"startup"}' $s | "$HATS" hook session-start
+printf '{"session_id":"%s"}' $s | "$HATS" hook prompt
+echo "turn ended" >> "$FAKE_LOG"
+printf '{"session_id":"%s","hook_event_name":"Stop"}' $s | "$HATS" hook stop
+sleep 4
+printf '{"session_id":"%s","rate_limits":{"five_hour":{"used_percentage":95,"resets_at":4102444800}}}' $s | "$HATS" statusline > /dev/null
+echo "late repaint" >> "$FAKE_LOG"
+sleep 2
+echo "second turn" >> "$FAKE_LOG"
+printf '{"session_id":"%s"}' $s | "$HATS" hook prompt
+printf '{"session_id":"%s","hook_event_name":"Stop"}' $s | "$HATS" hook stop
+while :; do sleep 0.05; done
+"#;
+    let run = run_in_pty(&sb, fake, |_| {});
+    let lines: Vec<&str> = run.log.lines().collect();
+    assert_eq!(
+        &lines[1..5],
+        ["turn ended", "late repaint", "second turn", "term"],
+        "{}",
+        run.log
+    );
+    assert!(run.log.ends_with("resumed\n"), "{}", run.log);
+}
