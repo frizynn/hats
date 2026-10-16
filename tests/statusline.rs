@@ -25,7 +25,12 @@ fn statusline(sb: &Sandbox, account: Option<&str>, args: &[&str], input: &str) -
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
     child.wait_with_output().unwrap()
 }
 
@@ -45,7 +50,10 @@ fn records_limits_per_account_in_the_agreed_format() {
 
     let out = statusline(&sb, Some("work"), &[], INPUT);
     assert!(out.status.success());
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "work 5h 24% 7d 41%");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "work 5h 24% 7d 41%"
+    );
 
     let text = fs::read_to_string(limits_path(&sb)).unwrap();
     let observed = &text[text.find("\"observedAt\":").unwrap() + 13..];
@@ -91,13 +99,20 @@ fn chains_the_users_command_with_the_same_input() {
     let sb = Sandbox::new();
     logged_in(&sb, "work");
     let script = sb.home.join("mine.sh");
-    fs::write(&script, "#!/bin/sh\nprintf 'mine:'; wc -c | tr -d ' '\nexit 3\n").unwrap();
+    fs::write(
+        &script,
+        "#!/bin/sh\nprintf 'mine:'; wc -c | tr -d ' '\nexit 3\n",
+    )
+    .unwrap();
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
 
     let out = statusline(&sb, Some("work"), &["--", script.to_str().unwrap()], INPUT);
     assert_eq!(out.status.code(), Some(3));
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), format!("mine:{}", INPUT.len()));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("mine:{}", INPUT.len())
+    );
     assert!(limits_path(&sb).exists());
 }
 
@@ -107,7 +122,10 @@ fn without_limits_or_login_it_only_shows_the_account() {
     sb.ok(&["add", "work"]);
     let out = statusline(&sb, Some("work"), &[], INPUT);
     assert!(out.status.success());
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "work 5h 24% 7d 41%");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "work 5h 24% 7d 41%"
+    );
     assert!(!limits_path(&sb).exists(), "no id before login");
 
     sb.ok(&["login", "work"]);
@@ -118,4 +136,17 @@ fn without_limits_or_login_it_only_shows_the_account() {
     let out = statusline(&sb, None, &[], "garbage");
     assert!(out.status.success());
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "default");
+}
+
+#[test]
+fn unchanged_limits_are_not_rewritten_on_every_repaint() {
+    let sb = Sandbox::new();
+    logged_in(&sb, "work");
+    statusline(&sb, Some("work"), &[], INPUT);
+    let first = fs::read_to_string(limits_path(&sb)).unwrap();
+    statusline(&sb, Some("work"), &[], INPUT);
+    assert_eq!(fs::read_to_string(limits_path(&sb)).unwrap(), first);
+
+    statusline(&sb, Some("work"), &[], &INPUT.replace("41.2", "42"));
+    assert_ne!(fs::read_to_string(limits_path(&sb)).unwrap(), first);
 }

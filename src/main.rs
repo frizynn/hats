@@ -1,13 +1,14 @@
 mod account;
 mod hook;
 mod registry;
+mod statusline;
 mod store;
 
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 use std::time::SystemTime;
 
 use account::{Account, Harness};
@@ -28,6 +29,8 @@ Commands:
   env [label]           print the shell line that selects it
   remove <label>        sign out and delete its directory
   hook session-start    Claude Code SessionStart hook (records the session's account)
+  statusline [-- cmd]   Claude Code status line: keeps each account's plan limits
+                        and runs your own status line command with the same input
   setup                 print the hook and shell snippets to install
 
 Accounts are Claude Code accounts unless --codex is given. The label
@@ -189,6 +192,25 @@ fn run(argv: Vec<OsString>) -> Result<(), Failure> {
             }
             _ => return Err(Failure::Usage("hook takes: session-start".to_owned())),
         },
+        "statusline" => {
+            if !args.positional.is_empty() {
+                return Err(Failure::Usage(
+                    "statusline takes no label; pass your status line command after --".to_owned(),
+                ));
+            }
+            let mut input = Vec::new();
+            io::stdin().lock().take(1 << 20).read_to_end(&mut input)?;
+            let config_dir = std::env::var_os(Harness::Claude.env_var());
+            let (summary, saved) =
+                statusline::record(&store, config_dir, &input, SystemTime::now());
+            if let Err(e) = saved {
+                eprintln!("agent-accounts statusline: {e}");
+            }
+            match args.passthrough.split_first() {
+                None => println!("{summary}"),
+                Some((program, rest)) => chain(program, rest, &input)?,
+            }
+        }
         "setup" => setup()?,
         other => return Err(Failure::Usage(format!("unknown command '{other}'"))),
     }
@@ -218,6 +240,22 @@ fn exec_harness(account: &Account, args: &[&str], passthrough: &[OsString]) -> S
     select_account(&mut cmd, account);
     let err = cmd.exec();
     format!("could not start {}: {err}", account.harness.program())
+}
+
+/// Runs the user's own status line command with the same input and exits with
+/// its status; its output goes straight to Claude Code.
+fn chain(program: &OsStr, args: &[OsString], input: &[u8]) -> Result<(), Failure> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not start {}: {e}", program.to_string_lossy()))?;
+    let mut stdin = child.stdin.take().expect("piped");
+    // A command that does not read its input closes the pipe early; not an error.
+    let _ = stdin.write_all(input);
+    drop(stdin);
+    let status = child.wait()?;
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 fn select_account(cmd: &mut Command, account: &Account) {
