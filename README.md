@@ -267,8 +267,25 @@ Facts and links, so each operator decides. Read on 2026-10-16.
 
 ## Measurements
 
-Filled in from `/usr/bin/time -l`, 3 runs each; see the section at the end of
-this file once measured.
+macOS 26 on Apple silicon, release build, a throwaway HOME with 5 signed-in
+accounts whose `.claude.json` is 157 KB each. Peak memory from
+`/usr/bin/time -l`; time is the median wall time per process over 100 runs,
+which includes about 1.4 ms to start any process (`/usr/bin/true` measures
+1.40 to 1.42 ms the same way). Three runs each; the ranges cover them.
+
+| What | Time | Peak memory |
+|---|---|---|
+| Binary | | 1.2 MB (the interactive view is 0.2 MB of it) |
+| `hats --version`, `config`, `env` | 2.0 to 2.2 ms | 2.0 to 2.2 MB |
+| `hats list` / `list --json` | 2.8 to 3.0 ms | 2.7 to 2.8 MB |
+| `hook session-start` / `prompt` / `stop` | 2.0 to 2.2 ms | 2.1 to 2.4 MB |
+| `statusline` / chained to another command | 2.7 / 3.7 ms | 2.6 MB |
+| Interactive view, open and quit | | 2.7 MB; 0.00 s of CPU in 10 s without keys |
+| `hats run` parent, waiting | 0.00 s of CPU in 10 s, 1 thread | 1.4 MB physical footprint (2.6 MB RSS with shared system libraries) |
+| Processes left running | 0 | |
+
+claude-swap 0.26.0 on the same machine: about 50 ms and 35 MB to print its
+version, and its auto-switch loop stays resident at about 27 MB.
 
 ## Uninstall
 
