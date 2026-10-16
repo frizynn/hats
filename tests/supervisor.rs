@@ -64,16 +64,24 @@ fn two_accounts() -> Sandbox {
     sb
 }
 
+/// Puts `fake` on PATH as `claude`. Written only when it changes: on Linux,
+/// a file another thread is writing cannot be executed (ETXTBSY), and a
+/// fork in a parallel test briefly holds every descriptor open.
+fn install_fake(sb: &Sandbox, fake: &str) -> std::path::PathBuf {
+    let bin = sb.home.join("fake-bin");
+    if fs::read_to_string(bin.join("claude")).is_ok_and(|old| old == fake) {
+        return bin;
+    }
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(bin.join("claude"), fake).unwrap();
+    fs::set_permissions(bin.join("claude"), fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
 /// `hats run -- --dangerously-skip-permissions` in a pseudo-terminal with
 /// `fake` as Claude Code; `during` runs once the agent is up.
 fn run_in_pty(sb: &Sandbox, fake: &str, during: impl FnOnce(u32)) -> Run {
-    let bin = sb.home.join("fake-bin");
-    fs::create_dir_all(&bin).unwrap();
-    // Replaced by rename, so a session already running it is not disturbed.
-    let tmp = bin.join(format!("claude.{:?}", std::thread::current().id()));
-    fs::write(&tmp, fake).unwrap();
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
-    fs::rename(&tmp, bin.join("claude")).unwrap();
+    let bin = install_fake(sb, fake);
     let log = sb.home.join("fake.log");
 
     let (mut master, slave) = pty();
@@ -287,15 +295,20 @@ fn a_stop_request_during_a_move_ends_instead_of_relaunching() {
 #[test]
 fn the_agent_ends_when_its_parent_is_killed() {
     let sb = two_accounts();
-    let fake = "#!/bin/sh\ntrap 'echo hup >> \"$FAKE_LOG\"; exit 129' HUP\necho start >> \"$FAKE_LOG\"\nwhile :; do sleep 0.05; done\n";
+    let fake = "#!/bin/sh\ntrap '' INT\ntrap 'echo hup >> \"$FAKE_LOG\"; exit 129' HUP\necho start >> \"$FAKE_LOG\"\nwhile :; do sleep 0.05; done\n";
     let log = sb.home.join("fake.log");
     let group = std::cell::Cell::new(0);
     // Whatever happens, nothing of this test outlives it.
     let _cleanup = KillGroupOnDrop(&group);
     let run = run_in_pty(&sb, fake, |pid| {
         group.set(pid as libc::pid_t);
-        // SAFETY: killing our own child outright.
-        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        // SAFETY: signals to our own child's process group, then to the child.
+        unsafe {
+            // Ctrl+C reaches the whole group first: it must not disarm anything.
+            libc::kill(-(pid as libc::pid_t), libc::SIGINT);
+            std::thread::sleep(Duration::from_millis(200));
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
     });
     assert_eq!(run.status.signal(), Some(libc::SIGKILL));
     let started = Instant::now();
@@ -323,6 +336,7 @@ impl Drop for KillGroupOnDrop<'_> {
 #[test]
 fn two_sessions_on_the_same_account_move_independently() {
     let sb = two_accounts();
+    install_fake(&sb, FAKE);
     let runs: Vec<Run> = std::thread::scope(|s| {
         let a = s.spawn(|| run_in_pty(&sb, FAKE, |_| {}));
         let b = s.spawn(|| run_in_pty(&sb, FAKE, |_| {}));

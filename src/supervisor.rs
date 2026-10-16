@@ -22,8 +22,9 @@
 
 use std::ffi::OsString;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
+use std::os::fd::FromRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -401,7 +402,7 @@ pub fn supervise(
     unsafe { libc::signal(libc::SIGCHLD, noop as *const () as libc::sighandler_t) };
 
     let terminal = Terminal::save();
-    let _sentinel = Sentinel::spawn();
+    let sentinel = Sentinel::spawn();
 
     loop {
         let mut cmd = Command::new(account.harness.program());
@@ -412,15 +413,16 @@ pub fn supervise(
         // SAFETY: only async-signal-safe calls between fork and exec.
         unsafe {
             cmd.pre_exec(|| {
-                let mut empty = MaybeUninit::<libc::sigset_t>::uninit();
-                libc::sigemptyset(empty.as_mut_ptr());
-                libc::pthread_sigmask(libc::SIG_SETMASK, empty.as_ptr(), std::ptr::null_mut());
+                unblock_all_signals();
                 Ok(())
             });
         }
         let child = cmd
             .spawn()
             .map_err(|e| format!("could not start {}: {e}", account.harness.program()))?;
+        if let Some(sentinel) = &sentinel {
+            sentinel.watch(child.id());
+        }
         let mut moving: Option<Move> = None;
 
         let status = loop {
@@ -557,42 +559,94 @@ fn fresh_run_dir(store: &Store, pid: u32) -> io::Result<PathBuf> {
     Ok(dir)
 }
 
-/// A stopped child in the agent's process group, so the agent never outlives
-/// this parent. If the parent is killed outright (SIGKILL), the group loses
-/// its link to the shell with a stopped member in it, and the kernel sends
-/// the whole group SIGHUP then SIGCONT (POSIX orphaned process groups): the
-/// agent ends as it does when the terminal closes, and so does the sentinel.
-/// Otherwise an orphaned agent keeps running in the background, cannot read
-/// the terminal and still writes to it (measured with Claude Code 2.1.301).
-struct Sentinel(libc::pid_t);
+/// Async-signal-safe: callable between fork and exec.
+fn unblock_all_signals() {
+    let mut empty = MaybeUninit::<libc::sigset_t>::uninit();
+    // SAFETY: sigemptyset initializes the set before it is used.
+    unsafe {
+        libc::sigemptyset(empty.as_mut_ptr());
+        libc::pthread_sigmask(libc::SIG_SETMASK, empty.as_ptr(), std::ptr::null_mut());
+    }
+}
+
+/// A child that ends the agent if this parent dies without cleaning up
+/// (SIGKILL, a crash): otherwise the orphaned agent keeps running in the
+/// background, cannot read the terminal and still writes to it (measured
+/// with Claude Code 2.1.301). It sleeps in read(2) on a pipe that only this
+/// parent holds open and that carries the pid of each agent it starts; when
+/// the parent is gone the read returns end-of-file, and the sentinel sends
+/// the last agent SIGHUP, as a closed terminal would, and SIGCONT in case it
+/// was suspended.
+struct Sentinel {
+    pid: libc::pid_t,
+    pipe: fs::File,
+}
 
 impl Sentinel {
     fn spawn() -> Option<Self> {
-        // SAFETY: this process has one thread; the child only makes
-        // async-signal-safe calls and never returns from the loop.
+        let mut fds = [0; 2];
+        // SAFETY: pipe(2) fills both descriptors on success; the agent must
+        // not inherit them, or the pipe would never close.
+        let (read, write) = unsafe {
+            if libc::pipe(fds.as_mut_ptr()) != 0 {
+                return None;
+            }
+            for fd in fds {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            (fs::File::from_raw_fd(fds[0]), fs::File::from_raw_fd(fds[1]))
+        };
+        // SAFETY: this process has one thread; the child never returns.
         match unsafe { libc::fork() } {
             -1 => None,
-            0 => unsafe {
-                // SAFETY: as above; SIGHUP must reach it, so nothing stays blocked.
-                let mut empty = MaybeUninit::<libc::sigset_t>::uninit();
-                libc::sigemptyset(empty.as_mut_ptr());
-                libc::pthread_sigmask(libc::SIG_SETMASK, empty.as_ptr(), std::ptr::null_mut());
-                // `fg` continues the whole group; stop again.
-                loop {
-                    libc::raise(libc::SIGSTOP);
-                }
-            },
-            pid => Some(Self(pid)),
+            0 => {
+                drop(write);
+                sentinel_main(&read)
+            }
+            pid => Some(Self { pid, pipe: write }),
         }
+    }
+
+    fn watch(&self, agent: u32) {
+        // Four bytes, so one atomic write; if the sentinel is gone there is
+        // nothing to do about it.
+        let _ = (&self.pipe).write_all(&agent.to_ne_bytes());
+    }
+}
+
+fn sentinel_main(pipe: &fs::File) -> ! {
+    // SAFETY: plain signal-disposition and process calls in our own child.
+    unsafe {
+        // Ctrl+C and Ctrl+\ reach the whole process group; they are the agent's.
+        libc::signal(libc::SIGINT, libc::SIG_IGN);
+        libc::signal(libc::SIGQUIT, libc::SIG_IGN);
+        unblock_all_signals();
+        let mut agent = 0;
+        let mut buf = [0u8; 4];
+        loop {
+            match (&*pipe).read_exact(&mut buf) {
+                Ok(()) => agent = u32::from_ne_bytes(buf),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(_) => libc::_exit(1),
+            }
+        }
+        if agent > 0 {
+            libc::kill(agent as libc::pid_t, libc::SIGHUP);
+            libc::kill(agent as libc::pid_t, libc::SIGCONT);
+        }
+        libc::_exit(0)
     }
 }
 
 impl Drop for Sentinel {
     fn drop(&mut self) {
-        // SAFETY: our own child, reaped so it does not linger as a zombie.
+        // Killed before the pipe closes, so it never signals; reaped so it
+        // does not linger as a zombie.
+        // SAFETY: our own child.
         unsafe {
-            libc::kill(self.0, libc::SIGKILL);
-            libc::waitpid(self.0, std::ptr::null_mut(), 0);
+            libc::kill(self.pid, libc::SIGKILL);
+            libc::waitpid(self.pid, std::ptr::null_mut(), 0);
         }
     }
 }
