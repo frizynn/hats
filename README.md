@@ -293,6 +293,7 @@ which includes about 1.4 ms to start any process (`/usr/bin/true` measures
 | `statusline` / chained to another command | 2.7 / 3.7 ms | 2.6 MB |
 | Interactive view, open and quit | | 2.7 MB; 0.00 s of CPU in 10 s without keys |
 | `hats run` parent, waiting | 0.00 s of CPU in 10 s, 1 thread | 1.4 MB physical footprint (2.6 MB RSS with shared system libraries) |
+| Its sentinel, waiting | 0.00 s of CPU in 10 s | 0.8 MB physical footprint (1.0 MB RSS) |
 | Processes left running | 0 | |
 
 claude-swap 0.26.0 on the same machine: about 50 ms and 35 MB to print its
