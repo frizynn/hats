@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Switch Claude Code and Codex between accounts, one config directory each"
+license = "MIT"
+repository = "https://github.com/frizynn/hats"
+readme = "README.md"
+keywords = ["claude", "claude-code", "codex", "accounts", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = ["/.github/"]
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive", "wrap_help"] }

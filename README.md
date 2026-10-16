@@ -1,5 +1,8 @@
 # hats
 
+[![ci](https://github.com/frizynn/hats/actions/workflows/ci.yml/badge.svg)](https://github.com/frizynn/hats/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Switch Claude Code and Codex between accounts. One small binary, no daemon,
 no credentials touched.
 
@@ -25,10 +28,37 @@ Auto: at 90 % of either limit, it moves to the account with the most room.
 
 ## Install
 
-Requires Rust 1.89 or later. macOS and Linux.
+macOS and Linux.
+
+**Prebuilt binary.** Each [release](https://github.com/frizynn/hats/releases)
+has an archive per platform (`aarch64-apple-darwin`, `x86_64-apple-darwin`,
+`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`; the Linux ones are
+static and run on any distribution) and a `SHA256SUMS` file. This picks yours
+and puts `hats` in `~/.local/bin`, which must be on your `PATH`:
 
 ```sh
-cargo install --path .        # from a clone; installs ~/.cargo/bin/hats
+target=$(uname -m | sed s/arm64/aarch64/)-$(uname -s | sed 's/Darwin/apple-darwin/;s/Linux/unknown-linux-musl/')
+mkdir -p ~/.local/bin
+curl -fsSL "https://github.com/frizynn/hats/releases/latest/download/hats-$target.tar.gz" | tar -xz -C ~/.local/bin hats
+```
+
+**With Cargo.** Requires Rust 1.89 or later; installs `~/.cargo/bin/hats`.
+
+```sh
+cargo install --git https://github.com/frizynn/hats --locked
+```
+
+**From a clone.**
+
+```sh
+git clone https://github.com/frizynn/hats
+cd hats
+cargo install --path . --locked
+```
+
+Then, optionally, shell completions:
+
+```sh
 hats completions zsh > ~/.zfunc/_hats   # or bash, fish, elvish, powershell
 ```
 
@@ -146,22 +176,23 @@ Every change of account is recorded in the registry with its reason
 
 | Command | What it does |
 |---|---|
-| `hats` | interactive view: accounts, limits, switch, add, sign in, remove, settings |
+| `hats`, `hats tui` | interactive view: accounts, limits, switch, add, sign in, remove, settings |
 | `hats list [--json]` | accounts with their limits; `●` marks the one new sessions start with |
 | `hats add <label>` | create an account directory that shares your settings |
 | `hats login <label> [-- args]` | `claude auth login` (or `codex login`) inside that account |
 | `hats use <label>` | make it the default for new sessions |
+| `hats auto [on\|off]` | say whether accounts switch by themselves and the last change, or turn it on or off; nothing has to stay open |
 | `hats run [label] [-- args]` | start the harness with that account (default: the current one) |
 | `hats env [label]` | print `export CLAUDE_CONFIG_DIR=...` for `eval` or a terminal multiplexer pane |
 | `hats remove <label>` | sign out with the harness, then delete the directory (links only, never the shared files) |
 | `hats config [list\|get\|set\|edit\|path]` | settings; `hats config` lists every key with its meaning |
 | `hats setup [--dry-run\|--undo]` | install or remove the hooks, the status line wrapper and the shell functions; run it again after moving the binary |
-| `hats import claude-swap` | take claude-swap's account order and settings (never its tokens) |
+| `hats import claude-swap [--from <dir>]` | take claude-swap's account order, settings and last limits (never its tokens) |
 | `hats completions <shell>` | shell completions |
 | `hats statusline [-- your command]` | the status line wrapper `setup` installs |
 
-Add `--codex` to act on Codex accounts. Every command has `--help` with
-examples; errors say what to run next.
+Add `--codex` to act on Codex accounts. Every command has `--help`, and
+`hats --help` ends with examples; errors say what to run next.
 
 ## Configuration
 
@@ -262,8 +293,9 @@ Facts and links, so each operator decides. Read on 2026-10-16.
   give each account its own configuration directory."
   ([Claude Code authentication](https://code.claude.com/docs/en/authentication#log-in-with-multiple-accounts))
 - Anthropic on tools that handle subscription credentials: "developers may
-  not collect, store, or intermediate Claude.ai credentials or session tokens
-  — sign-in to a Claude account must complete through Anthropic's own flow."
+  not collect, store, or intermediate Claude.ai credentials or session
+  tokens", and "sign-in to a Claude account must complete through Anthropic's
+  own flow."
   ([Legal and compliance](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use))
   hats does not.
 - Anthropic on usage limits: "Advertised usage limits for Pro and Max plans
@@ -323,7 +355,7 @@ version, and its auto-switch loop stays resident at about 27 MB.
 hats setup --undo                      # removes the hooks, status line wrapper and shell functions
 hats remove <label>                    # per account: signs out with the harness, deletes the directory
 rm -r ~/.local/state/hats ~/.config/hats
-cargo uninstall hats
+rm ~/.local/bin/hats                   # or `cargo uninstall hats` if Cargo installed it
 ```
 
 ## Development
@@ -333,3 +365,10 @@ cargo test                               # every test uses a throwaway HOME and 
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
+
+CI runs these on macOS and Linux for every pull request. Pushing a `v*` tag
+builds the four archives and publishes a release.
+
+## License
+
+[MIT](LICENSE)
