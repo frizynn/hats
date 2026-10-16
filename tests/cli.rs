@@ -481,3 +481,12 @@ fn history_a_new_account_writes_is_shared_and_survives_remove() {
         );
     }
 }
+
+#[test]
+fn help_describes_the_label_argument() {
+    let sb = Sandbox::new();
+    for command in ["add", "login", "use", "run", "env", "remove"] {
+        let help = sb.ok(&[command, "--help"]);
+        assert!(help.contains("Account label"), "{command}: {help}");
+    }
+}
