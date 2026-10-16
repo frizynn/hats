@@ -40,6 +40,12 @@ hats                   # see your accounts and their limits
 From then on, `claude` in a new terminal starts with the current account. Your
 existing `~/.claude` login keeps working as the account named `default`.
 
+`hats setup` shows every change before writing and keeps a backup of each file
+next to it, never over an earlier one. Running it again changes nothing, or
+points the hooks at the new place if you moved the binary. `hats setup --undo`
+takes it all out, and writes back your original bytes if you changed nothing
+else in the meantime.
+
 For Codex, add `--codex` to the same commands: `hats --codex add personal`,
 `hats --codex login personal`.
 
@@ -94,7 +100,10 @@ moves.
 
 **Running sessions.** Started with `hats run` (or the `claude` function that
 `hats setup` installs), an interactive Claude Code session has hats as its
-parent: one process, about 1 MB, asleep in `sigwait` until something happens.
+parent: one process, about 1 MB, asleep in `sigwait` until something happens,
+plus a forked sentinel asleep on a pipe that ends Claude Code with `SIGHUP` if
+the parent is ever killed outright, so the agent is never left running in the
+background.
 When the session's account passes the threshold or hits the limit, hats waits
 until the agent is idle (the `Stop` hook ran and no prompt came after it),
 waits one more second, ends Claude Code with `SIGTERM` and starts it again in
@@ -114,6 +123,8 @@ Limits of the running-session move:
   that session (it starts it with `exec`) rather than guess.
 - The move restarts Claude Code: background shells and MCP servers it started
   are restarted too.
+- If Claude Code dies of a signal it cannot handle (`kill -9`, the OOM
+  killer), hats restores the terminal settings and modes before exiting.
 
 Every change of account is recorded in the registry with its reason
 (`manual`, `threshold` or `limit`).
@@ -131,7 +142,7 @@ Every change of account is recorded in the registry with its reason
 | `hats env [label]` | print `export CLAUDE_CONFIG_DIR=...` for `eval` or a terminal multiplexer pane |
 | `hats remove <label>` | sign out with the harness, then delete the directory (links only, never the shared files) |
 | `hats config [list\|get\|set\|edit\|path]` | settings; `hats config` lists every key with its meaning |
-| `hats setup [--dry-run\|--undo]` | install or remove the hooks, the status line wrapper and the shell functions |
+| `hats setup [--dry-run\|--undo]` | install or remove the hooks, the status line wrapper and the shell functions; run it again after moving the binary |
 | `hats import claude-swap` | take claude-swap's account order and settings (never its tokens) |
 | `hats completions <shell>` | shell completions |
 | `hats statusline [-- your command]` | the status line wrapper `setup` installs |
@@ -169,7 +180,7 @@ relaunch = "idle"
 | Registry of account changes | `$XDG_STATE_HOME/hats/switches.jsonl` (default `~/.local/state/hats`), or `$HATS_STATE_DIR` | 0600 |
 | Last limits per account | `$XDG_STATE_HOME/hats/limits.json` | 0600 |
 | Current account per harness | `$XDG_STATE_HOME/hats/current-claude`, `current-codex` | |
-| Settings | `$XDG_CONFIG_HOME/hats/config.toml` | |
+| Settings | `$XDG_CONFIG_HOME/hats/config.toml` | 0600 |
 | Credentials | where the harness keeps them; hats never reads them | |
 
 Keep `$XDG_DATA_HOME` stable: Claude Code names each account's Keychain entry
