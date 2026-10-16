@@ -150,3 +150,68 @@ fn unchanged_limits_are_not_rewritten_on_every_repaint() {
     statusline(&sb, Some("work"), &[], &INPUT.replace("41.2", "42"));
     assert_ne!(fs::read_to_string(limits_path(&sb)).unwrap(), first);
 }
+
+#[test]
+fn concurrent_repaints_of_every_account_lose_nothing() {
+    let sb = Sandbox::new();
+    let labels: Vec<String> = (0..6).map(|i| format!("a{i}")).collect();
+    for label in &labels {
+        sb.signed_in(label, &format!("org-{label}"));
+    }
+    sb.ok(&["use", "a0"]);
+    // a0 is past the threshold, so its repaints also move the default.
+    let mut children = Vec::new();
+    for round in 0..4 {
+        for (i, label) in labels.iter().enumerate() {
+            let used = if i == 0 { 95 } else { 10 + i * 5 + round };
+            let input = format!(
+                r#"{{"session_id":"s-{label}","rate_limits":{{"five_hour":{{"used_percentage":{used},"resets_at":4102444800}}}}}}"#
+            );
+            let mut child = sb
+                .cmd(&["statusline"])
+                .env("CLAUDE_CONFIG_DIR", sb.claude_dir(label))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+            children.push(child);
+        }
+    }
+    for child in children {
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success() && out.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let doc: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(limits_path(&sb)).unwrap()).unwrap();
+    let mut seen: Vec<&str> = doc["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["label"].as_str().unwrap())
+        .collect();
+    seen.sort_unstable();
+    assert_eq!(seen, labels);
+    assert_eq!(mode(&limits_path(&sb)), 0o600);
+    // Every registry line is whole, and the default left a0 for an account with room.
+    let lines = sb.registry_lines();
+    assert!(lines.iter().any(|l| l["reason"] == "threshold"));
+    assert_ne!(sb.current(), "a0");
+    let leftovers: Vec<_> = fs::read_dir(sb.home.join(".local/state/hats"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.contains("tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
