@@ -268,7 +268,7 @@ fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         crate::account::create_private_dir(dir)?;
     }
-    let tmp = path.with_extension("toml.tmp");
+    let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
     fs::write(&tmp, bytes)?;
     fs::rename(tmp, path)
 }

@@ -348,7 +348,7 @@ fn launch(
     let account = chosen(store, harness, label)?;
     // Picks up shared files the user created since the account was added.
     account.create(store)?;
-    if supervisor::should_supervise(harness, settings, &args) {
+    if supervisor::should_supervise(&account, settings, &args) {
         let code = supervisor::supervise(store, settings, account, args)?;
         return Err(Failure::Exit(code.clamp(0, 255) as u8));
     }

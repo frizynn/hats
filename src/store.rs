@@ -80,7 +80,7 @@ impl Store {
     pub fn set_current(&self, account: &Account) -> io::Result<()> {
         self.ensure_state()?;
         let path = self.current_file(account.harness);
-        let tmp = path.with_extension("tmp");
+        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
         fs::write(&tmp, format!("{}\n", account.label))?;
         fs::rename(tmp, path)
     }

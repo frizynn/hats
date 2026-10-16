@@ -9,8 +9,9 @@
 //! hooks and status line wake it with SIGUSR1 after writing to its run
 //! directory (`<state>/run/<pid>/`):
 //!
-//! - `busy`: created by the `UserPromptSubmit` hook, removed by `Stop` and
-//!   `StopFailure`. A move waits until it is gone, so a turn is never cut.
+//! - `idle`: created by the `Stop` and `StopFailure` hooks, removed by
+//!   `UserPromptSubmit`. A move happens only while it exists, so a turn is
+//!   never cut, and without the hooks a session is never moved.
 //! - `move.json`: written by the status line wrapper when the session's
 //!   account passed the threshold, or by `StopFailure` on a rate limit.
 //!
@@ -105,9 +106,12 @@ pub fn request_move(
 
 /// `UserPromptSubmit` hook: the agent is working.
 pub fn mark_busy(store: &Store) -> io::Result<()> {
-    match parent_dir(store) {
-        Some((_, dir)) => fs::write(dir.join("busy"), b""),
-        None => Ok(()),
+    let Some((_, dir)) = parent_dir(store) else {
+        return Ok(());
+    };
+    match fs::remove_file(dir.join("idle")) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
     }
 }
 
@@ -117,11 +121,7 @@ pub fn mark_idle(store: &Store, session: &str, rate_limited: bool) -> io::Result
     let Some((pid, dir)) = parent_dir(store) else {
         return Ok(());
     };
-    match fs::remove_file(dir.join("busy")) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
+    fs::write(dir.join("idle"), b"")?;
     if rate_limited {
         write_request(&dir, session, Reason::Limit)?;
     }
@@ -278,14 +278,26 @@ const SUBCOMMANDS: &[&str] = &[
 ];
 
 /// Whether `hats run` should stay as the parent of this launch.
-pub fn should_supervise(harness: Harness, config: &HarnessConfig, args: &[OsString]) -> bool {
+/// Whether `hats run` should stay as the parent of this launch: an
+/// interactive Claude Code session, in auto mode, whose settings run the
+/// hooks that say when the agent is idle.
+pub fn should_supervise(account: &Account, config: &HarnessConfig, args: &[OsString]) -> bool {
     // SAFETY: isatty(3) on the standard descriptors.
     let tty = unsafe { libc::isatty(0) == 1 && libc::isatty(1) == 1 };
-    harness == Harness::Claude
+    account.harness == Harness::Claude
         && config.mode == Mode::Auto
         && config.relaunch == Relaunch::Idle
         && tty
         && relaunch_args(args, "probe").is_some()
+        && idle_hooks_installed(&account.dir.join("settings.json"))
+}
+
+/// Whether `settings` runs `hats hook prompt` and `hats hook stop`.
+fn idle_hooks_installed(settings: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(settings) else {
+        return false;
+    };
+    text.contains(" hook prompt\"") && text.contains(" hook stop\"")
 }
 
 struct SignalSet(libc::sigset_t);
@@ -352,6 +364,7 @@ struct Move {
     reason: Reason,
     session: String,
     term_sent: bool,
+    killed: bool,
 }
 
 /// Runs Claude Code for `account` and moves it between accounts until it
@@ -385,6 +398,8 @@ pub fn supervise(
     // SAFETY: installs a handler that does nothing; it never runs while the
     // signal is blocked and taken by sigwait.
     unsafe { libc::signal(libc::SIGCHLD, noop as *const () as libc::sighandler_t) };
+
+    let terminal = Terminal::save();
 
     loop {
         let mut cmd = Command::new(account.harness.program());
@@ -420,7 +435,7 @@ pub fn supervise(
                     ChildState::Running => {}
                 },
                 libc::SIGUSR1 => {
-                    if moving.is_none() && !dir.join("busy").exists() {
+                    if moving.is_none() && dir.join("idle").exists() {
                         moving = plan_move(store, config, &account, &dir);
                         if moving.is_some() {
                             // SAFETY: alarm(3) schedules SIGALRM, which is blocked and waited for.
@@ -433,7 +448,8 @@ pub fn supervise(
                     if m.term_sent {
                         // SAFETY: our own child.
                         unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGKILL) };
-                    } else if dir.join("busy").exists() {
+                        m.killed = true;
+                    } else if !dir.join("idle").exists() {
                         // A prompt arrived during the grace period: try again
                         // at the next idle point.
                         let m = moving.take().expect("checked");
@@ -470,9 +486,12 @@ pub fn supervise(
                     Some(m.reason),
                 );
                 registry::append(&store.registry(), &line).map_err(|e| e.to_string())?;
+                if m.killed {
+                    terminal.restore();
+                }
                 args = relaunch_args(&args, &m.session).expect("checked before supervising");
                 account = m.to;
-                let _ = fs::remove_file(dir.join("busy"));
+                let _ = fs::remove_file(dir.join("idle"));
             }
             _ => return Ok(status),
         }
@@ -493,7 +512,34 @@ fn plan_move(store: &Store, config: &HarnessConfig, account: &Account, dir: &Pat
         reason,
         session: request.session,
         term_sent: false,
+        killed: false,
     })
+}
+
+/// The terminal settings from before the agent started. Claude Code resets
+/// its own modes on SIGTERM; this is only for an agent that had to be killed.
+struct Terminal(Option<libc::termios>);
+
+impl Terminal {
+    fn save() -> Self {
+        let mut t = MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: tcgetattr fills the struct when it returns 0.
+        let ok = unsafe { libc::tcgetattr(0, t.as_mut_ptr()) == 0 };
+        // SAFETY: initialized when ok.
+        Self(ok.then(|| unsafe { t.assume_init() }))
+    }
+
+    fn restore(&self) {
+        if let Some(t) = &self.0 {
+            // SAFETY: a termios read from this terminal.
+            unsafe { libc::tcsetattr(0, libc::TCSANOW, t) };
+        }
+        // Bracketed paste, focus events and mouse reporting off, kitty
+        // keyboard flags popped, cursor shown.
+        let reset =
+            b"\x1b[?2004l\x1b[?1004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[<u\x1b[?25h";
+        let _ = io::Write::write_all(&mut io::stdout(), reset);
+    }
 }
 
 struct RemoveOnDrop(PathBuf);

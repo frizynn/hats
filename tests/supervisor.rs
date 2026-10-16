@@ -56,6 +56,8 @@ fn two_accounts() -> Sandbox {
     sb.signed_in("work", "org-work");
     sb.signed_in("side", "org-side");
     sb.ok(&["use", "work"]);
+    // The idle hooks are what make a move safe; setup installs them.
+    sb.ok(&["setup"]);
     sb
 }
 
@@ -205,4 +207,26 @@ fn a_closed_terminal_ends_both() {
     assert!(run.log.contains("hup"), "{}", run.log);
     assert_eq!(run.status.code(), Some(129));
     assert!(run.elapsed < Duration::from_secs(5));
+}
+
+#[test]
+fn without_the_idle_hooks_a_session_is_never_supervised() {
+    let sb = two_accounts();
+    sb.ok(&["setup", "--undo"]);
+    let fake = "#!/bin/sh\necho \"start parent=${HATS_SUPERVISOR:-none}\" >> \"$FAKE_LOG\"\n";
+    let run = run_in_pty(&sb, fake, |_| {});
+    assert_eq!(run.log.trim(), "start parent=none");
+}
+
+#[test]
+fn an_agent_that_ignores_sigterm_is_killed_after_ten_seconds() {
+    let sb = two_accounts();
+    let fake = FAKE.replace(
+        "trap 'echo term >> \"$FAKE_LOG\"; exit 143' TERM",
+        "trap '' TERM",
+    );
+    let run = run_in_pty(&sb, &fake, |_| {});
+    assert!(run.log.ends_with("resumed\n"), "{}", run.log);
+    assert!(run.elapsed >= Duration::from_secs(11), "{:?}", run.elapsed);
+    assert!(run.status.success());
 }
