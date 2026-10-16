@@ -162,3 +162,64 @@ fn another_accounts_session_does_not_move_the_default() {
     sb.repaint("side", 99.0, 0.0);
     assert_eq!(sb.current(), "work");
 }
+
+/// A Codex rollout as Codex writes it: a session header, then events; the
+/// last `token_count` carries the account's limits.
+fn rollout(sb: &Sandbox, label: &str, account_id: &str, used: f64) {
+    let dir = sb
+        .data()
+        .join("codex")
+        .join(label)
+        .join("sessions/2026/01/02");
+    std::fs::create_dir_all(&dir).unwrap();
+    let header = format!(
+        r#"{{"type":"session_meta","payload":{{"id":"x","creator_account_id":"{account_id}"}}}}"#
+    );
+    let old = r#"{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":1.0,"window_minutes":300,"resets_at":4102444800}}}}"#;
+    let new = format!(
+        r#"{{"type":"event_msg","payload":{{"type":"token_count","rate_limits":{{"limit_id":"codex","primary":{{"used_percent":{used},"window_minutes":300,"resets_at":4102444800}},"secondary":null,"plan_type":"pro"}}}}}}"#
+    );
+    std::fs::write(
+        dir.join("rollout-2026-01-02T10-00-00-x.jsonl"),
+        format!("{header}\n{old}\n{new}\n"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn codex_new_sessions_move_using_rollout_limits() {
+    let sb = Sandbox::new();
+    std::fs::create_dir_all(sb.home.join(".codex")).unwrap();
+    sb.ok(&["--codex", "add", "main"]);
+    sb.ok(&["--codex", "add", "alt"]);
+    rollout(&sb, "main", "acct-main", 96.0);
+    rollout(&sb, "alt", "acct-alt", 30.0);
+    sb.ok(&["--codex", "use", "main"]);
+
+    let list = sb.ok(&["list", "--json"]);
+    let doc: serde_json::Value = serde_json::from_str(&list).unwrap();
+    let main = doc["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["label"] == "main")
+        .unwrap();
+    assert_eq!(main["usedPercent"], 96.0);
+    assert_eq!(main["limits"]["windows"][0]["name"], "five_hour");
+
+    let out = sb.ok(&["--codex", "run"]);
+    let alt = sb.data().join("codex/alt");
+    assert!(
+        out.contains(&format!("CODEX_HOME={}", alt.display())),
+        "{out}"
+    );
+    let last = sb.registry_lines().pop().unwrap();
+    assert_eq!(
+        (
+            last["harness"].as_str(),
+            last["label"].as_str(),
+            last["reason"].as_str()
+        ),
+        (Some("codex"), Some("alt"), Some("threshold"))
+    );
+}
