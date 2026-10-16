@@ -23,7 +23,7 @@ CLAUDE  auto · threshold 90 % · headroom
 
 ## Install
 
-macOS and Linux. Pick one of three ways.
+macOS and Linux.
 
 **Prebuilt binary.** Each [release](https://github.com/frizynn/hats/releases)
 has an archive per platform (`aarch64-apple-darwin`, `x86_64-apple-darwin`,
