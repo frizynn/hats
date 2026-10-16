@@ -233,7 +233,10 @@ pub fn set(path: &Path, full_key: &str, raw: &str) -> Result<(), String> {
             let labels = raw.split(',').map(str::trim).filter(|s| !s.is_empty());
             let mut array = Array::new();
             for label in labels {
-                crate::account::validate_label(label)?;
+                // `default`, the harness's own directory, can be ordered too.
+                if label != crate::account::DEFAULT_LABEL {
+                    crate::account::validate_label(label)?;
+                }
                 array.push(label);
             }
             Item::Value(Value::Array(array))
@@ -351,11 +354,11 @@ mod tests {
         let path = dir.path().join("hats/config.toml");
         set(&path, "claude.threshold", "85").unwrap();
         set(&path, "codex.mode", "manual").unwrap();
-        set(&path, "claude.order", "work, personal").unwrap();
+        set(&path, "claude.order", "work, default, personal").unwrap();
         let config = Config::load(&path).unwrap();
         assert_eq!(config.claude.threshold, 85);
         assert_eq!(config.codex.mode, Mode::Manual);
-        assert_eq!(config.claude.order, ["work", "personal"]);
+        assert_eq!(config.claude.order, ["work", "default", "personal"]);
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("# Percent of the 5-hour or weekly limit"));
 

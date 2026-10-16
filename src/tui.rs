@@ -489,17 +489,9 @@ impl<'a> App<'a> {
             return Step::Idle;
         };
         let mut labels: Vec<&str> = statuses.iter().map(|s| s.account.label.as_str()).collect();
-        // `order` takes only labels of accounts added with hats.
-        if labels[from] == DEFAULT_LABEL || labels[to] == DEFAULT_LABEL {
-            self.fail(format!(
-                "'{DEFAULT_LABEL}' cannot be ordered: it follows the accounts added with hats."
-            ));
-            return Step::Redraw;
-        }
         labels.swap(from, to);
         let moved = labels[to].to_owned();
-        let order: Vec<&str> = labels.into_iter().filter(|l| *l != DEFAULT_LABEL).collect();
-        let order = order.join(",");
+        let order = labels.join(",");
         let step = self.save("order", &order);
         self.select_label(Some(&moved));
         step
@@ -1099,16 +1091,16 @@ mod tests {
         assert_eq!(labels(&app), ["a", "default", "x", "y"]);
         app.select_label(Some("x"));
 
+        // `default` is ordered like any other account.
         app.on_key(key(KeyCode::Char('K')));
-        assert!(app.message.as_ref().is_some_and(|m| m.error));
-        assert!(!store.config.exists());
-        app.on_key(key(KeyCode::Char('J')));
-        assert_eq!(order(), ["a", "y", "x"]);
-        assert_eq!(labels(&app), ["a", "y", "x", "default"]);
+        assert_eq!(order(), ["a", "x", "default", "y"]);
+        assert_eq!(labels(&app), ["a", "x", "default", "y"]);
         assert_eq!(app.selected_status().unwrap().account.label, "x");
+        app.on_key(key(KeyCode::Char('J')));
+        assert_eq!(order(), ["a", "default", "x", "y"]);
 
         app.on_key(shift(KeyCode::Up));
-        assert_eq!(order(), ["a", "x", "y"]);
+        assert_eq!(order(), ["a", "x", "default", "y"]);
         assert_eq!(app.selected, 1);
 
         app.on_key(key(KeyCode::Char('c')));
@@ -1116,7 +1108,7 @@ mod tests {
         assert_eq!(app.panel, Panel::Settings(Field::Order));
         app.on_key(key(KeyCode::Left));
         app.on_key(shift(KeyCode::Right));
-        assert_eq!(order(), ["x", "a", "y"]);
+        assert_eq!(order(), ["x", "a", "default", "y"]);
     }
 
     #[test]
