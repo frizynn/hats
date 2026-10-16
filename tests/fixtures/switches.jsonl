@@ -1,4 +1,6 @@
-{"v":1,"at":"2026-01-02T03:04:05.678Z","harness":"claude","account":"9ae25bfbd05c9e76","label":"work","configDir":"/home/user/.local/share/hats/claude/work"}
+{"v":1,"at":"2026-01-02T03:04:05.678Z","harness":"claude","account":"9ae25bfbd05c9e76","label":"work","configDir":"/home/user/.local/share/hats/claude/work","reason":"manual"}
 {"v":1,"at":"2026-01-02T03:10:00.000Z","harness":"claude","account":"9ae25bfbd05c9e76","label":"work","configDir":"/home/user/.local/share/hats/claude/work","session":"11111111-2222-4333-8444-555555555555"}
-{"v":1,"at":"2026-01-02T04:00:00.001Z","harness":"claude","account":"0123456789abcdef","label":"default","configDir":"/home/user/.claude","session":"11111111-2222-4333-8444-555555555555"}
-{"v":1,"at":"2026-01-02T05:00:00.000Z","harness":"codex","account":"9a00cf1657c91b7f","label":"personal","configDir":"/home/user/.local/share/hats/codex/personal"}
+{"v":1,"at":"2026-01-02T04:00:00.001Z","harness":"claude","account":"0123456789abcdef","label":"personal","configDir":"/home/user/.local/share/hats/claude/personal","reason":"threshold"}
+{"v":1,"at":"2026-01-02T04:00:02.500Z","harness":"claude","account":"0123456789abcdef","label":"personal","configDir":"/home/user/.local/share/hats/claude/personal","session":"11111111-2222-4333-8444-555555555555","reason":"threshold"}
+{"v":1,"at":"2026-01-02T04:00:05.000Z","harness":"claude","account":"0123456789abcdef","label":"personal","configDir":"/home/user/.local/share/hats/claude/personal","session":"11111111-2222-4333-8444-555555555555"}
+{"v":1,"at":"2026-01-02T05:00:00.000Z","harness":"codex","account":"9a00cf1657c91b7f","label":"default","configDir":"/home/user/.codex","reason":"limit"}

@@ -213,6 +213,17 @@ impl Account {
         Ok(())
     }
 
+    /// Points `cmd` at this account: the account's directory in the harness's
+    /// variable, or the variable removed for the harness's own directory.
+    pub fn select(&self, cmd: &mut std::process::Command) {
+        let var = self.harness.env_var();
+        if self.is_default {
+            cmd.env_remove(var);
+        } else {
+            cmd.env(var, &self.dir);
+        }
+    }
+
     /// Stable id of the logged-in provider account, or `None` before login.
     /// Reads only identity fields, never credentials.
     pub fn provider_id(&self, store: &Store) -> io::Result<Option<String>> {
@@ -309,17 +320,11 @@ struct CodexSessionMeta {
     creator_account_id: Option<String>,
 }
 
-/// `creator_account_id` from the header of the newest rollout. Rollouts live
-/// in `sessions/YYYY/MM/DD/rollout-<timestamp>-<id>.jsonl`, so the newest is
-/// the greatest name at each level.
+/// `creator_account_id` from the header of the newest rollout.
 fn codex_identity(sessions: &Path) -> io::Result<Option<String>> {
-    let mut path = sessions.to_path_buf();
-    for _ in 0..4 {
-        match greatest_entry(&path)? {
-            Some(next) => path = next,
-            None => return Ok(None),
-        }
-    }
+    let Some(path) = newest_rollout(sessions)? else {
+        return Ok(None);
+    };
     let mut first = String::new();
     BufReader::new(fs::File::open(&path)?).read_line(&mut first)?;
     let header: CodexRolloutHeader = match serde_json::from_str(&first) {
@@ -327,6 +332,19 @@ fn codex_identity(sessions: &Path) -> io::Result<Option<String>> {
         Err(_) => return Ok(None),
     };
     Ok(header.payload.creator_account_id)
+}
+
+/// Rollouts live in `sessions/YYYY/MM/DD/rollout-<timestamp>-<id>.jsonl`, so
+/// the newest is the greatest name at each level.
+pub fn newest_rollout(sessions: &Path) -> io::Result<Option<PathBuf>> {
+    let mut path = sessions.to_path_buf();
+    for _ in 0..4 {
+        match greatest_entry(&path)? {
+            Some(next) => path = next,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(path))
 }
 
 fn greatest_entry(dir: &Path) -> io::Result<Option<PathBuf>> {

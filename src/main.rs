@@ -1,59 +1,165 @@
 mod account;
+mod auto;
+mod config;
 mod hook;
+mod import;
+mod limits;
+mod policy;
 mod registry;
+mod setup;
 mod statusline;
 mod store;
+mod supervisor;
+mod tui;
+mod view;
 
-use std::ffi::{OsStr, OsString};
-use std::io::{self, Read, Write};
+use std::ffi::OsString;
+use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
 use std::time::SystemTime;
 
-use account::{Account, Harness};
-use registry::Switch;
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+
+use account::{Account, DEFAULT_LABEL, Harness};
+use config::Config;
+use policy::Reason;
 use store::Store;
 
-const USAGE: &str = "\
-hats: one config directory per Claude Code or Codex account
+const EXAMPLES: &str = "\
+Examples:
+  hats add work && hats login work      add an account and sign in with Claude Code's own login
+  hats run                              start Claude Code with the current account
+  hats run personal -- --resume <id>    start it with another account and pass arguments on
+  hats use work                         make 'work' the default for new sessions
+  hats --codex add personal             the same commands manage Codex accounts
+  hats config set claude.threshold 85   switch at 85 % of the 5-hour or weekly limit
+  hats setup                            install the hooks, status line and shell functions
+  hats                                  open the interactive view";
 
-Usage: hats <command> [--codex] [args] [-- harness args]
+/// Switch Claude Code and Codex between accounts, one config directory each.
+///
+/// Each account is a full CLAUDE_CONFIG_DIR or CODEX_HOME where the harness logs
+/// in by itself. hats never reads, stores or moves credentials and never calls
+/// the providers: limits come from what the harness already shows.
+#[derive(Parser)]
+#[command(name = "hats", version, after_help = EXAMPLES, propagate_version = true)]
+struct Cli {
+    /// Act on Codex accounts instead of Claude Code ones.
+    #[arg(long, global = true)]
+    codex: bool,
 
-Commands:
-  list                  accounts, their ids and the current one
-  add <label>           create an account that shares your settings and history
-  login <label>         sign in to it with the harness's own login
-  use <label>           start new sessions with it by default
-  run [label]           start the harness with it (default: the current one)
-  env [label]           print the shell line that selects it
-  remove <label>        sign out and delete its directory
-  hook session-start    Claude Code SessionStart hook (records the session's account)
-  statusline [-- cmd]   Claude Code status line: keeps each account's plan limits
-                        and runs your own status line command with the same input
-  setup                 print the hook and shell snippets to install
+    #[command(subcommand)]
+    command: Option<Cmd>,
+}
 
-Accounts are Claude Code accounts unless --codex is given. The label
-'default' is the harness's own directory (~/.claude or ~/.codex).
-";
+#[derive(Subcommand)]
+enum Cmd {
+    /// List accounts with their limits; `*` marks the current one.
+    #[command(visible_alias = "ls")]
+    List {
+        /// Print JSON (schema `v: 1`) for scripts.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create an account that shares your settings, skills and history.
+    Add { label: String },
+    /// Sign in to an account with the harness's own login.
+    Login {
+        label: String,
+        /// Passed on to `claude auth login` or `codex login`.
+        #[arg(last = true)]
+        args: Vec<OsString>,
+    },
+    /// Make an account the default for new sessions.
+    Use { label: String },
+    /// Start the harness with an account (default: the current one).
+    ///
+    /// In auto mode, an interactive Claude Code session stays under a small
+    /// hats parent that moves it to the next account when it passes the
+    /// threshold, once the agent is idle.
+    Run {
+        label: Option<String>,
+        /// Passed on to the harness.
+        #[arg(last = true)]
+        args: Vec<OsString>,
+    },
+    /// Print the shell line that selects an account, for `eval`.
+    Env { label: Option<String> },
+    /// Sign out with the harness and delete the account's directory.
+    #[command(visible_alias = "rm")]
+    Remove { label: String },
+    /// Show or change settings (`hats config` lists them all).
+    Config {
+        #[command(subcommand)]
+        action: Option<ConfigCmd>,
+    },
+    /// Install the Claude Code hooks, the status line wrapper and the shell
+    /// functions, showing every change and keeping a backup.
+    Setup {
+        /// Show what would change and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Remove what setup added.
+        #[arg(long)]
+        undo: bool,
+    },
+    /// Import account order and switching settings from another tool.
+    Import {
+        #[arg(value_enum)]
+        source: ImportSource,
+        /// Where that tool keeps its data.
+        #[arg(long)]
+        from: Option<PathBuf>,
+    },
+    /// Print shell completions: `hats completions zsh > ~/.zfunc/_hats`.
+    Completions { shell: clap_complete::Shell },
+    /// Open the interactive view (also `hats` with no command).
+    Tui,
+    /// Claude Code status line wrapper; `hats setup` installs it.
+    Statusline {
+        /// Your own status line command, run with the same input.
+        #[arg(last = true)]
+        command: Vec<OsString>,
+    },
+    /// Claude Code hooks; `hats setup` installs them.
+    #[command(hide = true)]
+    Hook { event: HookEvent },
+}
 
-fn main() -> ExitCode {
-    match run(std::env::args_os().skip(1).collect()) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(Failure::Usage(msg)) => {
-            eprintln!("hats: {msg}\n\n{USAGE}");
-            ExitCode::from(2)
-        }
-        Err(Failure::Error(msg)) => {
-            eprintln!("hats: {msg}");
-            ExitCode::FAILURE
-        }
-    }
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// Every key with its value and what it does.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print one value: `hats config get claude.mode`.
+    Get { key: String },
+    /// Change one value: `hats config set codex.strategy next`.
+    Set { key: String, value: String },
+    /// Open config.toml in $VISUAL or $EDITOR and check it after.
+    Edit,
+    /// Print where config.toml lives.
+    Path,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ImportSource {
+    ClaudeSwap,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum HookEvent {
+    SessionStart,
+    Prompt,
+    Stop,
 }
 
 enum Failure {
-    Usage(String),
     Error(String),
+    Exit(u8),
 }
 
 impl From<String> for Failure {
@@ -68,199 +174,187 @@ impl From<io::Error> for Failure {
     }
 }
 
-struct Args {
-    command: String,
-    positional: Vec<String>,
-    harness: Harness,
-    passthrough: Vec<OsString>,
-}
-
-fn parse(argv: Vec<OsString>) -> Result<Args, Failure> {
-    let mut words = Vec::new();
-    let mut harness = Harness::Claude;
-    let mut rest = argv.into_iter();
-    let mut passthrough = Vec::new();
-    while let Some(arg) = rest.next() {
-        if arg == "--" {
-            passthrough = rest.collect();
-            break;
-        }
-        let arg = arg
-            .into_string()
-            .map_err(|a| Failure::Usage(format!("argument is not UTF-8: {a:?}")))?;
-        match arg.as_str() {
-            "--codex" => harness = Harness::Codex,
-            "--claude" => harness = Harness::Claude,
-            "-h" | "--help" => words.insert(0, "help".to_owned()),
-            "-V" | "--version" => words.insert(0, "version".to_owned()),
-            flag if flag.starts_with('-') => {
-                return Err(Failure::Usage(format!("unknown option {flag}")));
-            }
-            _ => words.push(arg),
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    match run(cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(Failure::Exit(code)) => ExitCode::from(code),
+        Err(Failure::Error(msg)) => {
+            eprintln!("hats: {msg}");
+            ExitCode::FAILURE
         }
     }
-    let mut words = words.into_iter();
-    Ok(Args {
-        command: words.next().unwrap_or_else(|| "help".to_owned()),
-        positional: words.collect(),
-        harness,
-        passthrough,
-    })
 }
 
-fn run(argv: Vec<OsString>) -> Result<(), Failure> {
-    let args = parse(argv)?;
+fn run(cli: Cli) -> Result<(), Failure> {
     let store = Store::from_env(|k| std::env::var_os(k))?;
-    let harness = args.harness;
-    let label = |required: bool| -> Result<Option<&str>, Failure> {
-        match (args.positional.as_slice(), required) {
-            ([], true) => Err(Failure::Usage(format!("{} needs a label", args.command))),
-            ([], false) => Ok(None),
-            ([label], _) => Ok(Some(label.as_str())),
-            _ => Err(Failure::Usage(format!(
-                "{} takes one label; pass harness arguments after --",
-                args.command
-            ))),
+    let harness = if cli.codex {
+        Harness::Codex
+    } else {
+        Harness::Claude
+    };
+    let Some(command) = cli.command else {
+        return if io::stdout().is_terminal() {
+            tui::run(&store).map_err(Failure::Error)
+        } else {
+            list(&store, false)
+        };
+    };
+    // Hooks run inside the agent's session: they must not fail it, so they
+    // report and exit 0.
+    if let Cmd::Hook { event } = command {
+        if let Err(e) = run_hook(&store, event) {
+            eprintln!("hats hook: {e}");
         }
-    };
-    let chosen = |label: Option<&str>| -> Result<Account, Failure> {
-        Ok(match label {
-            Some(label) => Account::find(harness, label, &store)?,
-            None => store.current(harness)?,
-        })
-    };
-
-    match args.command.as_str() {
-        "help" => print!("{USAGE}"),
-        "version" => println!("hats {}", env!("CARGO_PKG_VERSION")),
-        "list" | "ls" => list(&store)?,
-        "add" => {
-            let account = Account::managed(harness, label(true)?.unwrap(), &store)?;
+        return Ok(());
+    }
+    let config = Config::load(&store.config)?;
+    match command {
+        Cmd::List { json } => list(&store, json)?,
+        Cmd::Add { label } => {
+            let account = Account::managed(harness, &label, &store)?;
             if account.dir.exists() {
-                return Err(format!("'{}' already exists", account.label).into());
+                return Err(format!(
+                    "'{label}' already exists; sign in with `hats{} login {label}`",
+                    flag(harness)
+                )
+                .into());
             }
             account.create(&store)?;
-            println!("created {} account '{}'", harness.name(), account.label);
-            println!("next: hats login{} {}", codex_flag(harness), account.label);
+            println!(
+                "Created {} account '{label}'. Next: hats{} login {label}",
+                harness.name(),
+                flag(harness)
+            );
         }
-        "login" => {
-            let account = Account::find(harness, label(true)?.unwrap(), &store)?;
+        Cmd::Login { label, args } => {
+            let account = find(&store, harness, &label)?;
             account.create(&store)?;
-            return Err(exec_harness(&account, harness.login_args(), &args.passthrough).into());
+            let mut cmd = Command::new(harness.program());
+            cmd.args(harness.login_args()).args(args);
+            return Err(exec(cmd, &account).into());
         }
-        "use" => {
-            let account = Account::find(harness, label(true)?.unwrap(), &store)?;
+        Cmd::Use { label } => {
+            let account = find(&store, harness, &label)?;
             let id = account
                 .provider_id(&store)?
                 .ok_or_else(|| not_logged_in(&account))?;
-            store.set_current(&account)?;
-            let line = Switch::new(
-                SystemTime::now(),
-                harness,
-                &id,
-                &account.label,
-                &account.dir,
-                None,
-            );
-            registry::append(&store.registry(), &line)?;
-            println!("new {} sessions use '{}'", harness.name(), account.label);
+            auto::make_default(&store, &account, &id, Reason::Manual, SystemTime::now())?;
+            println!("New {} sessions use '{label}'.", harness.name());
         }
-        "run" => {
-            let account = chosen(label(false)?)?;
-            // Picks up shared files the user created since the account was added.
-            account.create(&store)?;
-            return Err(exec_harness(&account, &[], &args.passthrough).into());
+        Cmd::Run { label, args } => {
+            return launch(&store, &config, harness, label.as_deref(), args);
         }
-        "env" => println!("{}", shell_line(&chosen(label(false)?)?)),
-        "remove" | "rm" => remove(
-            &store,
-            Account::find(harness, label(true)?.unwrap(), &store)?,
-        )?,
-        "hook" => match args.positional.as_slice() {
-            [event] if event == "session-start" => {
-                // A hook must never break the session: report and exit 0.
-                let config_dir = std::env::var_os(Harness::Claude.env_var());
-                if let Err(e) =
-                    hook::session_start(&store, config_dir, io::stdin().lock(), SystemTime::now())
-                {
-                    eprintln!("hats hook: {e}");
-                }
-            }
-            _ => return Err(Failure::Usage("hook takes: session-start".to_owned())),
-        },
-        "statusline" => {
-            if !args.positional.is_empty() {
-                return Err(Failure::Usage(
-                    "statusline takes no label; pass your status line command after --".to_owned(),
-                ));
-            }
-            let mut input = Vec::new();
-            io::stdin().lock().take(1 << 20).read_to_end(&mut input)?;
-            let config_dir = std::env::var_os(Harness::Claude.env_var());
-            let (summary, saved) =
-                statusline::record(&store, config_dir, &input, SystemTime::now());
-            if let Err(e) = saved {
-                eprintln!("hats statusline: {e}");
-            }
-            match args.passthrough.split_first() {
-                None => println!("{summary}"),
-                Some((program, rest)) => chain(program, rest, &input)?,
-            }
+        Cmd::Env { label } => println!(
+            "{}",
+            shell_line(&chosen(&store, harness, label.as_deref())?)
+        ),
+        Cmd::Remove { label } => remove(&store, find(&store, harness, &label)?)?,
+        Cmd::Config { action } => config_command(&store, &config, action)?,
+        Cmd::Setup { dry_run, undo } => setup::run(&store, dry_run, undo)?,
+        Cmd::Import {
+            source: ImportSource::ClaudeSwap,
+            from,
+        } => {
+            let from = from.unwrap_or_else(|| store.home.join(".claude-swap-backup"));
+            import::claude_swap(&store, &from)?;
         }
-        "setup" => setup()?,
-        other => return Err(Failure::Usage(format!("unknown command '{other}'"))),
+        Cmd::Completions { shell } => {
+            clap_complete::generate(shell, &mut Cli::command(), "hats", &mut io::stdout());
+        }
+        Cmd::Tui => tui::run(&store)?,
+        Cmd::Statusline { command } => statusline_command(&store, &config, command)?,
+        Cmd::Hook { .. } => unreachable!("handled above"),
     }
     Ok(())
 }
 
-fn codex_flag(harness: Harness) -> &'static str {
+fn run_hook(store: &Store, event: HookEvent) -> Result<(), String> {
+    let config_dir = std::env::var_os(Harness::Claude.env_var());
+    let stdin = io::stdin().lock();
+    let now = SystemTime::now();
+    match event {
+        HookEvent::SessionStart => hook::session_start(store, config_dir, stdin, now),
+        HookEvent::Prompt => hook::prompt(store),
+        HookEvent::Stop => {
+            let config = Config::load(&store.config)?;
+            hook::stop(store, &config.claude, config_dir, stdin, now)
+        }
+    }
+}
+
+fn flag(harness: Harness) -> &'static str {
     match harness {
         Harness::Claude => "",
         Harness::Codex => " --codex",
     }
 }
 
+fn find(store: &Store, harness: Harness, label: &str) -> Result<Account, String> {
+    Account::find(harness, label, store).map_err(|e| {
+        let known: Vec<String> = Account::all(harness, store)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|a| !a.is_default || a.dir.exists())
+            .map(|a| a.label)
+            .collect();
+        let known = if known.is_empty() {
+            "none".to_owned()
+        } else {
+            known.join(", ")
+        };
+        format!(
+            "{e}. Known: {known}. Add it with `hats{} add {label}`",
+            flag(harness)
+        )
+    })
+}
+
+fn chosen(store: &Store, harness: Harness, label: Option<&str>) -> Result<Account, String> {
+    match label {
+        Some(label) => find(store, harness, label),
+        None => store.current(harness),
+    }
+}
+
 fn not_logged_in(account: &Account) -> String {
     format!(
-        "'{}' is not logged in: run hats login{} {}",
+        "'{}' is not signed in. Run `hats{} login {}`",
         account.label,
-        codex_flag(account.harness),
+        flag(account.harness),
         account.label
     )
 }
 
-/// Replaces this process with the harness, so nothing of ours stays running.
-fn exec_harness(account: &Account, args: &[&str], passthrough: &[OsString]) -> String {
-    let mut cmd = Command::new(account.harness.program());
-    cmd.args(args).args(passthrough);
-    select_account(&mut cmd, account);
+/// Replaces this process with the harness, so nothing of hats stays running.
+fn exec(mut cmd: Command, account: &Account) -> String {
+    account.select(&mut cmd);
     let err = cmd.exec();
     format!("could not start {}: {err}", account.harness.program())
 }
 
-/// Runs the user's own status line command with the same input and exits with
-/// its status; its output goes straight to Claude Code.
-fn chain(program: &OsStr, args: &[OsString], input: &[u8]) -> Result<(), Failure> {
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("could not start {}: {e}", program.to_string_lossy()))?;
-    let mut stdin = child.stdin.take().expect("piped");
-    // A command that does not read its input closes the pipe early; not an error.
-    let _ = stdin.write_all(input);
-    drop(stdin);
-    let status = child.wait()?;
-    std::process::exit(status.code().unwrap_or(1));
-}
-
-fn select_account(cmd: &mut Command, account: &Account) {
-    let var = account.harness.env_var();
-    if account.is_default {
-        cmd.env_remove(var);
-    } else {
-        cmd.env(var, &account.dir);
+fn launch(
+    store: &Store,
+    config: &Config,
+    harness: Harness,
+    label: Option<&str>,
+    args: Vec<OsString>,
+) -> Result<(), Failure> {
+    let settings = config.for_harness(harness);
+    if label.is_none() {
+        // A new session should not start on an account that is already spent.
+        auto::check_default(store, harness, settings, SystemTime::now(), None)?;
     }
+    let account = chosen(store, harness, label)?;
+    // Picks up shared files the user created since the account was added.
+    account.create(store)?;
+    if supervisor::should_supervise(harness, settings, &args) {
+        let code = supervisor::supervise(store, settings, account, args)?;
+        return Err(Failure::Exit(code.clamp(0, 255) as u8));
+    }
+    let mut cmd = Command::new(harness.program());
+    cmd.args(args);
+    Err(exec(cmd, &account).into())
 }
 
 fn shell_line(account: &Account) -> String {
@@ -268,65 +362,168 @@ fn shell_line(account: &Account) -> String {
     if account.is_default {
         format!("unset {var}")
     } else {
-        format!("export {var}={}", shell_quote(account.dir.as_os_str()))
+        format!(
+            "export {var}={}",
+            shell_quote(&account.dir.to_string_lossy())
+        )
     }
 }
 
-fn shell_quote(value: &OsStr) -> String {
-    format!("'{}'", value.to_string_lossy().replace('\'', r"'\''"))
+pub fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-fn list(store: &Store) -> Result<(), Failure> {
+fn list(store: &Store, json: bool) -> Result<(), Failure> {
+    let config = Config::load(&store.config)?;
+    let now = SystemTime::now();
     let mut out = io::stdout().lock();
-    writeln!(out, "HARNESS ACCOUNT          ID                DIR")?;
+    let mut rows = Vec::new();
+    let mut any = false;
     for harness in Harness::ALL {
-        let current = store.current(harness).ok();
-        for account in Account::all(harness, store)? {
-            if account.is_default && !account.dir.exists() {
-                continue;
+        let settings = config.for_harness(harness);
+        let statuses = auto::statuses(store, harness, settings)?;
+        if statuses.is_empty() {
+            continue;
+        }
+        any = true;
+        let current = store.current(harness).ok().map(|a| a.label);
+        if json {
+            for s in &statuses {
+                rows.push(serde_json::json!({
+                    "harness": harness,
+                    "label": s.account.label,
+                    "account": s.id,
+                    "signedIn": s.id.is_some(),
+                    "current": current.as_deref() == Some(s.account.label.as_str()),
+                    "configDir": s.account.dir,
+                    "usedPercent": s.used(now),
+                    "limits": s.reading.as_ref().map(|r| serde_json::json!({
+                        "observedAt": r.observed_at,
+                        "windows": r.windows,
+                    })),
+                }));
             }
-            let id = account
-                .provider_id(store)
-                .unwrap_or(None)
-                .unwrap_or_else(|| "(not logged in)".to_owned());
-            let marker = if current.as_ref() == Some(&account) {
+            continue;
+        }
+        writeln!(
+            out,
+            "{}  {} · threshold {} % · {}",
+            harness.name().to_uppercase(),
+            settings.mode.as_str(),
+            settings.threshold,
+            settings.strategy.as_str()
+        )?;
+        for s in &statuses {
+            let marker = if current.as_deref() == Some(s.account.label.as_str()) {
                 "*"
             } else {
                 " "
             };
-            writeln!(
-                out,
-                "{:<7} {marker}{:<15} {:<17} {}",
-                harness.name(),
-                account.label,
-                id,
-                tilde(&account.dir, store)
-            )?;
+            write!(out, "  {marker} {:<14}", s.account.label)?;
+            match (&s.id, &s.reading) {
+                (None, _) => write!(
+                    out,
+                    " not signed in: hats{} login {}",
+                    flag(harness),
+                    s.account.label
+                )?,
+                (Some(_), None) => write!(out, " no limits seen yet")?,
+                (Some(_), Some(r)) => {
+                    for w in &r.windows {
+                        let used = view::used_now(w, now);
+                        write!(
+                            out,
+                            "  {} {} {:>3.0}% {:<9}",
+                            view::window_short(&w.name),
+                            view::bar(used, 10),
+                            used,
+                            view::reset_label(w.resets_at, now)
+                        )?;
+                    }
+                    write!(out, "  seen {}", view::age(r.observed_at, now))?;
+                }
+            }
+            writeln!(out)?;
+        }
+    }
+    if json {
+        let doc = serde_json::json!({ "v": 1, "accounts": rows });
+        serde_json::to_writer(&mut out, &doc).map_err(io::Error::other)?;
+        writeln!(out)?;
+    } else if !any {
+        writeln!(out, "No accounts yet. Add one with `hats add <label>`.")?;
+    }
+    Ok(())
+}
+
+fn config_command(
+    store: &Store,
+    config: &Config,
+    action: Option<ConfigCmd>,
+) -> Result<(), Failure> {
+    match action.unwrap_or(ConfigCmd::List { json: false }) {
+        ConfigCmd::List { json: true } => {
+            let map: serde_json::Map<String, serde_json::Value> = config
+                .entries()
+                .into_iter()
+                .map(|(k, v)| (k, v.into()))
+                .collect();
+            println!("{}", serde_json::Value::Object(map));
+        }
+        ConfigCmd::List { json: false } => {
+            for (key, value) in config.entries() {
+                let short = key.split_once('.').map_or(key.as_str(), |(_, k)| k);
+                let help = config::KEYS
+                    .iter()
+                    .find(|(k, _)| *k == short)
+                    .map_or("", |(_, h)| h);
+                println!("{key:<17} {value:<10} {help}");
+            }
+            println!(
+                "\nChange one with `hats config set <key> <value>`; file: {}",
+                store.config.display()
+            );
+        }
+        ConfigCmd::Get { key } => println!("{}", config.get(&key)?),
+        ConfigCmd::Set { key, value } => {
+            config::set(&store.config, &key, &value)?;
+            println!("{key} = {}", Config::load(&store.config)?.get(&key)?);
+        }
+        ConfigCmd::Path => println!("{}", store.config.display()),
+        ConfigCmd::Edit => {
+            config::ensure_file(&store.config)?;
+            let editor = std::env::var_os("VISUAL")
+                .or_else(|| std::env::var_os("EDITOR"))
+                .unwrap_or_else(|| "vi".into());
+            let status = Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("{} \"$1\"", editor.to_string_lossy()))
+                .arg("hats")
+                .arg(&store.config)
+                .status()?;
+            if !status.success() {
+                return Err(format!("the editor exited with {status}").into());
+            }
+            Config::load(&store.config)
+                .map_err(|e| format!("{e}\nFix it with `hats config edit`"))?;
+            println!("Saved {}", store.config.display());
         }
     }
     Ok(())
 }
 
-fn tilde(path: &Path, store: &Store) -> String {
-    match path.strip_prefix(&store.home) {
-        Ok(rest) => format!("~/{}", rest.display()),
-        Err(_) => path.display().to_string(),
-    }
-}
-
 fn remove(store: &Store, account: Account) -> Result<(), Failure> {
     if account.is_default {
         return Err(format!(
-            "'{}' is the harness's own directory; it is never removed",
-            account.label
+            "'{DEFAULT_LABEL}' is the harness's own directory; hats never removes it"
         )
         .into());
     }
     if account.provider_id(store)?.is_some() {
-        // The harness deletes its own credential; this tool never touches it.
+        // The harness deletes its own credential; hats never touches it.
         let mut cmd = Command::new(account.harness.program());
         cmd.args(account.harness.logout_args());
-        select_account(&mut cmd, &account);
+        account.select(&mut cmd);
         let status = cmd
             .status()
             .map_err(|e| format!("could not start {}: {e}", account.harness.program()))?;
@@ -341,45 +538,44 @@ fn remove(store: &Store, account: Account) -> Result<(), Failure> {
         store.set_current(&Account::default_for(account.harness, store))?;
     }
     println!(
-        "removed {} account '{}'",
+        "Removed {} account '{}'.",
         account.harness.name(),
         account.label
     );
     Ok(())
 }
 
-fn setup() -> Result<(), Failure> {
-    let exe = std::env::current_exe()?;
-    let json = |cmd: String| serde_json::to_string(&cmd).expect("string");
-    let hook = json(format!("{} hook session-start", exe.display()));
-    let status = json(format!(
-        "{} statusline -- <your status line command>",
-        exe.display()
-    ));
-    let exe = shell_quote(exe.as_os_str());
-    print!(
-        "\
-Nothing here is applied for you. Paste what you want:
-
-1. Record which account each Claude Code session uses. In ~/.claude/settings.json
-   (accounts made with `add` share that file):
-
-  \"hooks\": {{
-    \"SessionStart\": [
-      {{ \"hooks\": [ {{ \"type\": \"command\", \"command\": {hook} }} ] }}
-    ]
-  }}
-
-2. Optional: keep each account's plan limits from the status line. In the same file,
-   wrap the status line you already have (drop `-- ...` if you have none):
-
-  \"statusLine\": {{ \"type\": \"command\", \"command\": {status} }}
-
-3. Start plain `claude` and `codex` with the current account. In ~/.zshrc or ~/.bashrc:
-
-  claude() {{ {exe} run -- \"$@\"; }}
-  codex() {{ {exe} run --codex -- \"$@\"; }}
-"
-    );
-    Ok(())
+fn statusline_command(
+    store: &Store,
+    config: &Config,
+    command: Vec<OsString>,
+) -> Result<(), Failure> {
+    let mut input = Vec::new();
+    io::stdin().lock().take(1 << 20).read_to_end(&mut input)?;
+    let config_dir = std::env::var_os(Harness::Claude.env_var());
+    let (summary, saved) =
+        statusline::record(store, &config.claude, config_dir, &input, SystemTime::now());
+    if let Err(e) = saved {
+        eprintln!("hats statusline: {e}");
+    }
+    let Some((program, args)) = command.split_first() else {
+        println!("{summary}");
+        return Ok(());
+    };
+    // The user's own command gets the same input; its output and exit status
+    // are what Claude Code sees.
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not start {}: {e}", program.to_string_lossy()))?;
+    let mut stdin = child.stdin.take().expect("piped");
+    // A command that does not read its input closes the pipe early; not an error.
+    let _ = stdin.write_all(&input);
+    drop(stdin);
+    let status = child.wait()?;
+    match status.code() {
+        Some(0) => Ok(()),
+        code => Err(Failure::Exit(code.unwrap_or(1).clamp(1, 255) as u8)),
+    }
 }

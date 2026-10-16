@@ -6,6 +6,17 @@ use std::process::Stdio;
 
 use common::{Sandbox, mode};
 
+fn account(list_json: &str, label: &str) -> serde_json::Value {
+    let doc: serde_json::Value = serde_json::from_str(list_json).unwrap();
+    doc["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["label"] == label)
+        .unwrap()
+        .clone()
+}
+
 fn hook(sb: &Sandbox, config_dir: Option<&std::path::Path>, input: &str) -> std::process::Output {
     let mut cmd = sb.cmd(&["hook", "session-start"]);
     if let Some(dir) = config_dir {
@@ -131,7 +142,11 @@ fn use_refuses_an_account_that_is_not_logged_in() {
     sb.ok(&["add", "work"]);
     let out = sb.cmd(&["use", "work"]).output().unwrap();
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("not logged in"));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("not signed in") && err.contains("hats login work"),
+        "{err}"
+    );
     assert!(sb.registry_lines().is_empty());
 }
 
@@ -140,11 +155,13 @@ fn login_runs_the_harness_login_inside_the_account() {
     let sb = Sandbox::new();
     sb.ok(&["add", "work"]);
     assert_eq!(sb.ok(&["login", "work"]).trim(), "logged in");
-    let list = sb.ok(&["list"]);
-    let row = list.lines().find(|l| l.contains("work")).unwrap();
-    assert!(row.contains("9ae25bfbd05c9e76"), "{list}");
+    let list = sb.ok(&["list", "--json"]);
+    let work = account(&list, "work");
+    assert_eq!(work["account"], "9ae25bfbd05c9e76");
+    assert_eq!(work["signedIn"], true);
     // The mail stays inside the harness's file.
     assert!(!list.contains("example.com"), "{list}");
+    assert!(!sb.ok(&["list"]).contains("example.com"));
 }
 
 #[test]
@@ -153,17 +170,32 @@ fn list_marks_the_current_account() {
     sb.ok(&["add", "work"]);
     sb.ok(&["add", "personal"]);
     sb.ok(&["login", "work"]);
-    let list = sb.ok(&["list"]);
-    let labels: Vec<_> = list
-        .lines()
-        .skip(1)
-        .map(|l| l.split_whitespace().nth(1).unwrap())
+    let list = sb.ok(&["list", "--json"]);
+    let doc: serde_json::Value = serde_json::from_str(&list).unwrap();
+    assert_eq!(doc["v"], 1);
+    let labels: Vec<_> = doc["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["label"].as_str().unwrap())
         .collect();
-    assert_eq!(labels, ["*default", "personal", "work"], "{list}");
-    assert!(list.contains("(not logged in)"));
+    assert_eq!(labels, ["default", "personal", "work"], "{list}");
+    assert_eq!(account(&list, "default")["current"], true);
+    assert_eq!(account(&list, "personal")["signedIn"], false);
 
     sb.ok(&["use", "work"]);
-    assert!(sb.ok(&["list"]).lines().any(|l| l.contains("*work")));
+    let list = sb.ok(&["list", "--json"]);
+    assert_eq!(account(&list, "work")["current"], true);
+    assert_eq!(account(&list, "default")["current"], false);
+    let text = sb.ok(&["list"]);
+    assert!(
+        text.lines().any(|l| l.trim_start().starts_with("* work")),
+        "{text}"
+    );
+    assert!(
+        text.contains("not signed in: hats login personal"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -335,17 +367,6 @@ fn state_paths_follow_overrides() {
         .unwrap();
     common::assert_success(&out, &["add", "work"]);
     assert!(alt.join("data/claude/work").is_dir());
-}
-
-#[test]
-fn setup_only_prints() {
-    let sb = Sandbox::new();
-    let settings = sb.home.join(".claude/settings.json");
-    fs::write(&settings, "{}").unwrap();
-    let out = sb.ok(&["setup"]);
-    assert!(out.contains("\"SessionStart\""));
-    assert!(out.contains("hook session-start"));
-    assert_eq!(fs::read_to_string(settings).unwrap(), "{}");
 }
 
 #[test]

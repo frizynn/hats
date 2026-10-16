@@ -9,6 +9,8 @@
 //!
 //! `session` is present when the line comes from a harness session hook and
 //! binds only that session; without it the line moves the default account.
+//! `reason` (`manual`, `threshold` or `limit`) says why the account changed;
+//! it is absent on session lines that did not change anything.
 //! Readers attribute a message of session S at time t to the newest line with
 //! `session == S` and `at <= t`, else to the newest line without `session` and
 //! `at <= t`, else to nobody.
@@ -22,6 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 use crate::account::Harness;
+use crate::policy::Reason;
 
 pub const FILE_NAME: &str = "switches.jsonl";
 const VERSION: u32 = 1;
@@ -37,6 +40,8 @@ pub struct Switch<'a> {
     config_dir: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     session: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<Reason>,
 }
 
 impl<'a> Switch<'a> {
@@ -47,6 +52,7 @@ impl<'a> Switch<'a> {
         label: &'a str,
         config_dir: &Path,
         session: Option<&'a str>,
+        reason: Option<Reason>,
     ) -> Self {
         Self {
             v: VERSION,
@@ -56,6 +62,7 @@ impl<'a> Switch<'a> {
             label,
             config_dir: config_dir.to_string_lossy().into_owned(),
             session,
+            reason,
         }
     }
 

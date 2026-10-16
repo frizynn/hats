@@ -42,7 +42,26 @@ const SESSION_KEYS: [&str; 7] = [
     "configDir",
     "session",
 ];
-const DEFAULT_KEYS: [&str; 6] = ["v", "at", "harness", "account", "label", "configDir"];
+const DEFAULT_KEYS: [&str; 7] = [
+    "v",
+    "at",
+    "harness",
+    "account",
+    "label",
+    "configDir",
+    "reason",
+];
+/// A session moved to another account by `hats run` carries why.
+const MOVED_KEYS: [&str; 8] = [
+    "v",
+    "at",
+    "harness",
+    "account",
+    "label",
+    "configDir",
+    "session",
+    "reason",
+];
 
 #[test]
 fn fixture_is_the_documented_format() {
@@ -63,7 +82,16 @@ fn fixture_is_the_documented_format() {
                 .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
         );
         let k = keys(line);
-        assert!(k == SESSION_KEYS || k == DEFAULT_KEYS, "{line}");
+        assert!(
+            k == SESSION_KEYS || k == DEFAULT_KEYS || k == MOVED_KEYS,
+            "{line}"
+        );
+        if let Some(reason) = value.get("reason") {
+            assert!(
+                matches!(reason.as_str(), Some("manual" | "threshold" | "limit")),
+                "{line}"
+            );
+        }
     }
 }
 
@@ -119,6 +147,7 @@ fn use_writes_a_default_line_without_session() {
     let value: serde_json::Value = serde_json::from_str(line).unwrap();
     assert_eq!(value["label"], "work");
     assert_eq!(value["account"], "9ae25bfbd05c9e76");
+    assert_eq!(value["reason"], "manual");
     assert_eq!(
         value["configDir"],
         sb.data().join("claude/work").display().to_string()

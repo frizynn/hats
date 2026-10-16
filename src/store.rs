@@ -1,7 +1,8 @@
-//! Where this tool keeps things. Account directories are data
-//! (`$XDG_DATA_HOME`), the registry and the current-account pointers are state
-//! (`$XDG_STATE_HOME`), following the XDG Base Directory Specification on
-//! every platform so the paths are predictable for other tools.
+//! Where hats keeps things, following the XDG Base Directory Specification on
+//! every platform so the paths are predictable for other tools: account
+//! directories are data (`$XDG_DATA_HOME/hats`), the registry, limits and
+//! current-account pointers are state (`$XDG_STATE_HOME/hats`), and
+//! `config.toml` is configuration (`$XDG_CONFIG_HOME/hats`).
 
 use std::ffi::OsString;
 use std::fs;
@@ -12,12 +13,14 @@ use crate::account::{Account, DEFAULT_LABEL, Harness, create_private_dir};
 
 pub const DATA_ENV: &str = "HATS_HOME";
 pub const STATE_ENV: &str = "HATS_STATE_DIR";
+pub const CONFIG_ENV: &str = "HATS_CONFIG";
 const APP: &str = "hats";
 
 pub struct Store {
     pub home: PathBuf,
     pub data: PathBuf,
     pub state: PathBuf,
+    pub config: PathBuf,
 }
 
 impl Store {
@@ -34,7 +37,18 @@ impl Store {
                 .unwrap_or_else(|| home.join(".local/state"))
                 .join(APP)
         });
-        Ok(Self { home, data, state })
+        let config = non_empty(CONFIG_ENV).unwrap_or_else(|| {
+            non_empty("XDG_CONFIG_HOME")
+                .unwrap_or_else(|| home.join(".config"))
+                .join(APP)
+                .join("config.toml")
+        });
+        Ok(Self {
+            home,
+            data,
+            state,
+            config,
+        })
     }
 
     pub fn accounts_dir(&self, harness: Harness) -> PathBuf {
