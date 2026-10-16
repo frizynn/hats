@@ -222,7 +222,11 @@ impl Account {
             let target = source.join(name);
             let link = self.dir.join(name);
             if target.exists() && fs::symlink_metadata(&link).is_err() {
-                std::os::unix::fs::symlink(&target, &link)?;
+                match std::os::unix::fs::symlink(&target, &link) {
+                    // Another hats starting at the same moment made it.
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                    result => result?,
+                }
             }
         }
         Ok(())
