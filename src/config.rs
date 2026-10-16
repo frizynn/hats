@@ -147,8 +147,9 @@ order = []
 # agent is idle, resuming the same conversation; off = leave them where they are.
 relaunch = "idle"
 # Close a `hats run` session after this long without use: the clock starts when
-# a turn ends and restarts with a new prompt or turn. 32 or "32h" hours, "90m"
-# minutes, "30s" seconds; 0 or "off" never. It prints how to resume it.
+# a turn ends and restarts with a prompt, a turn end or a write to the session's
+# transcript. 32 or "32h" hours, "90m" minutes, "30s" seconds; 0 or "off" never.
+# It prints how to resume the session.
 close_idle = "32h"
 
 [codex]
