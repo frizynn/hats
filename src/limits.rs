@@ -86,7 +86,7 @@ pub fn unix_secs(t: SystemTime) -> i64 {
     t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
 }
 
-fn unix_millis(t: SystemTime) -> u64 {
+pub fn unix_millis(t: SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 

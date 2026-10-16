@@ -95,5 +95,5 @@ pub fn stop(
     {
         auto::check_default(store, Harness::Claude, config, now, Some(Reason::Limit))?;
     }
-    supervisor::mark_idle(store, &input.session_id, rate_limited).map_err(|e| e.to_string())
+    supervisor::mark_idle(store, &input.session_id, rate_limited, now).map_err(|e| e.to_string())
 }

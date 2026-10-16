@@ -9,9 +9,11 @@
 //! hooks and status line wake it with SIGUSR1 after writing to its run
 //! directory (`<state>/run/<pid>/`):
 //!
-//! - `idle`: created by the `Stop` and `StopFailure` hooks, removed by
-//!   `UserPromptSubmit`. A move happens only while it exists, so a turn is
-//!   never cut, and without the hooks a session is never moved.
+//! - `idle`: written by the `Stop` and `StopFailure` hooks with the time the
+//!   turn ended, removed by `UserPromptSubmit`. A move starts only within
+//!   `MOVE_WINDOW_MS` of that time, so a turn is never cut, a prompt being
+//!   typed later is never lost, and without the hooks a session is never
+//!   moved. A move asked for later waits for the next turn to end.
 //! - `move.json`: written by the status line wrapper when the session's
 //!   account passed the threshold, or by `StopFailure` on a rate limit.
 //!
@@ -35,6 +37,7 @@ use serde::{Deserialize, Serialize};
 use crate::account::{Account, Harness, create_private_dir};
 use crate::auto;
 use crate::config::{HarnessConfig, Mode, Relaunch};
+use crate::limits::unix_millis;
 use crate::policy::Reason;
 use crate::registry::{self, Switch};
 use crate::store::Store;
@@ -46,6 +49,11 @@ pub const PID_ENV: &str = "HATS_SUPERVISOR";
 const GRACE_SECS: u32 = 1;
 /// Seconds after SIGTERM before SIGKILL.
 const KILL_SECS: u32 = 10;
+/// How long after a turn ends a move may start. Later, the user may be typing
+/// the next prompt. Measured on Claude Code 2.1.301: the status line, which
+/// asks for the move, runs 0.31 to 0.34 s after the `Stop` hook (its 300 ms
+/// debounce), and the wrapper asks before running the user's own command.
+const MOVE_WINDOW_MS: u64 = 2000;
 
 #[derive(Serialize, Deserialize)]
 struct MoveRequest {
@@ -119,11 +127,16 @@ pub fn mark_busy(store: &Store) -> io::Result<()> {
 
 /// `Stop` and `StopFailure` hooks: the agent is idle. A rate limit error asks
 /// for a move even without status line data.
-pub fn mark_idle(store: &Store, session: &str, rate_limited: bool) -> io::Result<()> {
+pub fn mark_idle(
+    store: &Store,
+    session: &str,
+    rate_limited: bool,
+    now: SystemTime,
+) -> io::Result<()> {
     let Some((pid, dir)) = parent_dir(store) else {
         return Ok(());
     };
-    fs::write(dir.join("idle"), b"")?;
+    fs::write(dir.join("idle"), unix_millis(now).to_string())?;
     if rate_limited {
         write_request(&dir, session, Reason::Limit)?;
     }
@@ -443,7 +456,7 @@ pub fn supervise(
                     ChildState::Running => {}
                 },
                 libc::SIGUSR1 => {
-                    if moving.is_none() && dir.join("idle").exists() {
+                    if moving.is_none() && turn_just_ended(&dir, SystemTime::now()) {
                         moving = plan_move(store, config, &account, &dir);
                         if moving.is_some() {
                             // SAFETY: alarm(3) schedules SIGALRM, which is blocked and waited for.
@@ -501,6 +514,14 @@ pub fn supervise(
             _ => return Ok(status),
         }
     }
+}
+
+/// Whether the agent is idle and its turn ended within `MOVE_WINDOW_MS`.
+fn turn_just_ended(dir: &Path, now: SystemTime) -> bool {
+    fs::read_to_string(dir.join("idle"))
+        .ok()
+        .and_then(|ended| ended.trim().parse::<u64>().ok())
+        .is_some_and(|ended| unix_millis(now).saturating_sub(ended) < MOVE_WINDOW_MS)
 }
 
 fn plan_move(store: &Store, config: &HarnessConfig, account: &Account, dir: &Path) -> Option<Move> {
@@ -736,6 +757,25 @@ mod tests {
 
         let dir = fresh_run_dir(&store, 42).unwrap();
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_move_starts_only_right_after_a_turn_ends() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let now = SystemTime::now();
+        let ended = |ago_ms: u64| {
+            let at = unix_millis(now - Duration::from_millis(ago_ms));
+            fs::write(dir.path().join("idle"), at.to_string()).unwrap();
+            turn_just_ended(dir.path(), now)
+        };
+        assert!(ended(0));
+        assert!(ended(MOVE_WINDOW_MS - 1));
+        assert!(!ended(MOVE_WINDOW_MS));
+        fs::write(dir.path().join("idle"), b"").unwrap();
+        assert!(!turn_just_ended(dir.path(), now), "no time, no move");
+        fs::remove_file(dir.path().join("idle")).unwrap();
+        assert!(!turn_just_ended(dir.path(), now), "busy");
     }
 
     #[test]
