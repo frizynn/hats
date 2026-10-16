@@ -110,6 +110,19 @@ struct AccountLimits {
     limited_until: Option<i64>,
 }
 
+impl AccountLimits {
+    fn new(account: &Account, id: &str, observed_at: u64, windows: Vec<LimitWindow>) -> Self {
+        Self {
+            harness: account.harness,
+            account: id.to_owned(),
+            label: account.label.clone(),
+            observed_at,
+            windows,
+            limited_until: None,
+        }
+    }
+}
+
 pub fn unix_secs(t: SystemTime) -> i64 {
     t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
 }
@@ -159,14 +172,7 @@ pub fn save(
             true
         }
         _ => {
-            *entry = Some(AccountLimits {
-                harness: account.harness,
-                account: id.to_owned(),
-                label: account.label.clone(),
-                observed_at,
-                windows,
-                limited_until: None,
-            });
+            *entry = Some(AccountLimits::new(account, id, observed_at, windows));
             true
         }
     })
@@ -186,14 +192,7 @@ pub fn seed(
         if entry.as_ref().is_some_and(|e| e.observed_at >= observed_at) {
             return false;
         }
-        *entry = Some(AccountLimits {
-            harness: account.harness,
-            account: id.to_owned(),
-            label: account.label.clone(),
-            observed_at,
-            windows,
-            limited_until: None,
-        });
+        *entry = Some(AccountLimits::new(account, id, observed_at, windows));
         stored = true;
         true
     })?;
@@ -205,14 +204,8 @@ pub fn seed(
 pub fn mark_limited(store: &Store, account: &Account, id: &str, now: SystemTime) -> io::Result<()> {
     let until = unix_secs(now) + LIMIT_HOLD.as_secs() as i64;
     update(store, account.harness, id, |entry| {
-        let entry = entry.get_or_insert_with(|| AccountLimits {
-            harness: account.harness,
-            account: id.to_owned(),
-            label: account.label.clone(),
-            observed_at: unix_millis(now),
-            windows: Vec::new(),
-            limited_until: None,
-        });
+        let entry = entry
+            .get_or_insert_with(|| AccountLimits::new(account, id, unix_millis(now), Vec::new()));
         entry.limited_until = Some(until);
         true
     })
