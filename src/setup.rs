@@ -10,26 +10,28 @@
 //! Every change is listed before writing, each file is backed up first, a
 //! second run changes nothing, and `--undo` removes exactly what was added.
 
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::ops::Range;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use crate::shell_quote;
 use crate::store::Store;
 
 const RC_START: &str = "# >>> hats >>>";
 const RC_END: &str = "# <<< hats <<<";
-const RECORD: &str = "setup.json";
-
-/// What setup replaced, so `--undo` can put it back.
-#[derive(Serialize, Deserialize, Default)]
-struct Record {
-    /// The user's status line before it was wrapped; `null` if there was none.
-    status_line: Option<Value>,
-}
+const BACKUP_TAG: &str = "hats-backup-";
+/// What each hook runs after the binary: `'<path>/hats' hook stop`.
+const HOOKS: [(&str, &str); 4] = [
+    ("SessionStart", "hook session-start"),
+    ("UserPromptSubmit", "hook prompt"),
+    ("Stop", "hook stop"),
+    ("StopFailure", "hook stop"),
+];
 
 struct Plan {
     settings_path: PathBuf,
@@ -39,14 +41,13 @@ struct Plan {
     rc: String,
     rc_changed: bool,
     changes: Vec<String>,
-    record: Record,
 }
 
 pub fn run(store: &Store, dry_run: bool, undo: bool) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let exe = exe.to_string_lossy().into_owned();
     let plan = if undo {
-        plan_undo(store, &exe)?
+        plan_undo(store)?
     } else {
         plan_install(store, &exe)?
     };
@@ -77,30 +78,29 @@ pub fn run(store: &Store, dry_run: bool, undo: bool) -> Result<(), String> {
     }
     let stamp = crate::limits::unix_secs(SystemTime::now());
     if plan.settings_changed {
-        let backup = backup(&plan.settings_path, stamp).map_err(|e| e.to_string())?;
         let mut text = serde_json::to_string_pretty(&plan.settings).expect("json value");
         text.push('\n');
-        write_atomic(&plan.settings_path, &text)
-            .map_err(|e| format!("{}: {e}", plan.settings_path.display()))?;
-        if let Some(b) = backup {
-            println!("Backup: {}", b.display());
-        }
+        // Undoing to what a backup holds puts the user's own bytes back.
+        let text = undo
+            .then(|| {
+                matching_backup(&plan.settings_path, |old| {
+                    serde_json::from_str::<Value>(old).is_ok_and(|old| old == plan.settings)
+                })
+            })
+            .flatten()
+            .unwrap_or(text);
+        write_with_backup(&plan.settings_path, &text, stamp)?;
     }
     if plan.rc_changed {
-        let backup = backup(&plan.rc_path, stamp).map_err(|e| e.to_string())?;
-        write_atomic(&plan.rc_path, &plan.rc)
-            .map_err(|e| format!("{}: {e}", plan.rc_path.display()))?;
-        if let Some(b) = backup {
-            println!("Backup: {}", b.display());
-        }
-    }
-    store.ensure_state().map_err(|e| e.to_string())?;
-    let record_path = store.state.join(RECORD);
-    if undo {
-        let _ = fs::remove_file(record_path);
-    } else {
-        let bytes = serde_json::to_vec_pretty(&plan.record).expect("plain struct");
-        fs::write(record_path, bytes).map_err(|e| e.to_string())?;
+        let text = undo
+            .then(|| {
+                matching_backup(&plan.rc_path, |old| {
+                    old.trim_end_matches('\n') == plan.rc.trim_end_matches('\n')
+                })
+            })
+            .flatten()
+            .unwrap_or(plan.rc);
+        write_with_backup(&plan.rc_path, &text, stamp)?;
     }
     println!(
         "{}",
@@ -113,22 +113,22 @@ pub fn run(store: &Store, dry_run: bool, undo: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn hooks(exe: &str) -> [(&'static str, String); 4] {
-    let q = crate::shell_quote(exe);
-    [
-        ("SessionStart", format!("{q} hook session-start")),
-        ("UserPromptSubmit", format!("{q} hook prompt")),
-        ("Stop", format!("{q} hook stop")),
-        ("StopFailure", format!("{q} hook stop")),
-    ]
+fn write_with_backup(path: &Path, text: &str, stamp: i64) -> Result<(), String> {
+    let shown = |e: io::Error| format!("{}: {e}", path.display());
+    let backup = backup(path, stamp).map_err(shown)?;
+    write_atomic(path, text).map_err(shown)?;
+    if let Some(b) = backup {
+        println!("Backup: {}", b.display());
+    }
+    Ok(())
 }
 
 fn status_line_prefix(exe: &str) -> String {
-    format!("{} statusline", crate::shell_quote(exe))
+    format!("{} statusline", shell_quote(exe))
 }
 
 fn shell_block(exe: &str, fish: bool) -> String {
-    let q = crate::shell_quote(exe);
+    let q = shell_quote(exe);
     let functions = if fish {
         format!(
             "function claude; {q} run -- $argv; end\nfunction codex; {q} run --codex -- $argv; end"
@@ -139,6 +139,18 @@ fn shell_block(exe: &str, fish: bool) -> String {
     format!(
         "{RC_START}\n# Added by `hats setup`; `hats setup --undo` removes it.\n{functions}\n{RC_END}\n"
     )
+}
+
+/// Where the shell block sits in `rc`, with the line break after it.
+fn block_range(rc: &str) -> Option<Range<usize>> {
+    let start = rc.find(RC_START)?;
+    let end = start + rc[start..].find(RC_END)? + RC_END.len();
+    let end = if rc[end..].starts_with('\n') {
+        end + 1
+    } else {
+        end
+    };
+    Some(start..end)
 }
 
 fn settings_path(store: &Store) -> PathBuf {
@@ -179,10 +191,63 @@ fn read_text(path: &Path) -> Result<String, String> {
     }
 }
 
-fn is_ours(group: &Value, command: &str) -> bool {
-    group["hooks"]
-        .as_array()
-        .is_some_and(|hooks| hooks.iter().any(|h| h["command"] == command))
+/// What a command written by `setup` runs after the hats binary, wherever
+/// that binary was when setup ran: `hook stop` for `'/old/path/hats' hook stop`.
+fn hats_args(command: &str) -> Option<&str> {
+    let (exe, rest) = unquote_word(command)?;
+    let rest = rest.strip_prefix(' ')?;
+    (Path::new(&exe).file_name()? == "hats").then_some(rest)
+}
+
+/// The single-quoted word at the start of `s`, as `shell_quote` writes it,
+/// and what follows it.
+fn unquote_word(s: &str) -> Option<(String, &str)> {
+    let mut rest = s.strip_prefix('\'')?;
+    let mut word = String::new();
+    loop {
+        let end = rest.find('\'')?;
+        word.push_str(&rest[..end]);
+        rest = &rest[end + 1..];
+        match rest.strip_prefix("\\''") {
+            Some(after) => {
+                word.push('\'');
+                rest = after;
+            }
+            None => return Some((word, rest)),
+        }
+    }
+}
+
+/// The status line command setup's wrapper chains to: `Some(None)` when it
+/// chains to nothing, `None` when `command` is not the wrapper.
+fn chained_status_line(command: &str) -> Option<Option<String>> {
+    let rest = hats_args(command)?.strip_prefix("statusline")?;
+    if rest.is_empty() {
+        return Some(None);
+    }
+    let (inner, tail) = unquote_word(rest.strip_prefix(" -- /bin/sh -c ")?)?;
+    tail.is_empty().then_some(Some(inner))
+}
+
+/// Removes setup's hooks that run `args` from `groups`, and the groups that
+/// held only them. Returns the removed commands.
+fn remove_hooks(groups: &mut Vec<Value>, args: &str) -> Vec<String> {
+    let mut removed = Vec::new();
+    groups.retain_mut(|group| {
+        let Some(hooks) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+            return true;
+        };
+        let before = hooks.len();
+        hooks.retain(|hook| match hook["command"].as_str() {
+            Some(command) if hats_args(command) == Some(args) => {
+                removed.push(command.to_owned());
+                false
+            }
+            _ => true,
+        });
+        !(hooks.is_empty() && hooks.len() < before)
+    });
+    removed
 }
 
 fn plan_install(store: &Store, exe: &str) -> Result<Plan, String> {
@@ -198,15 +263,24 @@ fn plan_install(store: &Store, exe: &str) -> Result<Plan, String> {
     let hooks_map = hooks_value
         .as_object_mut()
         .ok_or("settings.json: \"hooks\" is not an object")?;
-    for (event, command) in hooks(exe) {
+    for (event, args) in HOOKS {
+        let command = format!("{} {args}", shell_quote(exe));
         let groups = hooks_map.entry(event).or_insert_with(|| json!([]));
         let groups = groups
             .as_array_mut()
             .ok_or_else(|| format!("settings.json: hooks.{event} is not a list"))?;
-        if !groups.iter().any(|g| is_ours(g, &command)) {
-            groups.push(json!({ "hooks": [{ "type": "command", "command": command }] }));
-            changes.push(format!("{shown}: add {event} hook `{command}`"));
+        // Replaces hooks from an earlier setup, even of a binary that moved.
+        let mut updated = groups.clone();
+        let removed = remove_hooks(&mut updated, args);
+        if removed == [command.as_str()] {
+            continue;
         }
+        updated.push(json!({ "hooks": [{ "type": "command", "command": command }] }));
+        *groups = updated;
+        changes.push(match removed.first() {
+            None => format!("{shown}: add {event} hook `{command}`"),
+            Some(old) => format!("{shown}: replace {event} hook `{old}` with `{command}`"),
+        });
     }
 
     let prefix = status_line_prefix(exe);
@@ -214,132 +288,58 @@ fn plan_install(store: &Store, exe: &str) -> Result<Plan, String> {
     let current_command = current
         .as_ref()
         .and_then(|s| s["command"].as_str())
-        .unwrap_or("");
-    let mut record = Record::default();
-    if !current_command.starts_with(&prefix) {
-        let mut wrapped = match &current {
-            Some(Value::Object(obj)) => obj.clone(),
+        .unwrap_or("")
+        .to_owned();
+    let chained = chained_status_line(&current_command);
+    let user_command = match &chained {
+        Some(inner) => inner.clone(),
+        None => Some(current_command.clone()).filter(|c| !c.is_empty()),
+    };
+    let command = match &user_command {
+        None => prefix,
+        Some(user) => format!("{prefix} -- /bin/sh -c {}", shell_quote(user)),
+    };
+    if command != current_command {
+        let mut wrapped = match current {
+            Some(Value::Object(obj)) => obj,
             _ => Map::new(),
-        };
-        let command = if current_command.is_empty() {
-            prefix.clone()
-        } else {
-            format!(
-                "{prefix} -- /bin/sh -c {}",
-                crate::shell_quote(current_command)
-            )
         };
         wrapped.insert("type".into(), "command".into());
         wrapped.insert("command".into(), command.clone().into());
-        changes.push(match current_command {
-            "" => format!("{shown}: set statusLine to `{command}`"),
-            old => format!("{shown}: wrap statusLine `{old}` as `{command}`"),
+        changes.push(match (&chained, current_command.as_str()) {
+            (Some(_), old) => format!("{shown}: replace statusLine `{old}` with `{command}`"),
+            (None, "") => format!("{shown}: set statusLine to `{command}`"),
+            (None, old) => format!("{shown}: wrap statusLine `{old}` as `{command}`"),
         });
-        record.status_line = current;
         root.insert("statusLine".into(), Value::Object(wrapped));
-    } else if let Ok(bytes) = fs::read(store.state.join(RECORD)) {
-        record = serde_json::from_slice(&bytes).unwrap_or_default();
     }
     let settings_changed = !changes.is_empty();
 
     let rc_path = rc_path(store);
     let mut rc = read_text(&rc_path)?;
-    let rc_changed = !rc.contains(RC_START);
-    if rc_changed {
-        if !rc.is_empty() && !rc.ends_with('\n') {
-            rc.push('\n');
-        }
-        let fish = rc_path.extension().is_some_and(|e| e == "fish");
-        rc.push_str(&shell_block(exe, fish));
-        changes.push(format!(
-            "{}: add `claude` and `codex` functions that start through `hats run`",
-            rc_path.display()
-        ));
-    }
-    Ok(Plan {
-        settings_path,
-        settings,
-        settings_changed,
-        rc_path,
-        rc,
-        rc_changed,
-        changes,
-        record,
-    })
-}
-
-fn plan_undo(store: &Store, exe: &str) -> Result<Plan, String> {
-    let settings_path = settings_path(store);
-    let mut settings = load_settings(&settings_path)?;
-    let shown = settings_path.display().to_string();
-    let mut changes = Vec::new();
-    let root = settings
-        .as_object_mut()
-        .ok_or("settings.json is not a JSON object")?;
-
-    if let Some(Value::Object(hooks_map)) = root.get_mut("hooks") {
-        for (event, command) in hooks(exe) {
-            let Some(Value::Array(groups)) = hooks_map.get_mut(event) else {
-                continue;
-            };
-            let before = groups.len();
-            groups.retain(|g| !is_ours(g, &command));
-            if groups.len() != before {
-                changes.push(format!("{shown}: remove {event} hook `{command}`"));
-            }
-            if groups.is_empty() {
-                hooks_map.remove(event);
-            }
-        }
-        if hooks_map.is_empty() {
-            root.remove("hooks");
-        }
-    }
-
-    let prefix = status_line_prefix(exe);
-    let wrapped = root
-        .get("statusLine")
-        .and_then(|s| s["command"].as_str())
-        .is_some_and(|c| c.starts_with(&prefix));
-    if wrapped {
-        let record: Record = fs::read(store.state.join(RECORD))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
-        match record.status_line {
-            Some(original) => {
-                changes.push(format!(
-                    "{shown}: restore statusLine `{}`",
-                    original["command"].as_str().unwrap_or("")
-                ));
-                root.insert("statusLine".into(), original);
-            }
-            None => {
-                changes.push(format!("{shown}: remove statusLine"));
-                root.remove("statusLine");
-            }
-        }
-    }
-    let settings_changed = !changes.is_empty();
-
-    let rc_path = rc_path(store);
-    let mut rc = read_text(&rc_path)?;
-    let rc_changed = match (rc.find(RC_START), rc.find(RC_END)) {
-        (Some(start), Some(end)) if end > start => {
-            let end = end + RC_END.len();
-            let end = if rc[end..].starts_with('\n') {
-                end + 1
-            } else {
-                end
-            };
-            rc.replace_range(start..end, "");
+    let fish = rc_path.extension().is_some_and(|e| e == "fish");
+    let block = shell_block(exe, fish);
+    let rc_changed = match block_range(&rc) {
+        Some(range) if rc[range.clone()] == block => false,
+        Some(range) => {
+            rc.replace_range(range, &block);
             changes.push(format!(
-                "{}: remove the hats shell functions",
+                "{}: point the `claude` and `codex` functions at {exe}",
                 rc_path.display()
             ));
             true
         }
-        _ => false,
+        None => {
+            if !rc.is_empty() && !rc.ends_with('\n') {
+                rc.push('\n');
+            }
+            rc.push_str(&block);
+            changes.push(format!(
+                "{}: add `claude` and `codex` functions that start through `hats run`",
+                rc_path.display()
+            ));
+            true
+        }
     };
     Ok(Plan {
         settings_path,
@@ -349,22 +349,132 @@ fn plan_undo(store: &Store, exe: &str) -> Result<Plan, String> {
         rc,
         rc_changed,
         changes,
-        record: Record::default(),
     })
 }
 
-/// Copies `path` next to itself before the first change; `None` if it did not exist.
-fn backup(path: &Path, stamp: i64) -> io::Result<Option<PathBuf>> {
-    if !path.exists() {
-        return Ok(None);
+fn plan_undo(store: &Store) -> Result<Plan, String> {
+    let settings_path = settings_path(store);
+    let mut settings = load_settings(&settings_path)?;
+    let shown = settings_path.display().to_string();
+    let mut changes = Vec::new();
+    let root = settings
+        .as_object_mut()
+        .ok_or("settings.json is not a JSON object")?;
+
+    if let Some(Value::Object(hooks_map)) = root.get_mut("hooks") {
+        for (event, args) in HOOKS {
+            let Some(Value::Array(groups)) = hooks_map.get_mut(event) else {
+                continue;
+            };
+            let removed = remove_hooks(groups, args);
+            if removed.is_empty() {
+                continue;
+            }
+            for command in &removed {
+                changes.push(format!("{shown}: remove {event} hook `{command}`"));
+            }
+            if groups.is_empty() {
+                hooks_map.remove(event);
+            }
+        }
+        if hooks_map.is_empty() && !changes.is_empty() {
+            root.remove("hooks");
+        }
     }
-    let name = format!(
-        "{}.hats-backup-{stamp}",
+
+    let chained = root
+        .get("statusLine")
+        .and_then(|s| s["command"].as_str())
+        .and_then(chained_status_line);
+    match chained {
+        Some(Some(user)) => {
+            changes.push(format!("{shown}: restore statusLine `{user}`"));
+            root["statusLine"]["command"] = user.into();
+        }
+        Some(None) => {
+            changes.push(format!("{shown}: remove statusLine"));
+            root.remove("statusLine");
+        }
+        None => {}
+    }
+    let settings_changed = !changes.is_empty();
+
+    let rc_path = rc_path(store);
+    let mut rc = read_text(&rc_path)?;
+    let rc_changed = match block_range(&rc) {
+        Some(range) => {
+            rc.replace_range(range, "");
+            changes.push(format!(
+                "{}: remove the hats shell functions",
+                rc_path.display()
+            ));
+            true
+        }
+        None => false,
+    };
+    Ok(Plan {
+        settings_path,
+        settings,
+        settings_changed,
+        rc_path,
+        rc,
+        rc_changed,
+        changes,
+    })
+}
+
+/// Copies `path` next to itself, never over an earlier backup; `None` if it
+/// did not exist. The copy is no more readable than the original.
+fn backup(path: &Path, stamp: i64) -> io::Result<Option<PathBuf>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mode = fs::metadata(path)?.permissions().mode();
+    let base = format!(
+        "{}.{BACKUP_TAG}{stamp}",
         path.file_name().unwrap_or_default().to_string_lossy()
     );
-    let backup = path.with_file_name(name);
-    fs::copy(path, &backup)?;
-    Ok(Some(backup))
+    for n in 0u32.. {
+        let name = if n == 0 {
+            base.clone()
+        } else {
+            format!("{base}.{n}")
+        };
+        let backup = path.with_file_name(name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&backup)
+        {
+            Ok(mut file) => {
+                file.write_all(&bytes)?;
+                return Ok(Some(backup));
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("some backup name is free")
+}
+
+/// The newest backup of `path` that `same` accepts.
+fn matching_backup(path: &Path, same: impl Fn(&str) -> bool) -> Option<String> {
+    let dir = path.parent()?;
+    let prefix = format!("{}.{BACKUP_TAG}", path.file_name()?.to_str()?);
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|name| name.starts_with(&prefix))
+        .collect();
+    names.sort();
+    names
+        .iter()
+        .rev()
+        .filter_map(|name| fs::read_to_string(dir.join(name)).ok())
+        .find(|text| same(text))
 }
 
 /// Writes through a symlink to its target, so a linked settings.json stays linked.
@@ -379,4 +489,30 @@ fn write_atomic(path: &Path, text: &str) -> io::Result<()> {
         fs::set_permissions(&tmp, meta.permissions())?;
     }
     fs::rename(tmp, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_its_commands_wherever_the_binary_was() {
+        let exe = "/home/o'neil/bin/hats";
+        let hook = format!("{} hook stop", shell_quote(exe));
+        assert_eq!(hats_args(&hook), Some("hook stop"));
+        assert_eq!(hats_args("'/opt/other/tool' hook stop"), None);
+        assert_eq!(hats_args("hats hook stop"), None);
+
+        let wrapped = format!(
+            "{} -- /bin/sh -c {}",
+            status_line_prefix(exe),
+            shell_quote("printf '%s' \"$x\" | head -1")
+        );
+        assert_eq!(
+            chained_status_line(&wrapped),
+            Some(Some("printf '%s' \"$x\" | head -1".to_owned()))
+        );
+        assert_eq!(chained_status_line(&status_line_prefix(exe)), Some(None));
+        assert_eq!(chained_status_line("bun status.ts"), None);
+    }
 }

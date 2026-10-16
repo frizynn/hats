@@ -280,7 +280,8 @@ fn a_backup_is_never_overwritten() {
 fn undo_restores_the_status_line_without_its_own_state() {
     let (sb, settings, _) = setup_sandbox();
     setup(&sb, &["setup"]);
-    fs::remove_dir_all(sb.home.join(".local/state/hats")).unwrap();
+    // Whatever hats keeps elsewhere may be gone by the time the user undoes.
+    let _ = fs::remove_dir_all(sb.home.join(".local/state/hats"));
     setup(&sb, &["setup", "--undo"]);
     assert_eq!(
         json(&settings)["statusLine"]["command"],
@@ -296,8 +297,8 @@ fn setup_from_a_moved_binary_updates_its_entries() {
     fs::create_dir_all(moved.parent().unwrap()).unwrap();
     fs::copy(env!("CARGO_BIN_EXE_hats"), &moved).unwrap();
     let run_moved = |args: &[&str]| {
-        let mut cmd = sb.cmd(args);
-        cmd.get_program();
+        // The sandbox environment, with the moved copy as the program.
+        let cmd = sb.cmd(args);
         let out = std::process::Command::new(&moved)
             .args(args)
             .env_clear()
