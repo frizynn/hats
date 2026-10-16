@@ -9,7 +9,7 @@ use std::fs;
 use std::io::Read;
 use std::os::fd::FromRawFd;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -50,6 +50,8 @@ struct Run {
     status: std::process::ExitStatus,
     elapsed: Duration,
     log: String,
+    /// The terminal the agent ran in, to read its settings after the run.
+    tty: fs::File,
 }
 
 fn two_accounts() -> Sandbox {
@@ -72,6 +74,7 @@ fn run_in_pty(sb: &Sandbox, fake: &str, during: impl FnOnce(u32)) -> Run {
     let log = sb.home.join("fake.log");
 
     let (mut master, slave) = pty();
+    let tty = slave.try_clone().unwrap();
     std::thread::spawn(move || {
         let mut sink = [0u8; 4096];
         while master.read(&mut sink).is_ok_and(|n| n > 0) {}
@@ -118,6 +121,7 @@ fn run_in_pty(sb: &Sandbox, fake: &str, during: impl FnOnce(u32)) -> Run {
         status,
         elapsed,
         log,
+        tty,
     }
 }
 
@@ -128,6 +132,7 @@ fn moves_an_idle_session_to_the_next_account_and_resumes_it() {
         status,
         elapsed,
         log,
+        ..
     } = run_in_pty(&sb, FAKE, |_| {});
     let lines: Vec<&str> = log.lines().collect();
     assert_eq!(
@@ -233,4 +238,81 @@ fn an_agent_that_ignores_sigterm_is_killed_after_ten_seconds() {
     assert!(run.log.ends_with("resumed\n"), "{}", run.log);
     assert!(run.elapsed >= Duration::from_secs(11), "{:?}", run.elapsed);
     assert!(run.status.success());
+}
+
+fn local_flags(tty: &fs::File) -> libc::tcflag_t {
+    use std::os::fd::AsRawFd;
+    let mut t = std::mem::MaybeUninit::<libc::termios>::uninit();
+    // SAFETY: tcgetattr fills the struct on success, checked below.
+    assert_eq!(
+        unsafe { libc::tcgetattr(tty.as_raw_fd(), t.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: initialized by tcgetattr.
+    unsafe { t.assume_init() }.c_lflag
+}
+
+#[test]
+fn an_agent_killed_outright_leaves_a_usable_terminal() {
+    let sb = two_accounts();
+    // Raw mode without echo, as an interactive agent sets it, then a kill it
+    // cannot handle (the OOM killer, `kill -9`).
+    let fake = "#!/bin/sh\nstty raw -echo\necho start >> \"$FAKE_LOG\"\nkill -KILL $$\n";
+    let run = run_in_pty(&sb, fake, |_| {});
+    assert_eq!(run.status.code(), Some(128 + libc::SIGKILL));
+    let flags = local_flags(&run.tty);
+    assert!(
+        flags & libc::ECHO != 0 && flags & libc::ICANON != 0,
+        "echo and line editing are back: {flags:#x}"
+    );
+}
+
+#[test]
+fn a_stop_request_during_a_move_ends_instead_of_relaunching() {
+    let sb = two_accounts();
+    // The terminal closes while the agent is shutting down for the move.
+    let fake = FAKE.replace(
+        "trap 'echo term >> \"$FAKE_LOG\"; exit 143' TERM",
+        "trap 'echo term >> \"$FAKE_LOG\"; kill -HUP $HATS_SUPERVISOR; sleep 0.3; exit 143' TERM",
+    );
+    let run = run_in_pty(&sb, &fake, |_| {});
+    assert!(run.log.contains("term"), "{}", run.log);
+    assert!(!run.log.contains("--resume"), "relaunched: {}", run.log);
+    assert!(!run.status.success());
+}
+
+#[test]
+fn the_agent_ends_when_its_parent_is_killed() {
+    let sb = two_accounts();
+    let fake = "#!/bin/sh\ntrap 'echo hup >> \"$FAKE_LOG\"; exit 129' HUP\necho start >> \"$FAKE_LOG\"\nwhile :; do sleep 0.05; done\n";
+    let log = sb.home.join("fake.log");
+    let group = std::cell::Cell::new(0);
+    // Whatever happens, nothing of this test outlives it.
+    let _cleanup = KillGroupOnDrop(&group);
+    let run = run_in_pty(&sb, fake, |pid| {
+        group.set(pid as libc::pid_t);
+        // SAFETY: killing our own child outright.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    });
+    assert_eq!(run.status.signal(), Some(libc::SIGKILL));
+    let started = Instant::now();
+    while !fs::read_to_string(&log).unwrap().contains("hup") {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the agent outlived its parent: {}",
+            fs::read_to_string(&log).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+struct KillGroupOnDrop<'a>(&'a std::cell::Cell<libc::pid_t>);
+
+impl Drop for KillGroupOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.0.get() > 0 {
+            // SAFETY: the process group created for the test's child.
+            unsafe { libc::kill(-self.0.get(), libc::SIGKILL) };
+        }
+    }
 }
