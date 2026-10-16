@@ -55,7 +55,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// List accounts with their limits; `*` marks the current one.
+    /// List accounts with their limits; `●` marks the one new sessions start with.
     #[command(visible_alias = "ls")]
     List {
         /// Print JSON (schema `v: 1`) for scripts.
