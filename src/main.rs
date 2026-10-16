@@ -64,32 +64,46 @@ enum Cmd {
         json: bool,
     },
     /// Create an account that shares your settings, skills and history.
-    Add { label: String },
+    Add {
+        /// Account label, as `hats list` shows it.
+        label: String,
+    },
     /// Sign in to an account with the harness's own login.
     Login {
+        /// Account label, as `hats list` shows it.
         label: String,
         /// Passed on to `claude auth login` or `codex login`.
         #[arg(last = true)]
         args: Vec<OsString>,
     },
     /// Make an account the default for new sessions.
-    Use { label: String },
+    Use {
+        /// Account label, as `hats list` shows it.
+        label: String,
+    },
     /// Start the harness with an account (default: the current one).
     ///
     /// In auto mode, an interactive Claude Code session stays under a small
     /// hats parent that moves it to the next account when it passes the
     /// threshold, once the agent is idle.
     Run {
+        /// Account label, as `hats list` shows it (default: the current one).
         label: Option<String>,
         /// Passed on to the harness.
         #[arg(last = true)]
         args: Vec<OsString>,
     },
     /// Print the shell line that selects an account, for `eval`.
-    Env { label: Option<String> },
+    Env {
+        /// Account label, as `hats list` shows it (default: the current one).
+        label: Option<String>,
+    },
     /// Sign out with the harness and delete the account's directory.
     #[command(visible_alias = "rm")]
-    Remove { label: String },
+    Remove {
+        /// Account label, as `hats list` shows it.
+        label: String,
+    },
     /// Show or change settings (`hats config` lists them all).
     Config {
         #[command(subcommand)]
