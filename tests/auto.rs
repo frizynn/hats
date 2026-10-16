@@ -212,7 +212,9 @@ fn a_rate_limit_counts_as_full_until_the_status_line_says_otherwise() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    let until = side["limits"]["limitedUntil"].as_i64().expect("limitedUntil");
+    let until = side["limits"]["limitedUntil"]
+        .as_i64()
+        .expect("limitedUntil");
     assert!((until - (now + 5 * 3600)).abs() < 60, "{side}");
 
     sb.repaint("work", 95.0, 0.0);

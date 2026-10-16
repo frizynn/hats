@@ -411,10 +411,16 @@ fn list(store: &Store, json: bool) -> Result<(), Failure> {
                     "current": current.as_deref() == Some(s.account.label.as_str()),
                     "configDir": s.account.dir,
                     "usedPercent": s.used(now),
-                    "limits": s.reading.as_ref().map(|r| serde_json::json!({
-                        "observedAt": r.observed_at,
-                        "windows": r.windows,
-                    })),
+                    "limits": s.reading.as_ref().map(|r| {
+                        let mut limits = serde_json::json!({
+                            "observedAt": r.observed_at,
+                            "windows": r.windows,
+                        });
+                        if let Some(until) = r.limited_until {
+                            limits["limitedUntil"] = until.into();
+                        }
+                        limits
+                    }),
                 }));
             }
             continue;

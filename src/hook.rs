@@ -4,7 +4,8 @@
 //! - `SessionStart`: records which account the session runs with. A resume
 //!   under another account writes a new line; the newest line wins.
 //! - `UserPromptSubmit`, `Stop`, `StopFailure`: tell a `hats run` parent when
-//!   the agent is working or idle; a rate limit error moves the account.
+//!   the agent is working or idle; a rate limit error marks the account full
+//!   and moves the default off it.
 
 use std::ffi::OsString;
 use std::io::Read;
@@ -15,6 +16,7 @@ use serde::Deserialize;
 
 use crate::account::{Account, Harness};
 use crate::config::HarnessConfig;
+use crate::limits;
 use crate::policy::Reason;
 use crate::registry::{self, Switch};
 use crate::store::Store;
@@ -90,10 +92,15 @@ pub fn stop(
     let input = read_input(stdin)?;
     let rate_limited = input.hook_event_name.as_deref() == Some("StopFailure")
         && input.error.as_deref() == Some("rate_limit");
-    if rate_limited
-        && store.current(Harness::Claude)?.label == session_account(store, config_dir).label
-    {
-        auto::check_default(store, Harness::Claude, config, now, Some(Reason::Limit))?;
+    if rate_limited {
+        let account = session_account(store, config_dir);
+        // Known as full from now on, whether or not it is the default.
+        if let Some(id) = account.provider_id(store).map_err(|e| e.to_string())? {
+            limits::mark_limited(store, &account, &id, now).map_err(|e| e.to_string())?;
+        }
+        if store.current(Harness::Claude)?.label == account.label {
+            auto::check_default(store, Harness::Claude, config, now, Some(Reason::Limit))?;
+        }
     }
     supervisor::mark_idle(store, &input.session_id, rate_limited, now).map_err(|e| e.to_string())
 }
