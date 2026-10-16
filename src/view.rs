@@ -253,7 +253,7 @@ fn state(
         };
         return vec![cell(format!("not signed in: {how}"), Tone::Warn)];
     };
-    let Some(r) = &s.reading else {
+    let Some(r) = s.reading.as_ref().filter(|_| s.used(now).is_some()) else {
         return vec![cell(
             "no data yet: appears once you use this account",
             Tone::Dim,

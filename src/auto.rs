@@ -19,8 +19,13 @@ pub struct Status {
 }
 
 impl Status {
+    /// Highest use now, or `None` when nothing is known: a learned limit
+    /// that expired leaves no numbers behind.
     pub fn used(&self, now: SystemTime) -> Option<f64> {
-        self.reading.as_ref().map(|r| r.binding_used(now))
+        self.reading
+            .as_ref()
+            .filter(|r| r.limited(now) || !r.windows.is_empty())
+            .map(|r| r.binding_used(now))
     }
 
     fn candidate(&self, now: SystemTime) -> Candidate {
