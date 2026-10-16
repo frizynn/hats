@@ -449,3 +449,35 @@ fn usage_errors_exit_2() {
         assert_eq!(out.status.code(), Some(2), "{args:?}");
     }
 }
+
+#[test]
+fn history_a_new_account_writes_is_shared_and_survives_remove() {
+    let sb = Sandbox::new();
+    sb.ok(&["add", "work"]);
+    let dir = sb.claude_dir("work");
+    // What Claude Code writes in its first session of the new account.
+    let mut history = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("history.jsonl"))
+        .unwrap();
+    history.write_all(b"{\"display\":\"x\"}\n").unwrap();
+    for name in ["file-history", "todos", "plans"] {
+        fs::create_dir_all(dir.join(name)).unwrap();
+        fs::write(dir.join(name).join("entry"), name).unwrap();
+    }
+
+    sb.ok(&["remove", "work"]);
+
+    let claude = sb.home.join(".claude");
+    assert_eq!(
+        fs::read_to_string(claude.join("history.jsonl")).unwrap(),
+        "{\"display\":\"x\"}\n"
+    );
+    for name in ["file-history", "todos", "plans"] {
+        assert_eq!(
+            fs::read_to_string(claude.join(name).join("entry")).unwrap(),
+            name
+        );
+    }
+}
