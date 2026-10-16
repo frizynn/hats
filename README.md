@@ -103,9 +103,10 @@ For Codex, add `--codex` to the same commands: `hats --codex add personal`,
   `oauthAccount.accountUuid` and `organizationUuid` from that directory's
   `.claude.json`, or `creator_account_id` from the newest Codex rollout header.
 - **Nothing stays running.** `hats run` replaces itself with the harness
-  (`exec`), except for interactive Claude Code sessions in auto mode, where a
-  small parent stays to move the session when needed (see below). Hooks and the
-  status line wrapper are short processes Claude Code already starts.
+  (`exec`), except for interactive Claude Code sessions, where a small parent
+  stays to move the session when needed and to close it when unused (see
+  below). Hooks and the status line wrapper are short processes Claude Code
+  already starts.
 
 ## Automatic switching
 
@@ -172,6 +173,47 @@ Limits of the running-session move:
 Every change of account is recorded in the registry with its reason
 (`manual`, `threshold` or `limit`).
 
+## Closing unused sessions
+
+A Claude Code session started with `hats run` (or the `claude` function) that
+goes unused for `claude.close_idle`, 32 hours by default, is closed: hats ends
+Claude Code with `SIGTERM`, as for a move, does not start it again, and
+prints how to resume it before the shell prompt comes back:
+
+```
+hats: closed this session after 32h without use. Resume it with: claude --resume <id>
+```
+
+`hats config set claude.close_idle 8` makes it 8 hours; `90m` and `30s` are
+minutes and seconds, handy to try it; `0` or `off` turns it off. It works in
+manual mode and with `relaunch = "off"` too; moving still needs both on. A
+change reaches running sessions at their next check.
+
+What counts as use:
+
+- The clock starts when a turn ends (the `Stop` or `StopFailure` hook). A new
+  prompt, another turn end or a write to the session's transcript restarts it;
+  the transcript covers a background task that wakes the agent without a
+  prompt.
+- During a turn there is no clock, also while Claude Code waits for your
+  approval: a session is never closed mid-turn.
+- Hours are wall-clock hours and count time the computer sleeps. The parent
+  wakes at most every 15 minutes to compare with the clock, because the timer
+  it sleeps on may not count sleep; after a long sleep, a session already due
+  closes within 15 minutes of waking.
+
+Limits:
+
+- Only Claude Code: a Codex session has no hats parent, so there is no
+  `codex.close_idle`.
+- Only sessions whose `hats run` parent runs a version with this setting.
+  Sessions opened before you installed it keep their old parent and are never
+  closed; start them again to get it.
+- A session where no turn has ended yet, or whose last turn was interrupted
+  with Esc (no `Stop` hook), has no clock and stays open.
+- Closing is not recorded in the registry: its format, which other tools read,
+  records changes of account only.
+
 ## Commands
 
 | Command | What it does |
@@ -207,6 +249,7 @@ threshold = 90         # 1-100, percent of the 5-hour or weekly limit
 strategy = "headroom"  # headroom | next
 order = ["work", "personal"]   # preferred order; others follow by name
 relaunch = "idle"      # idle | off: move running `hats run` sessions
+close_idle = "32h"     # close a `hats run` session unused this long; 0 | off: never
 
 [codex]
 mode = "auto"
