@@ -354,20 +354,32 @@ fn remove(store: &Store, account: Account) -> Result<(), Failure> {
 
 fn setup() -> Result<(), Failure> {
     let exe = std::env::current_exe()?;
-    let exe = exe.to_string_lossy();
-    let command = serde_json::to_string(&format!("{exe} hook session-start")).expect("string");
+    let json = |cmd: String| serde_json::to_string(&cmd).expect("string");
+    let hook = json(format!("{} hook session-start", exe.display()));
+    let status = json(format!(
+        "{} statusline -- <your status line command>",
+        exe.display()
+    ));
+    let exe = shell_quote(exe.as_os_str());
     print!(
         "\
-1. Record which account each Claude Code session uses. Add to ~/.claude/settings.json
+Nothing here is applied for you. Paste what you want:
+
+1. Record which account each Claude Code session uses. In ~/.claude/settings.json
    (accounts made with `add` share that file):
 
   \"hooks\": {{
     \"SessionStart\": [
-      {{ \"hooks\": [ {{ \"type\": \"command\", \"command\": {command} }} ] }}
+      {{ \"hooks\": [ {{ \"type\": \"command\", \"command\": {hook} }} ] }}
     ]
   }}
 
-2. Start plain `claude` and `codex` with the current account. Add to ~/.zshrc or ~/.bashrc:
+2. Optional: keep each account's plan limits from the status line. In the same file,
+   wrap the status line you already have (drop `-- ...` if you have none):
+
+  \"statusLine\": {{ \"type\": \"command\", \"command\": {status} }}
+
+3. Start plain `claude` and `codex` with the current account. In ~/.zshrc or ~/.bashrc:
 
   claude() {{ {exe} run -- \"$@\"; }}
   codex() {{ {exe} run --codex -- \"$@\"; }}
