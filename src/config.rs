@@ -3,7 +3,8 @@
 //! `hats config set`, keeping the user's comments.
 
 use std::fs;
-use std::io;
+use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -272,7 +273,13 @@ fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
         crate::account::create_private_dir(dir)?;
     }
     let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
-    fs::write(&tmp, bytes)?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    file.write_all(bytes)?;
     fs::rename(tmp, path)
 }
 
