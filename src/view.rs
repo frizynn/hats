@@ -69,8 +69,9 @@ pub struct Block {
     pub accounts: Vec<Vec<Row>>,
 }
 
-/// Column widths for one block.
-struct Layout {
+/// Column widths, shared by the blocks on one screen so they line up.
+pub struct Layout {
+    width: usize,
     label: usize,
     /// The identity column, when it fits on the account's line; otherwise it
     /// goes on a second line.
@@ -79,31 +80,31 @@ struct Layout {
 }
 
 impl Layout {
-    fn new(statuses: &[Status], harness: Harness, width: usize) -> Self {
-        let label = statuses
-            .iter()
-            .map(|s| s.account.label.chars().count())
-            .max()
-            .unwrap_or(0)
-            .max("ACCOUNT".len());
-        let who = statuses
-            .iter()
-            .map(|s| who(s, harness).chars().count())
-            .max()
-            .unwrap_or(0)
-            .max("SIGNED IN AS".len());
+    pub fn new<'a>(
+        groups: impl IntoIterator<Item = (Harness, &'a [Status])>,
+        width: usize,
+    ) -> Self {
+        let (mut label, mut who) = ("ACCOUNT".len(), "SIGNED IN AS".len());
+        for (harness, statuses) in groups {
+            for s in statuses {
+                label = label.max(s.account.label.chars().count());
+                who = who.max(self::who(s, harness).chars().count());
+            }
+        }
         // Marker, label, two windows, age, and the gaps between them.
         let fixed = 2 + label + 3 * GAP.len() + 2 * WINDOW_TEXT + GAP.len() + AGE_WIDTH;
         let bars = |room: usize| room / 2;
         let wide = fixed + who + GAP.len();
         if width >= wide + 2 * 6 {
             Self {
+                width,
                 label,
                 who: Some(who),
                 bar: bars(width - wide).min(10),
             }
         } else {
             Self {
+                width,
                 label,
                 who: None,
                 bar: bars(width.saturating_sub(fixed)).clamp(3, 10),
@@ -167,11 +168,11 @@ pub fn block(
     config: &HarnessConfig,
     statuses: &[Status],
     current: Option<&str>,
-    width: usize,
+    layout: &Layout,
     now: SystemTime,
     hints: Hints,
 ) -> Block {
-    let layout = Layout::new(statuses, harness, width);
+    let width = layout.width;
     let mut header = vec![vec![
         cell(title(harness), Tone::Title),
         cell(" · new sessions start in ", Tone::Plain),
@@ -213,7 +214,7 @@ pub fn block(
             if let Some(w) = layout.who {
                 line.push(cell(format!("{who:<w$}{GAP}"), Tone::Dim));
             }
-            line.extend(state(s, harness, config, &layout, now, hints));
+            line.extend(state(s, harness, config, layout, now, hints));
             let mut rows = vec![line];
             if layout.who.is_none() && !who.is_empty() {
                 // Under the label and a step in, so it reads as part of it.

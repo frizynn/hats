@@ -12,6 +12,7 @@ mod store;
 mod supervisor;
 mod tui;
 mod view;
+mod watch;
 
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Read, Write};
@@ -426,9 +427,13 @@ fn list(store: &Store, json: bool) -> Result<(), Failure> {
     let mut out = io::stdout().lock();
     let mut rows = Vec::new();
     let mut any = false;
-    for harness in Harness::ALL {
+    let groups = Harness::ALL
+        .into_iter()
+        .map(|h| Ok((h, auto::statuses(store, h, config.for_harness(h))?)))
+        .collect::<Result<Vec<_>, String>>()?;
+    let layout = view::Layout::new(groups.iter().map(|(h, s)| (*h, s.as_slice())), width);
+    for (harness, statuses) in groups {
         let settings = config.for_harness(harness);
-        let statuses = auto::statuses(store, harness, settings)?;
         if statuses.is_empty() {
             continue;
         }
@@ -469,7 +474,7 @@ fn list(store: &Store, json: bool) -> Result<(), Failure> {
             settings,
             &statuses,
             current.as_deref(),
-            width,
+            &layout,
             now,
             view::Hints::Commands,
         );

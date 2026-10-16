@@ -1,10 +1,11 @@
 //! Interactive view: the accounts of both harnesses with their limits, and
-//! the CLI's actions on keys. It blocks on the next terminal event and draws
-//! only after one that changed something, so it costs nothing while idle.
+//! the CLI's actions on keys. It blocks until a key or a change of hats'
+//! state (a status line, a hook, `hats use` elsewhere) and draws only after
+//! one that changed something, so it costs nothing while idle.
 
 use std::io::{self, Stdout, Write, stdout};
 use std::process::{Command, Stdio};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -21,6 +22,7 @@ use crate::config::{self, Config, Mode, Relaunch, Strategy};
 use crate::registry::{self, Change};
 use crate::store::Store;
 use crate::view;
+use crate::watch::Watch;
 
 /// Changes of account shown at the foot.
 const RECENT: usize = 3;
@@ -33,29 +35,67 @@ pub fn run(store: &Store) -> Result<(), String> {
         Screen::enter().map_err(|e| format!("could not open the interactive view: {e}"))?;
     let result = event_loop(&mut app, &mut screen);
     drop(screen);
+    // Back on the normal screen, say what closed the view: a terminal that
+    // sends Esc or Ctrl+C on its own would otherwise close it unseen.
+    if let Some(key) = app.closed_by {
+        println!("hats: closed with {key}.");
+    }
     result.map_err(|e| e.to_string())
 }
 
 fn event_loop(app: &mut App, screen: &mut Screen) -> io::Result<()> {
+    // Starts crossterm's reader, which also listens for resizes.
+    event::poll(Duration::ZERO)?;
+    let mut watch = app.watch();
     screen.term.draw(|frame| app.draw(frame))?;
     loop {
-        // No timeout: nothing runs until the user does something.
-        let step = match event::read()? {
-            Event::Key(key) => app.on_key(key),
-            Event::Resize(..) => Step::Redraw,
-            _ => Step::Idle,
-        };
-        match step {
-            Step::Idle => continue,
-            Step::Redraw => {}
-            Step::Quit => return Ok(()),
-            Step::Run(child) => {
-                let outcome = screen.run(&child)?;
-                app.finish(&child, outcome);
+        // No timeout: nothing runs until a key or a change of hats' state.
+        let mut redraw = false;
+        match &mut watch {
+            Some(watch) => {
+                let wake = watch.wait()?;
+                if wake.changed {
+                    app.reload();
+                    redraw = true;
+                }
+                if wake.input {
+                    // Everything the terminal sent, without blocking.
+                    while event::poll(Duration::ZERO)? {
+                        match handle(app, screen, event::read()?)? {
+                            None => return Ok(()),
+                            Some(again) => redraw |= again,
+                        }
+                    }
+                }
             }
+            None => match handle(app, screen, event::read()?)? {
+                None => return Ok(()),
+                Some(again) => redraw = again,
+            },
         }
-        screen.term.draw(|frame| app.draw(frame))?;
+        if redraw {
+            screen.term.draw(|frame| app.draw(frame))?;
+        }
     }
+}
+
+/// Acts on one terminal event: `None` to quit, else whether to redraw.
+fn handle(app: &mut App, screen: &mut Screen, event: Event) -> io::Result<Option<bool>> {
+    let step = match event {
+        Event::Key(key) => app.on_key(key),
+        Event::Resize(..) => Step::Redraw,
+        _ => Step::Idle,
+    };
+    Ok(match step {
+        Step::Idle => Some(false),
+        Step::Redraw => Some(true),
+        Step::Quit => None,
+        Step::Run(child) => {
+            let outcome = screen.run(&child)?;
+            app.finish(&child, outcome);
+            Some(true)
+        }
+    })
 }
 
 /// What the loop does after a key.
@@ -181,6 +221,8 @@ struct App<'a> {
     message: Option<Message>,
     /// The newest changes of account, of both harnesses.
     changes: Vec<Change>,
+    /// The key that closed the view.
+    closed_by: Option<&'static str>,
     color: bool,
 }
 
@@ -199,6 +241,7 @@ impl<'a> App<'a> {
             panel: Panel::List,
             message: None,
             changes: Vec::new(),
+            closed_by: None,
             color,
         };
         app.reload();
@@ -215,6 +258,18 @@ impl<'a> App<'a> {
 
     fn selected_status(&self) -> Option<&Status> {
         self.groups[self.focus].statuses.get(self.selected)
+    }
+
+    /// Wakes the view when another process changes the state, if the
+    /// terminal is on stdin, where crossterm reads keys.
+    fn watch(&self) -> Option<Watch> {
+        // SAFETY: isatty(3) on stdin.
+        let tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+        if !tty {
+            return None;
+        }
+        self.store.ensure_state().ok()?;
+        Watch::new(&self.store.state, libc::STDIN_FILENO).ok()
     }
 
     /// Reads config, accounts and limits again, keeping the selected account.
@@ -269,6 +324,7 @@ impl<'a> App<'a> {
         }
         // Raw mode turns Ctrl+C into a key.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.closed_by = Some("Ctrl+C");
             return Step::Quit;
         }
         let cleared = self.message.take().is_some();
@@ -279,6 +335,12 @@ impl<'a> App<'a> {
             Panel::Remove(label) => self.remove_key(label, key),
         };
         self.panel = panel;
+        if step == Step::Quit && self.closed_by.is_none() {
+            self.closed_by = Some(match key.code {
+                KeyCode::Esc => "Esc",
+                _ => "q",
+            });
+        }
         match step {
             Step::Idle if cleared => Step::Redraw,
             step => step,
@@ -600,6 +662,12 @@ impl<'a> App<'a> {
 
     fn draw_list(&self, frame: &mut Frame, area: Rect, now: SystemTime) {
         let width = usize::from(area.width);
+        let layout = view::Layout::new(
+            self.groups
+                .iter()
+                .map(|g| (g.harness, g.statuses.as_slice())),
+            width,
+        );
         let mut lines = Vec::new();
         let mut selected = 0..0;
         for (i, group) in self.groups.iter().enumerate() {
@@ -629,7 +697,7 @@ impl<'a> App<'a> {
                 self.config.for_harness(group.harness),
                 &group.statuses,
                 group.current.as_deref(),
-                width,
+                &layout,
                 now,
                 view::Hints::Keys,
             );
@@ -1056,6 +1124,7 @@ mod tests {
         assert_eq!(app.on_key(key(KeyCode::Esc)), Step::Redraw);
         assert_eq!(app.panel, Panel::List);
         assert_eq!(app.on_key(key(KeyCode::Esc)), Step::Quit);
+        assert_eq!(app.closed_by, Some("Esc"));
     }
 
     #[test]
