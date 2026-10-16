@@ -15,19 +15,22 @@
 //! `session == S` and `at <= t`, else to the newest line without `session` and
 //! `at <= t`, else to nobody.
 
-use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::account::Harness;
 use crate::policy::Reason;
 
 pub const FILE_NAME: &str = "switches.jsonl";
 const VERSION: u32 = 1;
+/// The registry grows with every session; recent changes sit in its tail.
+const RECENT_TAIL: u64 = 64 * 1024;
 
 #[derive(Serialize)]
 pub struct Switch<'a> {
@@ -83,6 +86,77 @@ pub fn append(path: &Path, switch: &Switch) -> io::Result<()> {
         .mode(0o600)
         .open(path)?;
     file.write_all(switch.to_line().as_bytes())
+}
+
+/// A change of account read back from the registry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Change {
+    /// Unix seconds.
+    pub at: i64,
+    pub harness: Harness,
+    /// The account before, when the registry's tail says.
+    pub from: Option<String>,
+    pub to: String,
+    pub reason: Reason,
+    /// A running session moved, rather than the default for new sessions.
+    pub session: bool,
+}
+
+#[derive(Deserialize)]
+struct Recorded {
+    at: String,
+    harness: Harness,
+    label: String,
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    reason: Option<Reason>,
+}
+
+/// The newest `limit` changes of account, oldest first.
+pub fn recent(path: &Path, limit: usize) -> Vec<Change> {
+    let mut tail = Vec::new();
+    let start = File::open(path).and_then(|mut file| {
+        let start = file.metadata()?.len().saturating_sub(RECENT_TAIL);
+        file.seek(SeekFrom::Start(start))?;
+        file.read_to_end(&mut tail)?;
+        Ok(start)
+    });
+    let Ok(start) = start else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&tail);
+    // A tail that starts mid-file starts mid-line.
+    let lines = text.lines().skip(usize::from(start > 0));
+    // Before its first line, a harness starts in its own directory.
+    let mut defaults: HashMap<Harness, String> = HashMap::new();
+    if start == 0 {
+        for harness in Harness::ALL {
+            defaults.insert(harness, crate::account::DEFAULT_LABEL.to_owned());
+        }
+    }
+    let mut sessions: HashMap<String, String> = HashMap::new();
+    let mut changes = Vec::new();
+    for line in lines {
+        let Ok(r) = serde_json::from_str::<Recorded>(line) else {
+            continue;
+        };
+        let before = match &r.session {
+            Some(session) => sessions.insert(session.clone(), r.label.clone()),
+            None => defaults.insert(r.harness, r.label.clone()),
+        };
+        if let (Some(reason), Some(at)) = (r.reason, parse_utc(&r.at)) {
+            changes.push(Change {
+                at,
+                harness: r.harness,
+                from: before.filter(|b| *b != r.label),
+                to: r.label,
+                reason,
+                session: r.session.is_some(),
+            });
+        }
+    }
+    changes.split_off(changes.len().saturating_sub(limit))
 }
 
 /// RFC 3339 UTC with milliseconds, e.g. `2026-01-02T03:04:05.678Z`.
@@ -183,6 +257,78 @@ mod tests {
             utc_millis(at(4_102_444_799, 999)),
             "2099-12-31T23:59:59.999Z"
         );
+    }
+
+    #[test]
+    fn recent_changes_say_from_where() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let at = |s: u64| UNIX_EPOCH + Duration::from_secs(1_767_323_000 + s);
+        let dir_of = |label: &str| Path::new("/accounts").join(label);
+        let lines = [
+            Switch::new(
+                at(0),
+                Harness::Claude,
+                "a",
+                "work",
+                &dir_of("work"),
+                None,
+                Some(Reason::Manual),
+            ),
+            Switch::new(
+                at(1),
+                Harness::Claude,
+                "a",
+                "work",
+                &dir_of("work"),
+                Some("s1"),
+                None,
+            ),
+            Switch::new(
+                at(2),
+                Harness::Claude,
+                "b",
+                "side",
+                &dir_of("side"),
+                Some("s1"),
+                Some(Reason::Limit),
+            ),
+            Switch::new(
+                at(3),
+                Harness::Codex,
+                "c",
+                "alt",
+                &dir_of("alt"),
+                None,
+                Some(Reason::Threshold),
+            ),
+            Switch::new(
+                at(4),
+                Harness::Claude,
+                "d",
+                "spare",
+                &dir_of("spare"),
+                None,
+                Some(Reason::Threshold),
+            ),
+        ];
+        for line in &lines {
+            append(&path, line).unwrap();
+        }
+        let summary: Vec<_> = recent(&path, 3)
+            .into_iter()
+            .map(|c| (c.from, c.to, c.session))
+            .collect();
+        let some = |s: &str| Some(s.to_owned());
+        assert_eq!(
+            summary,
+            [
+                (some("work"), "side".to_owned(), true),
+                (some("default"), "alt".to_owned(), false),
+                (some("work"), "spare".to_owned(), false),
+            ]
+        );
+        assert!(recent(&dir.path().join("none"), 3).is_empty());
     }
 
     #[test]

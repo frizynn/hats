@@ -6,9 +6,10 @@ use std::time::SystemTime;
 
 use crate::account::Harness;
 use crate::auto::Status;
-use crate::config::{HarnessConfig, Mode, Strategy};
+use crate::config::{HarnessConfig, Mode, Relaunch, Strategy};
 use crate::limits::{LIMIT_HOLD, LimitWindow, Reading, unix_secs};
-use crate::policy;
+use crate::policy::{self, Reason};
+use crate::registry::Change;
 
 /// Marks the account new sessions start with.
 pub const MARK: &str = "●";
@@ -375,6 +376,104 @@ pub fn ago(secs: u64, now: SystemTime) -> String {
     }
 }
 
+/// A change of account in words: `17:52  default → work: default hit its limit`.
+pub fn change(c: &Change, now: SystemTime) -> String {
+    format!("{}  {}", clock(c.at, now), what_changed(c))
+}
+
+/// `default → work: default hit its limit`.
+fn what_changed(c: &Change) -> String {
+    let route = match &c.from {
+        Some(from) => format!("{from} → {}", c.to),
+        None => format!("→ {}", c.to),
+    };
+    let who = c.from.as_deref().unwrap_or("the account");
+    let why = match c.reason {
+        Reason::Manual => "you chose it".to_owned(),
+        Reason::Threshold => format!("{who} passed the threshold"),
+        Reason::Limit => format!("{who} hit its limit"),
+    };
+    let what = if c.session { "a running session, " } else { "" };
+    format!("{what}{route}: {why}")
+}
+
+/// What `hats auto` says: whether and how it switches, where new sessions
+/// start, the last change and that nothing has to stay open.
+pub fn auto_report(
+    harness: Harness,
+    c: &HarnessConfig,
+    current: &str,
+    hooks_installed: bool,
+    last: Option<&Change>,
+    now: SystemTime,
+) -> Vec<String> {
+    let name = match harness {
+        Harness::Claude => "Claude Code",
+        Harness::Codex => "Codex",
+    };
+    let to = match c.strategy {
+        Strategy::Headroom => "the account with the most room",
+        Strategy::Next => "the next account in order with room",
+    };
+    let mut lines = Vec::new();
+    match c.mode {
+        Mode::Auto => {
+            lines.push(format!("{name}: automatic switching is on."));
+            lines.push(match harness {
+                Harness::Claude => format!(
+                    "When the account in use reaches {} % of its 5-hour or weekly limit, new sessions start in {to}{}.",
+                    c.threshold,
+                    if c.relaunch == Relaunch::Idle {
+                        ", and sessions started with `hats run` move there once their turn ends"
+                    } else {
+                        ""
+                    }
+                ),
+                Harness::Codex => format!(
+                    "When the account in use reaches {} % of its 5-hour or weekly limit, new sessions started with `hats run --codex` start in {to}. Running Codex sessions keep their account.",
+                    c.threshold
+                ),
+            });
+        }
+        Mode::Manual => {
+            lines.push(format!("{name}: automatic switching is off."));
+            lines.push(format!(
+                "New sessions stay in '{current}' until you choose another with `hats{} use <label>`. `hats{} auto on` turns it on.",
+                flag(harness),
+                flag(harness)
+            ));
+        }
+    }
+    if c.mode == Mode::Auto {
+        lines.push(format!("New sessions start in '{current}'."));
+    }
+    lines.push(match last {
+        Some(c) => format!("Last change at {}: {}.", clock(c.at, now), what_changed(c)),
+        None => "No change of account yet.".to_owned(),
+    });
+    if c.mode == Mode::Auto {
+        lines.push(match (harness, hooks_installed) {
+            (Harness::Claude, false) => {
+                "Not active yet: run `hats setup` to install the hooks and the status line that switch.".to_owned()
+            }
+            (Harness::Claude, true) => {
+                "Nothing needs to stay open: Claude Code's hooks and status line switch by themselves. To watch it, leave `hats` open.".to_owned()
+            }
+            (Harness::Codex, _) => {
+                "Nothing needs to stay open: each new session checks when it starts. To watch it, leave `hats` open.".to_owned()
+            }
+        });
+    }
+    lines
+}
+
+fn flag(harness: Harness) -> &'static str {
+    match harness {
+        Harness::Claude => "",
+        Harness::Codex => " --codex",
+    }
+}
+
 /// `text` cut to `width` characters, with `…` when cut.
 pub fn fit(text: &str, width: usize) -> String {
     if text.chars().count() <= width {
@@ -386,7 +485,7 @@ pub fn fit(text: &str, width: usize) -> String {
 }
 
 /// Words of `text` in lines of at most `width` characters.
-fn wrap(text: &str, width: usize) -> impl Iterator<Item = String> {
+pub fn wrap(text: &str, width: usize) -> impl Iterator<Item = String> {
     let mut lines: Vec<String> = Vec::new();
     for word in text.split(' ') {
         match lines.last_mut() {

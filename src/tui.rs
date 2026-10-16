@@ -18,8 +18,12 @@ use ratatui::{Frame, Terminal};
 use crate::account::{DEFAULT_LABEL, Harness};
 use crate::auto::{self, Status};
 use crate::config::{self, Config, Mode, Relaunch, Strategy};
+use crate::registry::{self, Change};
 use crate::store::Store;
 use crate::view;
+
+/// Changes of account shown at the foot.
+const RECENT: usize = 3;
 
 pub fn run(store: &Store) -> Result<(), String> {
     let color = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
@@ -175,6 +179,8 @@ struct App<'a> {
     selected: usize,
     panel: Panel,
     message: Option<Message>,
+    /// The newest changes of account, of both harnesses.
+    changes: Vec<Change>,
     color: bool,
 }
 
@@ -192,6 +198,7 @@ impl<'a> App<'a> {
             selected: 0,
             panel: Panel::List,
             message: None,
+            changes: Vec::new(),
             color,
         };
         app.reload();
@@ -227,6 +234,7 @@ impl<'a> App<'a> {
                 });
             group.current = self.store.current(group.harness).ok().map(|a| a.label);
         }
+        self.changes = registry::recent(&self.store.registry(), 2 * RECENT);
         if let Some(e) = error {
             self.fail(e);
         }
@@ -553,9 +561,11 @@ impl<'a> App<'a> {
         } else {
             0
         };
-        let [list, panel, status, footer] = Layout::vertical([
+        let changes = self.recent_changes(now);
+        let [list, panel, recent, status, footer] = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(panel_height),
+            Constraint::Length(changes.len() as u16),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
@@ -564,8 +574,28 @@ impl<'a> App<'a> {
         if let Panel::Settings(field) = self.panel {
             self.draw_settings(frame, panel, field);
         }
+        frame.render_widget(Paragraph::new(changes), recent);
         self.draw_status(frame, status);
         frame.render_widget(Paragraph::new(self.help()), footer);
+    }
+
+    /// The focused harness's last changes of account, in words, as the
+    /// registry recorded them.
+    fn recent_changes(&self, now: SystemTime) -> Vec<Line<'static>> {
+        let harness = self.harness();
+        let mut lines: Vec<Line> = self
+            .changes
+            .iter()
+            .filter(|c| c.harness == harness)
+            .rev()
+            .take(RECENT)
+            .map(|c| Line::styled(view::change(c, now), self.dim()))
+            .collect();
+        lines.reverse();
+        if lines.is_empty() {
+            lines.push(Line::styled("No change of account yet.", self.dim()));
+        }
+        lines
     }
 
     fn draw_list(&self, frame: &mut Frame, area: Rect, now: SystemTime) {
@@ -982,6 +1012,11 @@ mod tests {
             "{screen}"
         );
         assert!(!screen.contains("signed in   "), "no status column");
+        // The foot says what changed, as the registry recorded it.
+        assert!(
+            line_with(&screen, "→ work").ends_with("default → work: you chose it"),
+            "{screen}"
+        );
         assert!(!screen.contains("CODEX"), "no codex accounts:\n{screen}");
         assert!(screen.lines().last().unwrap().contains("q quit"));
 

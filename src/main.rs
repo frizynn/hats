@@ -103,6 +103,14 @@ enum Cmd {
         /// Account label, as `hats list` shows it.
         label: String,
     },
+    /// Say whether accounts switch by themselves, and turn it on or off.
+    ///
+    /// Nothing needs to stay running: Claude Code's hooks and status line do
+    /// the switching. To watch it happen, leave `hats` open.
+    Auto {
+        /// `on` or `off`; without it, only say how it is.
+        state: Option<OnOff>,
+    },
     /// Show or change settings (`hats config` lists them all).
     Config {
         #[command(subcommand)]
@@ -156,6 +164,12 @@ enum ConfigCmd {
     Edit,
     /// Print where config.toml lives.
     Path,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum OnOff {
+    On,
+    Off,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -263,6 +277,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             shell_line(&chosen(&store, harness, label.as_deref())?)
         ),
         Cmd::Remove { label } => remove(&store, find(&store, harness, &label)?)?,
+        Cmd::Auto { state } => auto_command(&store, harness, state)?,
         Cmd::Config { action } => config_command(&store, &config, action)?,
         Cmd::Setup { dry_run, undo } => setup::run(&store, dry_run, undo)?,
         Cmd::Import {
@@ -468,6 +483,41 @@ fn list(store: &Store, json: bool) -> Result<(), Failure> {
         writeln!(out)?;
     } else if !any {
         writeln!(out, "No accounts yet. Add one with `hats add <label>`.")?;
+    }
+    Ok(())
+}
+
+fn auto_command(store: &Store, harness: Harness, state: Option<OnOff>) -> Result<(), Failure> {
+    if let Some(state) = state {
+        let mode = match state {
+            OnOff::On => config::Mode::Auto,
+            OnOff::Off => config::Mode::Manual,
+        };
+        config::set(
+            &store.config,
+            &format!("{}.mode", harness.name()),
+            mode.as_str(),
+        )?;
+    }
+    let config = Config::load(&store.config)?;
+    let current = store.current(harness)?;
+    let last = registry::recent(&store.registry(), usize::MAX)
+        .into_iter()
+        .rfind(|c| c.harness == harness);
+    let now = SystemTime::now();
+    let lines = view::auto_report(
+        harness,
+        config.for_harness(harness),
+        &current.label,
+        setup::installed(store),
+        last.as_ref(),
+        now,
+    );
+    let width = width();
+    for line in &lines {
+        for part in view::wrap(line, width) {
+            println!("{part}");
+        }
     }
     Ok(())
 }

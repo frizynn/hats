@@ -335,3 +335,60 @@ fn codex_new_sessions_move_using_rollout_limits() {
         (Some("codex"), Some("alt"), Some("threshold"))
     );
 }
+
+#[test]
+fn auto_says_what_it_does_and_turns_it_on_and_off() {
+    let sb = three_accounts();
+    // Wide, so each sentence stays on one line.
+    let auto = |args: &[&str]| {
+        let out = sb.cmd(args).env("COLUMNS", "1000").output().unwrap();
+        common::assert_success(&out, args);
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let out = auto(&["auto"]);
+    for line in [
+        "Claude Code: automatic switching is on.",
+        "When the account in use reaches 90 % of its 5-hour or weekly limit, new sessions start in the account with the most room, and sessions started with `hats run` move there once their turn ends.",
+        "New sessions start in 'work'.",
+        ": default → work: you chose it.",
+        "Not active yet: run `hats setup` to install the hooks and the status line that switch.",
+    ] {
+        assert!(out.contains(line), "{line:?} in\n{out}");
+    }
+
+    // Once setup installed the hooks and the status line, nothing else is needed.
+    std::fs::write(
+        sb.home.join(".claude/settings.json"),
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"'/bin/hats' hook stop"}]}]},"statusLine":{"type":"command","command":"'/bin/hats' statusline"}}"#,
+    )
+    .unwrap();
+    sb.repaint("spare", 5.0, 5.0);
+    sb.repaint("work", 95.0, 0.0);
+    let out = auto(&["auto"]);
+    assert!(
+        out.contains(": work → spare: work passed the threshold."),
+        "{out}"
+    );
+    assert!(out.contains("Nothing needs to stay open"), "{out}");
+    assert!(!out.contains("hats setup"), "{out}");
+
+    let out = auto(&["auto", "off"]);
+    assert!(
+        out.starts_with("Claude Code: automatic switching is off."),
+        "{out}"
+    );
+    assert!(out.contains("`hats auto on` turns it on."), "{out}");
+    assert_eq!(sb.ok(&["config", "get", "claude.mode"]).trim(), "manual");
+    assert!(auto(&["auto", "on"]).starts_with("Claude Code: automatic switching is on."));
+    assert_eq!(sb.ok(&["config", "get", "claude.mode"]).trim(), "auto");
+
+    // Codex has its own switch.
+    let out = auto(&["--codex", "auto", "off"]);
+    assert!(
+        out.starts_with("Codex: automatic switching is off."),
+        "{out}"
+    );
+    assert!(out.contains("No change of account yet."), "{out}");
+    assert_eq!(sb.ok(&["config", "get", "codex.mode"]).trim(), "manual");
+    assert_eq!(sb.ok(&["config", "get", "claude.mode"]).trim(), "auto");
+}
