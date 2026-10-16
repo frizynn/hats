@@ -392,3 +392,24 @@ fn auto_says_what_it_does_and_turns_it_on_and_off() {
     assert_eq!(sb.ok(&["config", "get", "codex.mode"]).trim(), "manual");
     assert_eq!(sb.ok(&["config", "get", "claude.mode"]).trim(), "auto");
 }
+
+#[test]
+fn a_learned_limit_that_expired_is_not_data() {
+    let sb = three_accounts();
+    sb.repaint("spare", 50.0, 50.0);
+    // `side` hit its limit five hours ago and has reported nothing since.
+    assert!(rate_limited(&sb, "side").wait().unwrap().success());
+    let path = sb.home.join(".local/state/hats/limits.json");
+    let mut limits: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    for entry in limits["accounts"].as_array_mut().unwrap() {
+        if let Some(until) = entry.get("limitedUntil").and_then(|u| u.as_i64()) {
+            entry["limitedUntil"] = (until - 5 * 3600 - 1).into();
+        }
+    }
+    std::fs::write(&path, limits.to_string()).unwrap();
+    assert_eq!(listed(&sb, "side")["usedPercent"], serde_json::Value::Null);
+    // `spare` has numbers and room: it goes first.
+    sb.repaint("work", 95.0, 0.0);
+    assert_eq!(sb.current(), "spare");
+}
