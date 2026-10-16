@@ -8,7 +8,6 @@ mod common;
 use std::fs;
 use std::io::Read;
 use std::os::fd::FromRawFd;
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -64,17 +63,14 @@ fn two_accounts() -> Sandbox {
     sb
 }
 
-/// Puts `fake` on PATH as `claude`. Written only when it changes: on Linux,
-/// a file another thread is writing cannot be executed (ETXTBSY), and a
-/// fork in a parallel test briefly holds every descriptor open.
+/// Puts `fake` on PATH as `claude`, unless a session may be running it.
 fn install_fake(sb: &Sandbox, fake: &str) -> std::path::PathBuf {
     let bin = sb.home.join("fake-bin");
     if fs::read_to_string(bin.join("claude")).is_ok_and(|old| old == fake) {
         return bin;
     }
     fs::create_dir_all(&bin).unwrap();
-    fs::write(bin.join("claude"), fake).unwrap();
-    fs::set_permissions(bin.join("claude"), fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_program(&bin.join("claude"), fake);
     bin
 }
 

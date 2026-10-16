@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -42,9 +43,7 @@ impl Sandbox {
         fs::create_dir_all(home.join(".claude")).unwrap();
         fs::create_dir_all(&bin).unwrap();
         for (name, script) in [("claude", FAKE_CLAUDE), ("codex", FAKE_CODEX)] {
-            let path = bin.join(name);
-            fs::write(&path, script).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            write_program(&bin.join(name), script);
         }
         Self {
             _root: root,
@@ -166,4 +165,24 @@ impl Sandbox {
             .map(|a| a["label"].as_str().unwrap().to_owned())
             .unwrap()
     }
+}
+
+/// Writes an executable script from a short-lived child process. Tests run
+/// in parallel threads, and on Linux a file cannot be executed while any
+/// process holds it open for writing (ETXTBSY): a fork in another thread
+/// would briefly inherit the test's descriptor.
+pub fn write_program(path: &Path, script: &str) {
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    assert!(child.wait().unwrap().success());
 }

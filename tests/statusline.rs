@@ -99,13 +99,10 @@ fn chains_the_users_command_with_the_same_input() {
     let sb = Sandbox::new();
     logged_in(&sb, "work");
     let script = sb.home.join("mine.sh");
-    fs::write(
+    common::write_program(
         &script,
         "#!/bin/sh\nprintf 'mine:'; wc -c | tr -d ' '\nexit 3\n",
-    )
-    .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let out = statusline(&sb, Some("work"), &["--", script.to_str().unwrap()], INPUT);
     assert_eq!(out.status.code(), Some(3));
