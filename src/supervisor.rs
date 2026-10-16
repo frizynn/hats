@@ -17,7 +17,8 @@
 //!
 //! Measured on Claude Code 2.1.301: SIGTERM exits in about 0.26 s and resets
 //! the terminal modes Claude Code set (bracketed paste, focus, mouse, kitty
-//! keyboard), so the parent does not restore anything itself.
+//! keyboard). The parent restores the terminal only when the agent dies of a
+//! signal it could not handle.
 
 use std::ffi::OsString;
 use std::fs;
@@ -332,6 +333,8 @@ enum ChildState {
     Running,
     Stopped,
     Exited(i32),
+    /// Ended by a signal it did not handle, so it could not reset the terminal.
+    Killed(i32),
 }
 
 fn reap(child: &Child) -> ChildState {
@@ -352,7 +355,7 @@ fn reap(child: &Child) -> ChildState {
     } else if libc::WIFEXITED(status) {
         ChildState::Exited(libc::WEXITSTATUS(status))
     } else if libc::WIFSIGNALED(status) {
-        ChildState::Exited(128 + libc::WTERMSIG(status))
+        ChildState::Killed(libc::WTERMSIG(status))
     } else {
         ChildState::Running
     }
@@ -364,7 +367,6 @@ struct Move {
     reason: Reason,
     session: String,
     term_sent: bool,
-    killed: bool,
 }
 
 /// Runs Claude Code for `account` and moves it between accounts until it
@@ -376,8 +378,7 @@ pub fn supervise(
     mut args: Vec<OsString>,
 ) -> Result<i32, String> {
     let me = std::process::id();
-    let dir = run_dir(store, me);
-    create_private_dir(&dir).map_err(|e| e.to_string())?;
+    let dir = fresh_run_dir(store, me).map_err(|e| e.to_string())?;
     let _cleanup = RemoveOnDrop(dir.clone());
 
     // Ctrl+C and Ctrl+\ belong to the agent; blocked here, they stay pending
@@ -400,6 +401,7 @@ pub fn supervise(
     unsafe { libc::signal(libc::SIGCHLD, noop as *const () as libc::sighandler_t) };
 
     let terminal = Terminal::save();
+    let _sentinel = Sentinel::spawn();
 
     loop {
         let mut cmd = Command::new(account.harness.program());
@@ -425,6 +427,10 @@ pub fn supervise(
             match waited.wait() {
                 libc::SIGCHLD => match reap(&child) {
                     ChildState::Exited(code) => break code,
+                    ChildState::Killed(signal) => {
+                        terminal.restore();
+                        break 128 + signal;
+                    }
                     // The agent suspended itself (Ctrl+Z in raw mode): stop
                     // too, so the shell gets the terminal back. `fg` continues
                     // the whole process group.
@@ -448,7 +454,6 @@ pub fn supervise(
                     if m.term_sent {
                         // SAFETY: our own child.
                         unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGKILL) };
-                        m.killed = true;
                     } else if !dir.join("idle").exists() {
                         // A prompt arrived during the grace period: try again
                         // at the next idle point.
@@ -463,12 +468,13 @@ pub fn supervise(
                         }
                     }
                 }
-                // The terminal closed or someone asked us to stop: pass it on
-                // and leave when the agent does.
-                sig => unsafe {
+                // The terminal closed or someone asked us to stop: pass it on,
+                // drop any move and leave when the agent does.
+                sig => {
+                    moving = None;
                     // SAFETY: our own child.
-                    libc::kill(child.id() as libc::pid_t, sig);
-                },
+                    unsafe { libc::kill(child.id() as libc::pid_t, sig) };
+                }
             }
         };
         // SAFETY: cancels a pending alarm.
@@ -486,9 +492,6 @@ pub fn supervise(
                     Some(m.reason),
                 );
                 registry::append(&store.registry(), &line).map_err(|e| e.to_string())?;
-                if m.killed {
-                    terminal.restore();
-                }
                 args = relaunch_args(&args, &m.session).expect("checked before supervising");
                 account = m.to;
                 let _ = fs::remove_file(dir.join("idle"));
@@ -512,7 +515,6 @@ fn plan_move(store: &Store, config: &HarnessConfig, account: &Account, dir: &Pat
         reason,
         session: request.session,
         term_sent: false,
-        killed: false,
     })
 }
 
@@ -539,6 +541,59 @@ impl Terminal {
         let reset =
             b"\x1b[?2004l\x1b[?1004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[<u\x1b[?25h";
         let _ = io::Write::write_all(&mut io::stdout(), reset);
+    }
+}
+
+/// This parent's run directory, emptied of what a parent with the same pid
+/// may have left behind if it was killed: a stale `move.json` would resume
+/// the wrong session.
+fn fresh_run_dir(store: &Store, pid: u32) -> io::Result<PathBuf> {
+    let dir = run_dir(store, pid);
+    match fs::remove_dir_all(&dir) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    create_private_dir(&dir)?;
+    Ok(dir)
+}
+
+/// A stopped child in the agent's process group, so the agent never outlives
+/// this parent. If the parent is killed outright (SIGKILL), the group loses
+/// its link to the shell with a stopped member in it, and the kernel sends
+/// the whole group SIGHUP then SIGCONT (POSIX orphaned process groups): the
+/// agent ends as it does when the terminal closes, and so does the sentinel.
+/// Otherwise an orphaned agent keeps running in the background, cannot read
+/// the terminal and still writes to it (measured with Claude Code 2.1.301).
+struct Sentinel(libc::pid_t);
+
+impl Sentinel {
+    fn spawn() -> Option<Self> {
+        // SAFETY: this process has one thread; the child only makes
+        // async-signal-safe calls and never returns from the loop.
+        match unsafe { libc::fork() } {
+            -1 => None,
+            0 => unsafe {
+                // SAFETY: as above; SIGHUP must reach it, so nothing stays blocked.
+                let mut empty = MaybeUninit::<libc::sigset_t>::uninit();
+                libc::sigemptyset(empty.as_mut_ptr());
+                libc::pthread_sigmask(libc::SIG_SETMASK, empty.as_ptr(), std::ptr::null_mut());
+                // `fg` continues the whole group; stop again.
+                loop {
+                    libc::raise(libc::SIGSTOP);
+                }
+            },
+            pid => Some(Self(pid)),
+        }
+    }
+}
+
+impl Drop for Sentinel {
+    fn drop(&mut self) {
+        // SAFETY: our own child, reaped so it does not linger as a zombie.
+        unsafe {
+            libc::kill(self.0, libc::SIGKILL);
+            libc::waitpid(self.0, std::ptr::null_mut(), 0);
+        }
     }
 }
 
@@ -610,6 +665,23 @@ mod tests {
             relaunch(&["--model", "x", "fix the bug"]).unwrap(),
             ["--model", "x", "--resume", "S"]
         );
+    }
+
+    #[test]
+    fn a_run_directory_starts_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::from_env(|k| (k == "HOME").then(|| tmp.path().into())).unwrap();
+        let stale = run_dir(&store, 42);
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("idle"), b"").unwrap();
+        fs::write(
+            stale.join("move.json"),
+            br#"{"session":"old","reason":"limit"}"#,
+        )
+        .unwrap();
+
+        let dir = fresh_run_dir(&store, 42).unwrap();
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
     }
 
     #[test]
