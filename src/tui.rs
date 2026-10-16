@@ -567,11 +567,11 @@ impl<'a> App<'a> {
                 } else {
                     secs.div_ceil(3600)
                 };
-                let next = hours.saturating_add_signed(i64::from(by));
-                if next * 3600 == secs {
+                let next = hours.saturating_add_signed(i64::from(by)) * 3600;
+                if next == secs {
                     return Step::Idle;
                 }
-                next.to_string()
+                config::show_close_idle((next > 0).then(|| Duration::from_secs(next)))
             }
             Field::Order => return Step::Idle,
         };
