@@ -229,6 +229,73 @@ fn remove_signs_out_and_keeps_shared_data() {
 }
 
 #[test]
+fn remove_never_follows_a_symlink() {
+    use std::os::unix::fs::symlink;
+    let sb = Sandbox::new();
+    let claude = sb.home.join(".claude");
+    fs::write(claude.join("history.jsonl"), "{\"display\":\"x\"}\n").unwrap();
+    fs::create_dir_all(claude.join("projects/repo")).unwrap();
+    fs::write(claude.join("projects/repo/s.jsonl"), "{}\n").unwrap();
+    fs::create_dir_all(claude.join("skills/demo")).unwrap();
+    fs::write(claude.join("skills/demo/SKILL.md"), "# demo\n").unwrap();
+    fs::write(sb.home.join("keep.txt"), "home\n").unwrap();
+    let outside = sb.home.join("outside");
+    fs::create_dir_all(outside.join("acct")).unwrap();
+    fs::write(outside.join("acct/keep.txt"), "outside\n").unwrap();
+    fs::write(outside.join("file.txt"), "file\n").unwrap();
+
+    sb.ok(&["add", "work"]);
+    sb.ok(&["login", "work"]);
+    let dir = sb.claude_dir("work");
+    symlink(&sb.home, dir.join("home")).unwrap();
+    symlink(outside.join("acct"), dir.join("dir")).unwrap();
+    symlink(outside.join("file.txt"), dir.join("file")).unwrap();
+    symlink(sb.home.join("missing"), dir.join("broken")).unwrap();
+    fs::create_dir_all(dir.join("cache/nested")).unwrap();
+    symlink(&sb.home, dir.join("cache/nested/home")).unwrap();
+
+    sb.ok(&["remove", "work"]);
+    assert!(fs::symlink_metadata(&dir).is_err());
+
+    // An account directory that is itself a symlink: only the link goes.
+    let linked = sb.data().join("claude/linked");
+    symlink(outside.join("acct"), &linked).unwrap();
+    sb.ok(&["remove", "linked"]);
+    assert!(fs::symlink_metadata(&linked).is_err());
+
+    for bad in [
+        "..",
+        ".",
+        "/",
+        "",
+        "../claude",
+        "café",
+        "a/../..",
+        "default",
+    ] {
+        let out = sb.cmd(&["remove", bad]).output().unwrap();
+        assert!(!out.status.success(), "remove {bad:?}");
+    }
+
+    for (path, text) in [
+        (claude.join("history.jsonl"), "{\"display\":\"x\"}\n"),
+        (claude.join("projects/repo/s.jsonl"), "{}\n"),
+        (claude.join("skills/demo/SKILL.md"), "# demo\n"),
+        (sb.home.join("keep.txt"), "home\n"),
+        (outside.join("acct/keep.txt"), "outside\n"),
+        (outside.join("file.txt"), "file\n"),
+    ] {
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            text,
+            "{}",
+            path.display()
+        );
+    }
+    assert!(sb.data().join("claude").is_dir());
+}
+
+#[test]
 fn hook_attributes_the_session_to_the_running_account() {
     let sb = Sandbox::new();
     sb.ok(&["add", "work"]);
