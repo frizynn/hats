@@ -16,7 +16,7 @@
 //!   `MOVE_WINDOW_MS` of that time, so a turn is never cut, a prompt being
 //!   typed later is never lost, and without the hooks a session is never
 //!   moved. A move asked for later waits for the next turn to end.
-//! - `turn.json`: the same turn end with the session and its transcript,
+//! - `turn`: the same turn end with the session and its transcript,
 //!   written and removed with `idle`, but kept across a move. The session is
 //!   unused from the later of that time and the transcript's last write (a
 //!   background task can wake the agent without `UserPromptSubmit`); while
@@ -30,11 +30,12 @@
 //! keyboard). The parent restores the terminal only when the agent dies of a
 //! signal it could not handle.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::FromRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -91,9 +92,9 @@ fn wake(pid: u32) {
 }
 
 /// Replaces `name` in `dir` at once, so the parent never reads half of it.
-fn write_file(dir: &Path, name: &str, value: &impl Serialize) -> io::Result<()> {
+fn write_file(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     let tmp = dir.join(format!("{name}.tmp"));
-    fs::write(&tmp, serde_json::to_vec(value).expect("plain struct"))?;
+    fs::write(&tmp, bytes)?;
     fs::rename(tmp, dir.join(name))
 }
 
@@ -102,7 +103,11 @@ fn write_request(dir: &Path, session: &str, reason: Reason) -> io::Result<()> {
         session: session.to_owned(),
         reason,
     };
-    write_file(dir, "move.json", &request)
+    write_file(
+        dir,
+        "move.json",
+        &serde_json::to_vec(&request).expect("plain struct"),
+    )
 }
 
 /// Whether running sessions move to another account.
@@ -134,12 +139,11 @@ pub fn request_move(
     Ok(())
 }
 
-/// The turn that ended last, as `turn.json` holds it.
-#[derive(Serialize, Deserialize)]
+/// The turn that ended last. The file `turn` holds it as three lines: the
+/// time it ended in Unix milliseconds, the session, the transcript.
 pub struct Turn {
     session: String,
     transcript: Option<PathBuf>,
-    /// Unix milliseconds.
     ended: u64,
 }
 
@@ -151,6 +155,30 @@ impl Turn {
             ended: unix_millis(ended),
         }
     }
+
+    fn write(&self, dir: &Path) -> io::Result<()> {
+        let mut bytes = format!("{}\n{}\n", self.ended, self.session).into_bytes();
+        if let Some(t) = &self.transcript {
+            bytes.extend_from_slice(t.as_os_str().as_bytes());
+        }
+        write_file(dir, "turn", &bytes)
+    }
+
+    fn read(dir: &Path) -> Option<Self> {
+        let bytes = fs::read(dir.join("turn")).ok()?;
+        let mut lines = bytes.splitn(3, |b| *b == b'\n');
+        let ended = std::str::from_utf8(lines.next()?).ok()?.parse().ok()?;
+        let session = String::from_utf8(lines.next()?.to_vec()).ok()?;
+        let transcript = lines
+            .next()
+            .filter(|t| !t.is_empty())
+            .map(|t| PathBuf::from(OsStr::from_bytes(t)));
+        Some(Self {
+            session,
+            transcript,
+            ended,
+        })
+    }
 }
 
 /// `UserPromptSubmit` hook: the agent is working.
@@ -158,13 +186,13 @@ pub fn mark_busy(store: &Store) -> io::Result<()> {
     let Some((_, dir)) = parent_dir(store) else {
         return Ok(());
     };
-    // `turn.json` first: the clock for closing stops before anything else.
+    // `turn` first: the clock for closing stops before anything else.
     // Both go even if one fails: either one left could end the agent.
     let gone = |name| match fs::remove_file(dir.join(name)) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),
     };
-    let turn = gone("turn.json");
+    let turn = gone("turn");
     gone("idle").and(turn)
 }
 
@@ -174,8 +202,8 @@ pub fn mark_idle(store: &Store, turn: &Turn, rate_limited: bool) -> io::Result<(
     let Some((pid, dir)) = parent_dir(store) else {
         return Ok(());
     };
-    write_file(&dir, "turn.json", turn)?;
-    // A parent from before `turn.json` reads only this.
+    turn.write(&dir)?;
+    // A parent from before `turn` reads only this.
     fs::write(dir.join("idle"), turn.ended.to_string())?;
     if rate_limited {
         write_request(&dir, &turn.session, Reason::Limit)?;
@@ -604,7 +632,7 @@ fn terminate(child: &Child, ending: &mut Ending) {
 /// `after` from its last use, the later of its last turn's end and its
 /// transcript's last write. Zero when it is due.
 fn time_to_close(dir: &Path, after: Duration, now: SystemTime) -> Option<(Duration, String)> {
-    let turn: Turn = serde_json::from_slice(&fs::read(dir.join("turn.json")).ok()?).ok()?;
+    let turn = Turn::read(dir)?;
     let ended = UNIX_EPOCH + Duration::from_millis(turn.ended);
     let written = turn
         .transcript
@@ -927,10 +955,10 @@ mod tests {
         let transcript = dir.path().join("s.jsonl");
         fs::write(&transcript, b"").unwrap();
         let hour = Duration::from_secs(3600);
-        // Whole milliseconds, as `turn.json` keeps them.
+        // Whole milliseconds, as `turn` keeps them.
         let now = UNIX_EPOCH + Duration::from_millis(unix_millis(SystemTime::now()));
         let turn = Turn::new("s".into(), Some(transcript.clone()), now - 3 * hour);
-        write_file(dir.path(), "turn.json", &turn).unwrap();
+        turn.write(dir.path()).unwrap();
         let left = |after: Duration| time_to_close(dir.path(), after, now).map(|(l, _)| l);
 
         let file = fs::File::options().write(true).open(&transcript).unwrap();
@@ -946,7 +974,7 @@ mod tests {
         fs::remove_file(&transcript).unwrap();
         assert_eq!(left(4 * hour), Some(hour), "no transcript: the turn's end");
 
-        fs::remove_file(dir.path().join("turn.json")).unwrap();
+        fs::remove_file(dir.path().join("turn")).unwrap();
         assert_eq!(left(hour), None, "busy");
     }
 
