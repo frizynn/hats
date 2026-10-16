@@ -544,11 +544,7 @@ fn config_command(
         ConfigCmd::List { json: false } => {
             for (key, value) in config.entries() {
                 let short = key.split_once('.').map_or(key.as_str(), |(_, k)| k);
-                let help = config::KEYS
-                    .iter()
-                    .find(|(k, _)| *k == short)
-                    .map_or("", |(_, h)| h);
-                println!("{key:<17} {value:<10} {help}");
+                println!("{key:<17} {value:<10} {}", config::help(short));
             }
             println!(
                 "\nChange one with `hats config set <key> <value>`; file: {}",

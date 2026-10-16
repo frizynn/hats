@@ -7,6 +7,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::str::FromStr;
+use std::time::Duration;
 
 use toml_edit::{Array, DocumentMut, Item, Value, value};
 
@@ -59,13 +60,28 @@ impl Default for HarnessConfig {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
     pub claude: HarnessConfig,
     pub codex: HarnessConfig,
+    /// `claude.close_idle`: how long a `hats run` session may go without use
+    /// before it is closed; `None` never. Claude Code only: a Codex session
+    /// has no hats parent to close it.
+    pub close_idle: Option<Duration>,
 }
 
-/// What `hats config` shows and accepts, with one line of help each.
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            claude: HarnessConfig::default(),
+            codex: HarnessConfig::default(),
+            close_idle: Some(Duration::from_secs(32 * 3600)),
+        }
+    }
+}
+
+/// What `hats config` shows and accepts for both harnesses, with one line of
+/// help each.
 pub const KEYS: &[(&str, &str)] = &[
     (
         "mode",
@@ -89,6 +105,29 @@ pub const KEYS: &[(&str, &str)] = &[
     ),
 ];
 
+/// Keys only Claude Code has: they act through the `hats run` parent.
+const CLAUDE_KEYS: &[(&str, &str)] = &[(
+    "close_idle",
+    "close a `hats run` session unused for this long (32h, 90m, 30s); off: never",
+)];
+
+/// The keys of one harness, with their help.
+pub fn keys(harness: Harness) -> impl Iterator<Item = &'static (&'static str, &'static str)> {
+    let only = match harness {
+        Harness::Claude => CLAUDE_KEYS,
+        Harness::Codex => &[],
+    };
+    KEYS.iter().chain(only)
+}
+
+/// The one line of help for a key, without its harness.
+pub fn help(key: &str) -> &'static str {
+    KEYS.iter()
+        .chain(CLAUDE_KEYS)
+        .find(|(k, _)| *k == key)
+        .map_or("", |(_, h)| h)
+}
+
 pub const TEMPLATE: &str = r#"# hats configuration. Edit it here or with `hats config set <key> <value>`,
 # for example `hats config set claude.threshold 85`. `hats config` lists every key.
 
@@ -107,6 +146,10 @@ order = []
 # Running `hats run` sessions: idle = relaunch them on the new account when the
 # agent is idle, resuming the same conversation; off = leave them where they are.
 relaunch = "idle"
+# Close a `hats run` session after this long without use: the clock starts when
+# a turn ends and restarts with a new prompt or turn. 32 or "32h" hours, "90m"
+# minutes, "30s" seconds; 0 or "off" never. It prints how to resume it.
+close_idle = "32h"
 
 [codex]
 mode = "auto"
@@ -131,12 +174,11 @@ impl Config {
             let Some(table) = doc.get(harness.name()) else {
                 continue;
             };
-            let section = config.for_harness_mut(harness);
-            for (key, _) in KEYS {
+            for (key, _) in keys(harness) {
                 if let Some(item) = table.get(key) {
                     let full = format!("{}.{key}", harness.name());
-                    section
-                        .apply(key, item)
+                    config
+                        .apply(harness, key, item)
                         .map_err(|e| format!("{}: {full}: {e}", path.display()))?;
                 }
             }
@@ -162,17 +204,34 @@ impl Config {
     pub fn entries(&self) -> Vec<(String, String)> {
         Harness::ALL
             .iter()
-            .flat_map(|h| {
-                let c = self.for_harness(*h);
-                KEYS.iter()
-                    .map(move |(key, _)| (format!("{}.{key}", h.name()), c.get(key)))
+            .flat_map(|&h| {
+                keys(h).map(move |(key, _)| (format!("{}.{key}", h.name()), self.value(h, key)))
             })
             .collect()
     }
 
     pub fn get(&self, full_key: &str) -> Result<String, String> {
         let (harness, key) = split_key(full_key)?;
-        Ok(self.for_harness(harness).get(key))
+        Ok(self.value(harness, key))
+    }
+
+    fn value(&self, harness: Harness, key: &str) -> String {
+        match key {
+            "close_idle" => show_close_idle(self.close_idle),
+            _ => self.for_harness(harness).get(key),
+        }
+    }
+
+    fn apply(&mut self, harness: Harness, key: &str, item: &Item) -> Result<(), String> {
+        if key != "close_idle" {
+            return self.for_harness_mut(harness).apply(key, item);
+        }
+        self.close_idle = match (item.as_integer(), item.as_str()) {
+            (Some(hours), _) => parse_close_idle(&hours.to_string())?,
+            (_, Some(text)) => parse_close_idle(text)?,
+            _ => return Err(r#"expected hours like 32, or a text like "90m""#.to_owned()),
+        };
+        Ok(())
     }
 }
 
@@ -230,6 +289,7 @@ pub fn set(path: &Path, full_key: &str, raw: &str) -> Result<(), String> {
         "strategy" => value(raw.parse::<Strategy>()?.as_str()),
         "relaunch" => value(raw.parse::<Relaunch>()?.as_str()),
         "threshold" => value(i64::from(parse_threshold(raw)?)),
+        "close_idle" => value(show_close_idle(parse_close_idle(raw)?)),
         "order" => {
             let labels = raw.split(',').map(str::trim).filter(|s| !s.is_empty());
             let mut array = Array::new();
@@ -296,12 +356,50 @@ fn split_key(full_key: &str) -> Result<(Harness, &str), String> {
         .into_iter()
         .find(|h| h.name() == section)
         .ok_or_else(unknown)?;
-    let key = KEYS
-        .iter()
+    if harness == Harness::Codex && CLAUDE_KEYS.iter().any(|(k, _)| *k == key) {
+        return Err(format!(
+            "{key} is Claude Code only: a Codex session has no `hats run` parent to close it"
+        ));
+    }
+    let key = keys(harness)
         .map(|(k, _)| *k)
         .find(|k| *k == key)
         .ok_or_else(unknown)?;
     Ok((harness, key))
+}
+
+/// `32` or `32h` hours, `90m` minutes, `30s` seconds; `0` or `off` never.
+fn parse_close_idle(raw: &str) -> Result<Option<Duration>, String> {
+    let raw = raw.trim();
+    if raw == "off" {
+        return Ok(None);
+    }
+    let (number, unit) = match raw.as_bytes().last() {
+        Some(b'h') => (&raw[..raw.len() - 1], 3600),
+        Some(b'm') => (&raw[..raw.len() - 1], 60),
+        Some(b's') => (&raw[..raw.len() - 1], 1),
+        _ => (raw, 3600),
+    };
+    let secs = number
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(unit))
+        .ok_or_else(|| {
+            format!("close_idle must be whole hours like 32, or 90m, 30s, or off; got '{raw}'")
+        })?;
+    Ok((secs > 0).then(|| Duration::from_secs(secs)))
+}
+
+/// The largest unit that keeps it whole: `32h`, `90m`, `30s`, or `off`.
+pub fn show_close_idle(close_idle: Option<Duration>) -> String {
+    let Some(after) = close_idle else {
+        return "off".to_owned();
+    };
+    match after.as_secs() {
+        s if s % 3600 == 0 => format!("{}h", s / 3600),
+        s if s % 60 == 0 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
 }
 
 fn parse_threshold(raw: &str) -> Result<u8, String> {
