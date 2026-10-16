@@ -376,6 +376,17 @@ mod tests {
     }
 
     #[test]
+    fn the_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hats/config.toml");
+        set(&path, "claude.threshold", "85").unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+    }
+
+    #[test]
     fn load_names_the_bad_key() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
