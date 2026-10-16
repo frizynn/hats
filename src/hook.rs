@@ -9,7 +9,7 @@
 
 use std::ffi::OsString;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use serde::Deserialize;
@@ -34,6 +34,8 @@ struct HookInput {
     hook_event_name: Option<String>,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    transcript_path: Option<PathBuf>,
 }
 
 fn read_input(stdin: impl Read) -> Result<HookInput, String> {
@@ -107,5 +109,6 @@ pub fn stop(
             Some(&account.label),
         )?;
     }
-    supervisor::mark_idle(store, &input.session_id, rate_limited, now).map_err(|e| e.to_string())
+    let turn = supervisor::Turn::new(input.session_id, input.transcript_path, now);
+    supervisor::mark_idle(store, &turn, rate_limited).map_err(|e| e.to_string())
 }

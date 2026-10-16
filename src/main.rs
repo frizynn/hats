@@ -83,9 +83,10 @@ enum Cmd {
     },
     /// Start the harness with an account (default: the current one).
     ///
-    /// In auto mode, an interactive Claude Code session stays under a small
-    /// hats parent that moves it to the next account when it passes the
-    /// threshold, once the agent is idle.
+    /// An interactive Claude Code session stays under a small hats parent
+    /// that, in auto mode, moves it to the next account when it passes the
+    /// threshold, once the agent is idle, and closes it when unused for
+    /// `claude.close_idle` (32h by default).
     Run {
         /// Account label, as `hats list` shows it (default: the current one).
         label: Option<String>,
@@ -377,8 +378,8 @@ fn launch(
     let account = chosen(store, harness, label)?;
     // Picks up shared files the user created since the account was added.
     account.create(store)?;
-    if supervisor::should_supervise(&account, settings, &args) {
-        let code = supervisor::supervise(store, settings, account, args)?;
+    if supervisor::should_supervise(&account, config, &args) {
+        let code = supervisor::supervise(store, config, account, args)?;
         return Err(Failure::Exit(code.clamp(0, 255) as u8));
     }
     let mut cmd = Command::new(harness.program());

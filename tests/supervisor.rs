@@ -574,3 +574,23 @@ echo "turn ended""#,
         assert!(!moved, "{key}: {:?}", sb.registry_lines());
     }
 }
+
+#[test]
+fn a_moved_session_left_idle_closes_too() {
+    let sb = two_accounts();
+    close_idle(&sb, "3s");
+    // The resumed agent waits like the first one; the clock goes on from the
+    // turn that ended before the move.
+    let fake = FAKE.replace(
+        "echo resumed >> \"$FAKE_LOG\"; exit 0 ;;",
+        "echo resumed >> \"$FAKE_LOG\"; trap 'echo term >> \"$FAKE_LOG\"; exit 143' TERM; while :; do sleep 0.05; done ;;",
+    );
+    let run = run_in_pty(&sb, &fake, |_| {});
+    assert!(run.log.ends_with("resumed\nterm\n"), "{}", run.log);
+    assert!(
+        run.output.contains("claude --resume s-1"),
+        "{:?}",
+        run.output
+    );
+    assert!(run.elapsed < Duration::from_secs(6), "{:?}", run.elapsed);
+}
