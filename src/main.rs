@@ -168,6 +168,8 @@ fn run(argv: Vec<OsString>) -> Result<(), Failure> {
         }
         "run" => {
             let account = chosen(label(false)?)?;
+            // Picks up shared files the user created since the account was added.
+            account.create(&store)?;
             return Err(exec_harness(&account, &[], &args.passthrough).into());
         }
         "env" => println!("{}", shell_line(&chosen(label(false)?)?)),
