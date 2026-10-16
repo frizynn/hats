@@ -156,6 +156,36 @@ fn a_rate_limit_error_moves_the_default_without_limit_data() {
     assert_eq!(reasons(&sb).last().unwrap().1, "limit");
 }
 
+/// Ends a turn of `label`'s session with a rate limit error, as Claude Code's
+/// `StopFailure` hook does.
+fn rate_limited(sb: &Sandbox, label: &str) -> std::process::Child {
+    let mut child = sb
+        .cmd(&["hook", "stop"])
+        .env("CLAUDE_CONFIG_DIR", sb.claude_dir(label))
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let input = format!(
+        r#"{{"session_id":"s-{label}","hook_event_name":"StopFailure","error":"rate_limit"}}"#
+    );
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child
+}
+
+#[test]
+fn an_account_never_seen_comes_after_one_with_room() {
+    let sb = three_accounts();
+    // `side` was never seen: it may be the spent one.
+    sb.repaint("spare", 30.0, 30.0);
+    assert!(rate_limited(&sb, "work").wait().unwrap().success());
+    assert_eq!(sb.current(), "spare");
+}
+
 #[test]
 fn another_accounts_session_does_not_move_the_default() {
     let sb = three_accounts();

@@ -142,10 +142,36 @@ mod tests {
             c("d", true, None),
         ];
         let cfg = config(Strategy::Next, &["c", "b", "d", "a"]);
-        // From b: c is over the margin (81 > 80), so d, which was never seen.
-        assert_eq!(pick("b", &accounts, &cfg), Some("d"));
-        // From a, wrapping around to the start of the order.
+        // From b: c is over the margin (81 > 80) and d was never seen, so a,
+        // wrapping around to the start of the order.
+        assert_eq!(pick("b", &accounts, &cfg), Some("a"));
+        // From a, nobody else with data has room: d, which was never seen.
         assert_eq!(pick("a", &accounts, &cfg), Some("d"));
+    }
+
+    #[test]
+    fn an_account_never_seen_only_when_none_with_data_has_room() {
+        // An account never seen may be spent: the one with data goes first.
+        let accounts = [
+            c("a", true, Some(97.0)),
+            c("b", true, None),
+            c("c", true, Some(60.0)),
+            c("d", true, None),
+        ];
+        for strategy in [Strategy::Headroom, Strategy::Next] {
+            assert_eq!(pick("a", &accounts, &config(strategy, &[])), Some("c"));
+        }
+        // Nobody with data has room: the first never seen, in the order.
+        let accounts = [
+            c("a", true, Some(97.0)),
+            c("b", true, None),
+            c("c", true, Some(85.0)),
+            c("d", true, None),
+        ];
+        for strategy in [Strategy::Headroom, Strategy::Next] {
+            let cfg = config(strategy, &["a", "d", "b", "c"]);
+            assert_eq!(pick("a", &accounts, &cfg), Some("d"));
+        }
     }
 
     #[test]
