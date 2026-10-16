@@ -159,13 +159,13 @@ pub fn mark_busy(store: &Store) -> io::Result<()> {
         return Ok(());
     };
     // `turn.json` first: the clock for closing stops before anything else.
-    for name in ["turn.json", "idle"] {
-        match fs::remove_file(dir.join(name)) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
-            _ => {}
-        }
-    }
-    Ok(())
+    // Both go even if one fails: either one left could end the agent.
+    let gone = |name| match fs::remove_file(dir.join(name)) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    };
+    let turn = gone("turn.json");
+    gone("idle").and(turn)
 }
 
 /// `Stop` and `StopFailure` hooks: the agent is idle. A rate limit error asks
@@ -621,7 +621,9 @@ fn time_to_close(dir: &Path, after: Duration, now: SystemTime) -> Option<(Durati
 fn schedule_close(dir: &Path, after: Option<Duration>, now: SystemTime) {
     let secs = match after.and_then(|after| time_to_close(dir, after, now)) {
         Some((left, _)) => {
-            let whole = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+            let whole = left
+                .as_secs()
+                .saturating_add(u64::from(left.subsec_nanos() > 0));
             whole.clamp(1, CHECK_SECS) as u32
         }
         None => 0,
@@ -938,6 +940,9 @@ mod tests {
         file.set_modified(now - hour).unwrap();
         assert_eq!(left(2 * hour), Some(hour), "a newer write restarts it");
         assert_eq!(left(Duration::MAX), Some(Duration::MAX), "never due");
+        schedule_close(dir.path(), Some(Duration::MAX), now);
+        // SAFETY: reads and clears the alarm just set.
+        assert_eq!(unsafe { libc::alarm(0) }, CHECK_SECS as u32);
         fs::remove_file(&transcript).unwrap();
         assert_eq!(left(4 * hour), Some(hour), "no transcript: the turn's end");
 
