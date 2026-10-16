@@ -295,7 +295,13 @@ fn setup_from_a_moved_binary_updates_its_entries() {
     setup(&sb, &["setup"]);
     let moved = sb.home.join("bin2/hats");
     fs::create_dir_all(moved.parent().unwrap()).unwrap();
-    fs::copy(env!("CARGO_BIN_EXE_hats"), &moved).unwrap();
+    // Copied by a child process, for the reason in `common::write_program`.
+    let copied = std::process::Command::new("cp")
+        .arg(env!("CARGO_BIN_EXE_hats"))
+        .arg(&moved)
+        .status()
+        .unwrap();
+    assert!(copied.success());
     let run_moved = |args: &[&str]| {
         // The sandbox environment, with the moved copy as the program.
         let cmd = sb.cmd(args);
