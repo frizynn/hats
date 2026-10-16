@@ -104,13 +104,17 @@ parent: one process, about 1 MB, asleep in `sigwait` until something happens,
 plus a forked sentinel asleep on a pipe that ends Claude Code with `SIGHUP` if
 the parent is ever killed outright, so the agent is never left running in the
 background.
-When the session's account passes the threshold or hits the limit, hats waits
-until the agent is idle (the `Stop` hook ran and no prompt came after it),
-waits one more second, ends Claude Code with `SIGTERM` and starts it again in
-the next account with `--resume <session>`, in the same terminal. A prompt
-typed in that second postpones the move to the next idle point, so a turn is
-never cut. Claude Code restores the terminal on `SIGTERM` (measured on
-2.1.301); the conversation continues from its transcript.
+When the session's account passes the threshold or hits the limit, hats moves
+it only right after a turn ends: within 2 seconds of the `Stop` hook, with no
+prompt after it. It waits one more second, ends Claude Code with `SIGTERM` and
+starts it again in the next account with `--resume <session>`, in the same
+terminal. A prompt sent in that second postpones the move to the next turn
+end, so a turn is never cut. The status line also repaints while the session
+sits idle (a permission mode change, the prompt cache expiring); a threshold
+seen then waits for the next turn to end, so a prompt you are typing is never
+lost. On Claude Code 2.1.301 the status line runs 0.31 to 0.34 s after the
+`Stop` hook, well inside the 2 seconds. Claude Code restores the terminal on
+`SIGTERM`; the conversation continues from its transcript.
 
 Limits of the running-session move:
 
@@ -215,17 +219,22 @@ The format is fixed by `tests/registry_format.rs` and
 ## Migrating from claude-swap
 
 ```sh
-hats import claude-swap     # reads ~/.claude-swap-backup/sequence.json and settings.json only
-hats login account-1        # one sign-in per account, with Claude Code's own login
+hats import claude-swap     # order, threshold and strategy; prints the sign-ins left
+hats login account-1        # one sign-in per account it lists, with Claude Code's own login
 ...
 hats setup
 ```
 
-The import creates one account per claude-swap account (its alias, or
-`account-<n>`), keeps claude-swap's order and threshold, and prints which
-accounts to sign in to. claude-swap's stored tokens are not read or copied.
-When every account is signed in, stop `cswap auto` and run `cswap purge` to
-delete them.
+The import creates one account per enabled claude-swap account (its alias, or
+`account-<n>`), keeps claude-swap's order, threshold and strategy, and prints
+which accounts to sign in to. The account claude-swap last switched into is
+already signed in at `~/.claude`: the import recognizes it by its account id
+(`accountUuid` and `organizationUuid`, hashed as in the registry) in
+claude-swap's copy of that account's `.claude.json`, keeps it as `default` in
+its place in the order and creates nothing for it. It reads
+`sequence.json`, `settings.json` and those copies; claude-swap's stored
+tokens are never read or copied. When every account is signed in, stop
+`cswap auto` and run `cswap purge` to delete them.
 
 | | claude-swap 0.26.0 | hats |
 |---|---|---|
