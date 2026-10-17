@@ -405,6 +405,34 @@ fn settings_change_in_place_and_are_saved_at_once() {
 }
 
 #[test]
+fn digits_change_tab_even_on_a_number_and_enter_opens_its_edit() {
+    let (_dir, store) = sandbox();
+    account(&store, "work", None);
+    let mut app = App::new(&store, DARK);
+    for name in ["threshold", "close_idle"] {
+        setting(&mut app, Harness::Claude, name);
+        app.on_key(key(KeyCode::Char('4')));
+        assert_eq!(app.tab, Tab::Activity, "on {name}");
+        assert_eq!(app.settings.edit, None, "on {name}");
+    }
+    assert_eq!(
+        config(&store),
+        Config::default(),
+        "nothing typed into a value"
+    );
+
+    // In the edit that enter opens, digits are the value.
+    setting(&mut app, Harness::Claude, "threshold");
+    app.on_key(key(KeyCode::Enter));
+    app.on_key(key(KeyCode::Backspace));
+    app.on_key(key(KeyCode::Backspace));
+    keys(&mut app, "42");
+    assert_eq!(app.tab, Tab::Settings);
+    app.on_key(key(KeyCode::Enter));
+    assert_eq!(config(&store).claude.threshold, 42);
+}
+
+#[test]
 fn an_invalid_value_is_refused_with_its_reason_and_left_to_fix() {
     let (_dir, store) = sandbox();
     account(&store, "work", None);
