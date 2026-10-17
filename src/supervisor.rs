@@ -18,10 +18,10 @@
 //!   moved. A move asked for later waits for the next turn to end.
 //! - `turn`: the same turn end with the session and its transcript,
 //!   written and removed with `idle`, but kept across a move. The session is
-//!   unused from the later of that time and the transcript's last write (a
-//!   background task can wake the agent without `UserPromptSubmit`); while
-//!   the file is missing the agent is in a turn, maybe waiting for approval,
-//!   and is never closed.
+//!   unused from the later of that time and the transcript's last write, in
+//!   case something wakes the agent without `UserPromptSubmit` (on 2.1.302 a
+//!   finished background task does run it); while the file is missing the
+//!   agent is in a turn, maybe waiting for approval, and is never closed.
 //! - `move.json`: written by the status line wrapper when the session's
 //!   account passed the threshold, or by `StopFailure` on a rate limit.
 //!

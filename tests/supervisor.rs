@@ -498,8 +498,8 @@ echo "second turn ended" >> "$FAKE_LOG""#,
 fn a_transcript_write_restarts_the_clock() {
     let sb = two_accounts();
     close_idle(&sb, "2s");
-    // A background task wakes the agent without UserPromptSubmit; the
-    // transcript still grows. Without that write it would close at 2 s.
+    // Something wakes the agent without UserPromptSubmit; the transcript
+    // still grows. Without that write it would close at 2 s.
     let fake = later(
         r#"sleep 1.5
 echo '{"type":"user"}' >> "$T"

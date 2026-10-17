@@ -192,9 +192,9 @@ change reaches running sessions at their next check.
 What counts as use:
 
 - The clock starts when a turn ends (the `Stop` or `StopFailure` hook). A new
-  prompt, another turn end or a write to the session's transcript restarts it;
-  the transcript covers a background task that wakes the agent without a
-  prompt.
+  prompt, another turn end or a write to the session's transcript restarts it.
+  On Claude Code 2.1.302 a background task that finishes wakes the agent
+  through `UserPromptSubmit` too; the transcript covers any wake that does not.
 - During a turn there is no clock, also while Claude Code waits for your
   approval: a session is never closed mid-turn.
 - Hours are wall-clock hours and count time the computer sleeps. The parent
@@ -211,6 +211,8 @@ Limits:
   closed; start them again to get it.
 - A session where no turn has ended yet, or whose last turn was interrupted
   with Esc (no `Stop` hook), has no clock and stays open.
+- A background task still running when the time is up does not keep the
+  session open: it ends with Claude Code.
 - Closing is not recorded in the registry: its format, which other tools read,
   records changes of account only.
 
@@ -379,13 +381,14 @@ which includes about 1.4 ms to start any process (`/usr/bin/true` measures
 
 | What | Time | Peak memory |
 |---|---|---|
-| Binary | | 1.2 MB (the interactive view is 0.2 MB of it) |
+| Binary | | 1.3 MB (the interactive view is 0.2 MB of it) |
 | `hats --version`, `config`, `env` | 2.0 to 2.2 ms | 2.0 to 2.2 MB |
 | `hats list` / `list --json` | 2.8 to 3.0 ms | 2.7 to 2.8 MB |
 | `hook session-start` / `prompt` / `stop` | 2.0 to 2.2 ms | 2.1 to 2.4 MB |
 | `statusline` / chained to another command | 2.7 / 3.7 ms | 2.6 MB |
 | Interactive view, open and quit | | 2.7 MB; 0.00 s of CPU in 10 s without keys |
 | `hats run` parent, waiting | 0.00 s of CPU in 10 s, 1 thread | 1.4 MB physical footprint (2.6 MB RSS with shared system libraries) |
+| Its check of the clock for closing | about 0.2 ms of CPU, at most every 15 minutes while the agent is idle | |
 | Its sentinel, waiting | 0.00 s of CPU in 10 s | 0.8 MB physical footprint (1.0 MB RSS) |
 | Processes left running | 0 | |
 
