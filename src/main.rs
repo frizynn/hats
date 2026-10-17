@@ -6,6 +6,7 @@ mod hook;
 mod import;
 mod limits;
 mod policy;
+mod process;
 mod registry;
 mod relaunch;
 mod setup;
@@ -291,7 +292,8 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 .provider_id(&store)?
                 .ok_or_else(|| not_logged_in(&account))?;
             auto::choose(&store, &account, &id, SystemTime::now())?;
-            println!("New {} sessions use '{label}'.", harness.name());
+            let moving = supervisor::move_running(&store, config.for_harness(harness), &account);
+            println!("{}", view::chosen(harness, &label, moving));
             if config.for_harness(harness).disabled.contains(&label) {
                 eprintln!("hats: {}", off_warning(harness, &label));
             }

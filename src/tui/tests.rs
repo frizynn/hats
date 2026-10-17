@@ -649,3 +649,43 @@ fn no_color_draws_without_colors() {
     assert!(colors(DARK) > 0);
     assert_eq!(colors(Theme::PLAIN), 0);
 }
+
+#[test]
+fn says_how_many_claude_code_sessions_run_without_hats() {
+    let (_dir, store) = sandbox();
+    account(&store, "work", Some(42.0));
+    account(&store, "side", Some(10.0));
+    let mut app = App::new(&store, DARK);
+    assert!(
+        !app.count_sessions,
+        "tests never read the computer's processes"
+    );
+    assert!(!text(&mut app).contains("without hats"));
+
+    app.unsupervised = 2;
+    let screen = text(&mut app);
+    let line =
+        "2 Claude Code sessions run without hats and never move: reopen them in a new terminal.";
+    assert!(screen.contains(line), "{screen}");
+    let below = screen
+        .lines()
+        .skip_while(|l| !l.contains(line))
+        .nth(1)
+        .unwrap();
+    assert!(
+        below.contains("5-HOUR LIMIT"),
+        "above the column titles: {screen}"
+    );
+    app.unsupervised = 1;
+    assert!(text(&mut app).contains("1 Claude Code session runs without hats"));
+    app.on_key(key(KeyCode::Right));
+    assert!(!text(&mut app).contains("without hats"), "not under Codex");
+    app.on_key(key(KeyCode::Left));
+
+    app.select_label(Some("side"));
+    app.on_key(key(KeyCode::Enter));
+    assert_eq!(
+        app.message.as_ref().unwrap().text,
+        "New claude sessions use 'side'."
+    );
+}

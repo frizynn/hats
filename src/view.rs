@@ -496,6 +496,27 @@ pub fn auto_report(
     lines
 }
 
+/// What choosing `label` changes: new sessions, and `moving` running ones.
+pub fn chosen(harness: Harness, label: &str, moving: usize) -> String {
+    let new = format!("New {} sessions use '{label}'.", harness.name());
+    match moving {
+        0 => new,
+        1 => format!("{new} 1 running session moves to it."),
+        n => format!("{new} {n} running sessions move to it."),
+    }
+}
+
+/// Claude Code sessions started without hats, which no switch reaches.
+pub fn unsupervised(count: usize) -> String {
+    let (sessions, them) = match count {
+        1 => ("session runs", "it"),
+        _ => ("sessions run", "them"),
+    };
+    format!(
+        "{count} Claude Code {sessions} without hats and never move: reopen {them} in a new terminal."
+    )
+}
+
 /// Why auto mode cannot move off `current`.
 pub fn stuck(current: &str) -> String {
     format!(

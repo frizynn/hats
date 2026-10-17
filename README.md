@@ -121,7 +121,7 @@ Auto: at 90 % of either limit, it moves to the account with the most room.
 
 | Tab | What it shows | Keys |
 |---|---|---|
-| Accounts | Claude Code or Codex, one line per account with its limits, and the selected account's mail, organization, plan, folder, resets and last change | `↑↓` move, `←→` the other harness, `enter` use, `space` turn off or on, `shift+↑↓` order, `a` add, `l` sign in, `d` remove (asks first) |
+| Accounts | Claude Code or Codex, one line per account with its limits, and the selected account's mail, organization, plan, folder, resets and last change; how many Claude Code sessions run without hats | `↑↓` move, `←→` the other harness, `enter` use, `space` turn off or on, `shift+↑↓` order, `a` add, `l` sign in, `d` remove (asks first) |
 | Usage | tokens and their cost at API list price today, in 7 and 30 days and in the month, by account, model and project, with a bar per day; the first scan runs on its own thread | `←→` one account or all, `esc` all again, `↑↓` scroll, `r` scan again |
 | Settings | every key of `config.toml` for both harnesses with its help, where hats keeps its files and whether `hats setup` was applied | `↑↓` move, `←→` change, `enter` to type a value and `enter` again to save it, `esc` cancels; a value that is not valid is refused with the reason |
 | Activity | changes of account and sessions closed for going unused, newest first | `↑↓` scroll, `home`/`end` |
@@ -200,16 +200,28 @@ plus a forked sentinel asleep on a pipe that ends Claude Code with `SIGHUP` if
 the parent is ever killed outright, so the agent is never left running in the
 background.
 When the session's account passes the threshold or hits the limit, hats moves
-it only right after a turn ends: within 2 seconds of the `Stop` hook, with no
+it right after a turn ends: within 2 seconds of the `Stop` hook, with no
 prompt after it. It waits one more second, ends Claude Code with `SIGTERM` and
 starts it again in the next account with `--resume <session>`, in the same
 terminal. A prompt sent in that second postpones the move to the next turn
 end, so a turn is never cut. The status line also repaints while the session
-sits idle (a permission mode change, the prompt cache expiring); a threshold
-seen then waits for the next turn to end, so a prompt you are typing is never
-lost. On Claude Code 2.1.301 the status line runs 0.31 to 0.34 s after the
-`Stop` hook, well inside the 2 seconds. Claude Code restores the terminal on
-`SIGTERM`; the conversation continues from its transcript.
+sits idle (a permission mode change, the prompt cache expiring, another
+session spending the same account). A threshold seen then moves the session
+only once it has gone a minute without use, because you may be typing the
+next prompt: Claude Code 2.1.302 loses a prompt typed and not sent when it is
+ended and resumed. On Claude Code 2.1.301 the status line runs 0.31 to 0.34 s
+after the `Stop` hook, well inside the 2 seconds. Claude Code restores the
+terminal on `SIGTERM`; the conversation continues from its transcript.
+
+**Choosing an account.** `hats use <label>`, or enter in the view, also moves
+every running `hats run` session that is on another account: at once if its
+agent is idle, when its turn ends if not. You chose somewhere else, so hats
+does not wait for a minute without use; a prompt typed and not sent in one of
+those sessions is lost. With `relaunch = "off"` running sessions stay where
+they are. A session started without hats (before `hats setup`, or in a
+terminal opened before it) has no hats parent and never moves: the Accounts
+tab of the view says how many there are, and reopening one in a new terminal
+puts it under hats.
 
 Limits of the running-session move:
 
@@ -355,7 +367,7 @@ How it counts:
 | `hats list [--json]` | accounts with their limits; `●` marks the one new sessions start with |
 | `hats add <label>` | create an account directory that shares your settings |
 | `hats login <label> [-- args]` | `claude auth login` (or `codex login`) inside that account |
-| `hats use <label>` | make it the default for new sessions |
+| `hats use <label>` | make it the default for new sessions, and move running `hats run` sessions to it |
 | `hats disable <label>`, `hats enable <label>` | keep auto switching from moving to an account, or let it again |
 | `hats auto [on\|off]` | say whether accounts switch by themselves and the last change, or turn it on or off; nothing has to stay open |
 | `hats run [label] [-- args]` | start the harness with that account (default: the current one) |
@@ -407,6 +419,7 @@ The Settings tab of the view changes the same keys in place.
 | Sessions closed for going unused | `$XDG_STATE_HOME/hats/closes.jsonl` | 0600 |
 | Last limits per account | `$XDG_STATE_HOME/hats/limits.json` | 0600 |
 | Current account per harness | `$XDG_STATE_HOME/hats/current-claude`, `current-codex` | |
+| What each `hats run` parent is told by hooks and `hats use` | `$XDG_STATE_HOME/hats/run/<pid>/`, removed when the parent ends; one a killed parent left is removed by the next `hats run`, `hats use` or `hats` | 0700 |
 | Token totals and scan offsets | `$XDG_STATE_HOME/hats/usage/` | 0600 |
 | Settings | `$XDG_CONFIG_HOME/hats/config.toml` | 0600 |
 | Credentials | where the harness keeps them; hats never reads them | |
@@ -538,7 +551,7 @@ which includes about 1.4 ms to start any process (`/usr/bin/true` measures
 | `hats list` / `list --json` | 2.8 to 3.0 ms | 2.7 to 2.8 MB |
 | `hook session-start` / `prompt` / `stop` | 2.0 to 2.2 ms | 2.1 to 2.4 MB |
 | `statusline` / chained to another command | 2.7 / 3.7 ms | 2.6 MB |
-| Interactive view, open | 3.2 ms to the first frame; 0.1 s more on a terminal that does not say its background | 4.0 MB RSS; 0.00 s of CPU in 10 s without keys |
+| Interactive view, open | 3.5 ms to the first frame, 0.2 to 0.3 ms of it counting the Claude Code sessions without hats among the user's 430 processes; 0.1 s more on a terminal that does not say its background | 4.0 MB RSS; 0.00 s of CPU in 10 s without keys |
 | `hats run` parent, waiting | 0.00 s of CPU in 10 s, 1 thread | 1.4 MB physical footprint (2.6 MB RSS with shared system libraries) |
 | Its check of the clock for closing | 0.2 to 0.5 ms of CPU, at most every 15 minutes while the agent is idle; reading Claude Code's background shells is 6 to 18 µs of it | |
 | Its sentinel, waiting | 0.00 s of CPU in 10 s | 0.8 MB physical footprint (1.0 MB RSS) |

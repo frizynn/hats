@@ -10,17 +10,15 @@
 //! turn, so between turns every such child is a background one. If Claude
 //! Code starts them some other way, none is found and nothing waits for them.
 //!
-//! Read straight from the kernel, without `ps`: `proc_listchildpids`,
-//! `KERN_PROCARGS2` and `proc_pidinfo` on macOS, `/proc` on Linux.
+//! Read straight from the kernel (see `process`).
 
 use std::time::SystemTime;
+
+use crate::process::{args, children, started};
 
 /// What the command line of a background shell starts with, after `-c`.
 const SOURCE: &[u8] = b"source ";
 const SNAPSHOTS: &[u8] = b"/shell-snapshots/";
-/// The start of a command line is enough to tell; longer ones are cut.
-#[cfg(target_os = "linux")]
-const ARGS_MAX: usize = 4096;
 
 /// When the newest background shell of `agent` started, if it has one.
 pub fn newest(agent: u32) -> Option<SystemTime> {
@@ -39,160 +37,6 @@ fn is_shell(args: &[u8]) -> bool {
     };
     let line = script.split(|b| *b == b'\n').next().unwrap_or_default();
     line.starts_with(SOURCE) && line.windows(SNAPSHOTS.len()).any(|w| w == SNAPSHOTS)
-}
-
-#[cfg(target_os = "macos")]
-fn children(agent: u32) -> Vec<u32> {
-    let mut pids = [0 as libc::pid_t; 256];
-    // SAFETY: the kernel writes at most the buffer's size in bytes and
-    // returns how many pids it wrote.
-    let n = unsafe {
-        libc::proc_listchildpids(
-            agent as libc::pid_t,
-            pids.as_mut_ptr().cast(),
-            std::mem::size_of_val(&pids) as libc::c_int,
-        )
-    };
-    let n = usize::try_from(n).unwrap_or(0).min(pids.len());
-    pids[..n].iter().map(|&p| p as u32).collect()
-}
-
-/// The arguments, NUL-separated, from `KERN_PROCARGS2`: the argument count,
-/// the executable's path, padding, then the arguments and the environment.
-#[cfg(target_os = "macos")]
-fn args(pid: u32) -> Option<Vec<u8>> {
-    // A buffer smaller than the process's arguments and environment fails
-    // or reads the wrong end on some macOS versions (seen on CI runners), so
-    // it takes the system's limit, as `ps` does. `calloc` maps it lazily.
-    let mut buf = vec![0u8; arg_max()?];
-    let mut len = buf.len();
-    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
-    // SAFETY: a valid name and a buffer of `len` bytes; the kernel sets
-    // `len` to what it wrote, cut to the buffer.
-    let rc = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            3,
-            buf.as_mut_ptr().cast(),
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 || len < 4 {
-        return None;
-    }
-    let argc = i32::from_ne_bytes(buf[..4].try_into().ok()?);
-    let rest = &buf[4..len];
-    let path_end = rest.iter().position(|b| *b == 0)?;
-    let start = path_end + rest[path_end..].iter().position(|b| *b != 0)?;
-    let mut args = rest[start..].to_vec();
-    // Keep only the arguments, not the environment after them.
-    if let Some(end) = args
-        .iter()
-        .enumerate()
-        .filter(|(_, b)| **b == 0)
-        .nth(usize::try_from(argc).ok()?.checked_sub(1)?)
-        .map(|(i, _)| i)
-    {
-        args.truncate(end);
-    }
-    Some(args)
-}
-
-/// `KERN_ARGMAX`: the most bytes of arguments and environment a process has.
-#[cfg(target_os = "macos")]
-fn arg_max() -> Option<usize> {
-    let mut max: libc::c_int = 0;
-    let mut len = std::mem::size_of::<libc::c_int>();
-    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
-    // SAFETY: a valid name and an int-sized buffer.
-    let rc = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            2,
-            (&mut max as *mut libc::c_int).cast(),
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    (rc == 0).then(|| usize::try_from(max).ok()).flatten()
-}
-
-#[cfg(target_os = "macos")]
-fn started(pid: u32) -> Option<SystemTime> {
-    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
-    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    // SAFETY: the kernel fills the struct when it returns its size.
-    let info = unsafe {
-        let n = libc::proc_pidinfo(
-            pid as libc::c_int,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            size,
-        );
-        (n == size).then(|| info.assume_init())?
-    };
-    let since = std::time::Duration::new(info.pbi_start_tvsec, info.pbi_start_tvusec as u32 * 1000);
-    std::time::UNIX_EPOCH.checked_add(since)
-}
-
-/// Each thread lists the children it started.
-#[cfg(target_os = "linux")]
-fn children(agent: u32) -> Vec<u32> {
-    let Ok(tasks) = std::fs::read_dir(format!("/proc/{agent}/task")) else {
-        return Vec::new();
-    };
-    tasks
-        .flatten()
-        .filter_map(|task| std::fs::read_to_string(task.path().join("children")).ok())
-        .flat_map(|list| {
-            list.split_whitespace()
-                .filter_map(|p| p.parse().ok())
-                .collect::<Vec<u32>>()
-        })
-        .collect()
-}
-
-#[cfg(target_os = "linux")]
-fn args(pid: u32) -> Option<Vec<u8>> {
-    use std::io::Read;
-    let mut args = Vec::with_capacity(ARGS_MAX);
-    std::fs::File::open(format!("/proc/{pid}/cmdline"))
-        .ok()?
-        .take(ARGS_MAX as u64)
-        .read_to_end(&mut args)
-        .ok()?;
-    Some(args)
-}
-
-/// From the start time in `/proc/<pid>/stat`, in clock ticks since boot, and
-/// the time since boot now, both counting suspend.
-#[cfg(target_os = "linux")]
-fn started(pid: u32) -> Option<SystemTime> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // The name, in parentheses, may hold spaces; the start is the 22nd field.
-    let ticks: u64 = stat
-        .rsplit_once(')')?
-        .1
-        .split_whitespace()
-        .nth(19)?
-        .parse()
-        .ok()?;
-    // SAFETY: plain queries with a valid out pointer.
-    let (hz, boot) = unsafe {
-        let mut now = std::mem::MaybeUninit::<libc::timespec>::uninit();
-        if libc::clock_gettime(libc::CLOCK_BOOTTIME, now.as_mut_ptr()) != 0 {
-            return None;
-        }
-        (libc::sysconf(libc::_SC_CLK_TCK), now.assume_init())
-    };
-    let hz = u64::try_from(hz).ok().filter(|hz| *hz > 0)?;
-    let up = std::time::Duration::new(boot.tv_sec as u64, boot.tv_nsec as u32);
-    let at = std::time::Duration::from_millis(ticks * 1000 / hz);
-    SystemTime::now().checked_sub(up.checked_sub(at)?)
 }
 
 #[cfg(test)]

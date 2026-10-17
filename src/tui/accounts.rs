@@ -15,6 +15,7 @@ use crate::account::{DEFAULT_LABEL, Harness};
 use crate::auto::{self, Status};
 use crate::config;
 use crate::limits::LimitWindow;
+use crate::supervisor;
 use crate::view::{self, Tone};
 
 /// Marks the selected row, before the text.
@@ -187,14 +188,15 @@ impl App<'_> {
             return Step::Redraw;
         };
         match auto::choose(self.store, &account, &id, SystemTime::now()) {
-            Ok(()) if self.is_off(&account.label) => {
-                self.fail(crate::off_warning(account.harness, &account.label))
+            Ok(()) => {
+                let settings = self.config.for_harness(account.harness);
+                let moving = supervisor::move_running(self.store, settings, &account);
+                if self.is_off(&account.label) {
+                    self.fail(crate::off_warning(account.harness, &account.label));
+                } else {
+                    self.info(view::chosen(account.harness, &account.label, moving));
+                }
             }
-            Ok(()) => self.info(format!(
-                "New {} sessions use '{}'.",
-                account.harness.name(),
-                account.label
-            )),
             Err(e) => self.fail(e),
         }
         self.reload();
@@ -324,12 +326,21 @@ impl App<'_> {
                 !group.statuses.is_empty()
                     && !auto::has_destination(&group.statuses, current, config, now)
             });
+        // Above the column titles, under the mode sentence.
         if stuck {
             let current = group.current.as_deref().unwrap_or(DEFAULT_LABEL);
-            // Above the column titles, under the mode sentence.
             header.insert(
                 header.len() - 1,
                 Line::styled(view::stuck(current), self.theme.fg(Color::Yellow)),
+            );
+        }
+        if group.harness == Harness::Claude && self.unsupervised > 0 {
+            header.insert(
+                header.len() - 1,
+                Line::styled(
+                    view::unsupervised(self.unsupervised),
+                    self.theme.fg(Color::Yellow),
+                ),
             );
         }
         let rows = group.statuses.len().max(1) as u16;
