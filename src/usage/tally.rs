@@ -245,6 +245,32 @@ struct TotalsFile {
     files: Option<Generation>,
 }
 
+impl TotalsFile {
+    /// `totals.json`, or `None` when there is none this hats can use.
+    fn read(dir: &Path) -> Result<Option<Self>, String> {
+        let path = dir.join("totals.json");
+        let Ok(bytes) = fs::read(&path) else {
+            return Ok(None);
+        };
+        match serde_json::from_slice::<Self>(&bytes) {
+            Ok(totals) if totals.v == 1 => Ok(Some(totals)),
+            _ => {
+                #[derive(Deserialize)]
+                struct Version {
+                    v: u32,
+                }
+                match serde_json::from_slice::<Version>(&bytes) {
+                    Ok(Version { v }) if v > 1 => Err(format!(
+                        "{}: saved by a newer hats (version {v}); use that one",
+                        path.display()
+                    )),
+                    _ => Ok(None),
+                }
+            }
+        }
+    }
+}
+
 impl Tally {
     pub fn empty(today: Day) -> Self {
         Self {
@@ -267,24 +293,8 @@ impl Tally {
     /// days whose logs are gone.
     pub fn load(dir: &Path, today: Day) -> Result<Self, String> {
         let read = |name: &str| fs::read(dir.join(name)).ok();
-        let Some(bytes) = read("totals.json") else {
+        let Some(totals) = TotalsFile::read(dir)? else {
             return Ok(Self::empty(today));
-        };
-        let totals = match serde_json::from_slice::<TotalsFile>(&bytes) {
-            Ok(totals) if totals.v == 1 => totals,
-            _ => {
-                #[derive(Deserialize)]
-                struct Version {
-                    v: u32,
-                }
-                return match serde_json::from_slice::<Version>(&bytes) {
-                    Ok(Version { v }) if v > 1 => Err(format!(
-                        "{}: saved by a newer hats (version {v}); use that one",
-                        dir.join("totals.json").display()
-                    )),
-                    _ => Ok(Self::empty(today)),
-                };
-            }
         };
         let Some(files) = totals.files else {
             return Ok(Self::empty(today));
