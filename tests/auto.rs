@@ -413,3 +413,49 @@ fn a_learned_limit_that_expired_is_not_data() {
     sb.repaint("work", 95.0, 0.0);
     assert_eq!(sb.current(), "spare");
 }
+
+#[test]
+fn an_account_turned_off_is_never_switched_to_but_can_be_chosen() {
+    let sb = three_accounts();
+    sb.repaint("side", 40.0, 10.0);
+    sb.repaint("spare", 5.0, 20.0);
+    assert!(sb.ok(&["disable", "spare"]).contains("'spare' is off"));
+    let enabled = |label: &str| listed(&sb, label)["enabled"].clone();
+    assert_eq!(enabled("spare"), false);
+    assert_eq!(enabled("side"), true);
+
+    // The emptiest account is off: the threshold moves to the next one.
+    sb.repaint("work", 91.0, 50.0);
+    assert_eq!(sb.current(), "side");
+
+    // Every other account off: a rate limit does not move it, and hats
+    // auto says why.
+    sb.ok(&["use", "work"]);
+    let out = sb.ok(&["disable", "side"]);
+    assert!(out.contains("nowhere to move"), "{out}");
+    rate_limited(&sb, "work").wait().unwrap();
+    assert_eq!(sb.current(), "work");
+    let auto = sb.ok(&["auto"]);
+    assert!(auto.contains("every other account is off"), "{auto}");
+
+    // Chosen by hand it is used, with a warning.
+    let out = sb.cmd(&["use", "spare"]).output().unwrap();
+    common::assert_success(&out, &["use", "spare"]);
+    assert_eq!(sb.current(), "spare");
+    let warning = String::from_utf8_lossy(&out.stderr);
+    assert!(warning.contains("'spare' is off"), "{warning}");
+
+    sb.ok(&["enable", "spare"]);
+    sb.ok(&["enable", "side"]);
+    assert_eq!(enabled("spare"), true);
+    let config = std::fs::read_to_string(sb.home.join(".config/hats/config.toml")).unwrap();
+    assert!(config.contains("disabled = []"), "{config}");
+    assert!(
+        sb.cmd(&["disable", "nobody"])
+            .output()
+            .unwrap()
+            .status
+            .code()
+            != Some(0)
+    );
+}

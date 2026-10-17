@@ -84,6 +84,16 @@ enum Cmd {
         /// Account label, as `hats list` shows it.
         label: String,
     },
+    /// Let auto switching move to an account again.
+    Enable {
+        /// Account label, as `hats list` shows it.
+        label: String,
+    },
+    /// Keep auto switching from moving to an account; `hats use` still can.
+    Disable {
+        /// Account label, as `hats list` shows it.
+        label: String,
+    },
     /// Start the harness with an account (default: the current one).
     ///
     /// An interactive Claude Code session stays under a small hats parent
@@ -282,7 +292,12 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 .ok_or_else(|| not_logged_in(&account))?;
             auto::choose(&store, &account, &id, SystemTime::now())?;
             println!("New {} sessions use '{label}'.", harness.name());
+            if config.for_harness(harness).disabled.contains(&label) {
+                eprintln!("hats: {}", off_warning(harness, &label));
+            }
         }
+        Cmd::Enable { label } => enable(&store, harness, &label, true)?,
+        Cmd::Disable { label } => enable(&store, harness, &label, false)?,
         Cmd::Run { label, args } => {
             return launch(&store, &config, harness, label.as_deref(), args);
         }
@@ -358,6 +373,39 @@ fn chosen(store: &Store, harness: Harness, label: Option<&str>) -> Result<Accoun
         Some(label) => find(store, harness, label),
         None => store.current(harness),
     }
+}
+
+/// What `hats use` and the view say when the chosen account is off.
+pub fn off_warning(harness: Harness, label: &str) -> String {
+    format!(
+        "'{label}' is off: auto switching never moves to it, but you chose it. Turn it on with `hats{} enable {label}`.",
+        flag(harness)
+    )
+}
+
+fn enable(store: &Store, harness: Harness, label: &str, enabled: bool) -> Result<(), Failure> {
+    let account = find(store, harness, label)?;
+    config::set_enabled(&store.config, harness, &account.label, enabled)?;
+    let config = Config::load(&store.config)?;
+    let settings = config.for_harness(harness);
+    if enabled {
+        println!("'{label}' is on: auto switching may move to it.");
+        return Ok(());
+    }
+    println!(
+        "'{label}' is off: auto switching never moves to it; `hats{} use {label}` still can.",
+        flag(harness)
+    );
+    let current = store.current(harness)?;
+    let statuses = auto::statuses(store, harness, settings)?;
+    if !auto::has_destination(&statuses, &current.label, settings, SystemTime::now()) {
+        println!(
+            "Every other {} account is off or not signed in: auto switching has nowhere to move from '{}'.",
+            harness.name(),
+            current.label
+        );
+    }
+    Ok(())
 }
 
 fn not_logged_in(account: &Account) -> String {
@@ -447,7 +495,12 @@ fn list(store: &Store, json: bool) -> Result<(), Failure> {
         .into_iter()
         .map(|h| Ok((h, auto::statuses(store, h, config.for_harness(h))?)))
         .collect::<Result<Vec<_>, String>>()?;
-    let layout = view::Layout::new(groups.iter().map(|(h, s)| (*h, s.as_slice())), width);
+    let layout = view::Layout::new(
+        groups
+            .iter()
+            .map(|(h, s)| (*h, config.for_harness(*h), s.as_slice())),
+        width,
+    );
     for (harness, statuses) in groups {
         let settings = config.for_harness(harness);
         if statuses.is_empty() {
@@ -465,6 +518,7 @@ fn list(store: &Store, json: bool) -> Result<(), Failure> {
                     "label": s.account.label,
                     "account": s.id,
                     "signedIn": s.id.is_some(),
+                    "enabled": !settings.disabled.contains(&s.account.label),
                     "current": current.as_deref() == Some(s.account.label.as_str()),
                     "configDir": s.account.dir,
                     "usedPercent": s.used(now),
@@ -548,17 +602,20 @@ fn auto_command(store: &Store, harness: Harness, state: Option<OnOff>) -> Result
         )?;
     }
     let config = Config::load(&store.config)?;
+    let settings = config.for_harness(harness);
     let current = store.current(harness)?;
     let last = registry::recent(&store.registry(), usize::MAX)
         .into_iter()
         .rfind(|c| c.harness == harness);
     let now = SystemTime::now();
+    let statuses = auto::statuses(store, harness, settings)?;
     let lines = view::auto_report(
         harness,
-        config.for_harness(harness),
+        settings,
         &current.label,
         setup::installed(store),
         last.as_ref(),
+        auto::has_destination(&statuses, &current.label, settings, now),
         now,
     );
     let width = width();

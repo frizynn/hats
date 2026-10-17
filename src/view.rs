@@ -77,17 +77,21 @@ pub struct Layout {
     /// goes on a second line.
     who: Option<usize>,
     bar: usize,
+    /// Who it is goes under the account when it has no column; the
+    /// interactive view shows it apart instead.
+    second_line: bool,
 }
 
 impl Layout {
     pub fn new<'a>(
-        groups: impl IntoIterator<Item = (Harness, &'a [Status])>,
+        groups: impl IntoIterator<Item = (Harness, &'a HarnessConfig, &'a [Status])>,
         width: usize,
     ) -> Self {
         let (mut label, mut who) = ("ACCOUNT".len(), "SIGNED IN AS".len());
-        for (harness, statuses) in groups {
+        for (harness, config, statuses) in groups {
             for s in statuses {
-                label = label.max(s.account.label.chars().count());
+                let off = if is_off(config, s) { OFF.len() } else { 0 };
+                label = label.max(s.account.label.chars().count() + off);
                 who = who.max(self::who(s, harness).chars().count());
             }
         }
@@ -101,6 +105,7 @@ impl Layout {
                 label,
                 who: Some(who),
                 bar: bars(width - wide).min(10),
+                second_line: true,
             }
         } else {
             Self {
@@ -108,13 +113,28 @@ impl Layout {
                 label,
                 who: None,
                 bar: bars(width.saturating_sub(fixed)).clamp(3, 10),
+                second_line: true,
             }
         }
+    }
+
+    /// One line per account: who it is shows elsewhere when it has no column.
+    pub fn one_line(mut self) -> Self {
+        self.second_line = false;
+        self
     }
 
     fn window(&self) -> usize {
         self.bar + WINDOW_TEXT
     }
+}
+
+/// Follows the label of an account auto switching never moves to.
+const OFF: &str = " off";
+
+/// Whether `s` is turned off for auto switching.
+pub fn is_off(config: &HarnessConfig, s: &Status) -> bool {
+    config.disabled.contains(&s.account.label)
 }
 
 /// Where the login is and who it is: `~/.claude · dana@example.com · Max`.
@@ -202,7 +222,7 @@ pub fn block(
                     cell("  ", Tone::Plain)
                 },
                 cell(
-                    format!("{:<w$}{GAP}", s.account.label, w = layout.label),
+                    s.account.label.clone(),
                     if is_current {
                         Tone::Strong
                     } else {
@@ -210,13 +230,17 @@ pub fn block(
                     },
                 ),
             ];
+            let off = if is_off(config, s) { OFF } else { "" };
+            line.push(cell(off, Tone::Warn));
+            let pad = layout.label - s.account.label.chars().count() - off.len();
+            line.push(cell(format!("{:pad$}{GAP}", ""), Tone::Plain));
             let who = who(s, harness);
             if let Some(w) = layout.who {
                 line.push(cell(format!("{who:<w$}{GAP}"), Tone::Dim));
             }
             line.extend(state(s, harness, config, layout, now, hints));
             let mut rows = vec![line];
-            if layout.who.is_none() && !who.is_empty() {
+            if layout.who.is_none() && layout.second_line && !who.is_empty() {
                 // Under the label and a step in, so it reads as part of it.
                 rows.push(vec![cell(
                     format!("    {}", fit(&who, width.saturating_sub(4))),
@@ -383,7 +407,7 @@ pub fn change(c: &Change, now: SystemTime) -> String {
 }
 
 /// `default → work: default hit its limit`.
-fn what_changed(c: &Change) -> String {
+pub fn what_changed(c: &Change) -> String {
     let route = match &c.from {
         Some(from) => format!("{from} → {}", c.to),
         None => format!("→ {}", c.to),
@@ -406,6 +430,7 @@ pub fn auto_report(
     current: &str,
     hooks_installed: bool,
     last: Option<&Change>,
+    can_move: bool,
     now: SystemTime,
 ) -> Vec<String> {
     let name = match harness {
@@ -447,6 +472,9 @@ pub fn auto_report(
     }
     if c.mode == Mode::Auto {
         lines.push(format!("New sessions start in '{current}'."));
+        if !can_move {
+            lines.push(stuck(current));
+        }
     }
     lines.push(match last {
         Some(c) => format!("Last change at {}: {}.", clock(c.at, now), what_changed(c)),
@@ -466,6 +494,13 @@ pub fn auto_report(
         });
     }
     lines
+}
+
+/// Why auto mode cannot move off `current`.
+pub fn stuck(current: &str) -> String {
+    format!(
+        "Nothing to move to: every other account is off or not signed in, so it stays in '{current}'."
+    )
 }
 
 fn flag(harness: Harness) -> &'static str {
