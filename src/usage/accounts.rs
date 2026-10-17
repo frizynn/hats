@@ -58,7 +58,7 @@ pub fn parse_switch_log(text: &str) -> Vec<SwitchLine> {
                 at,
                 harness: r.harness,
                 account: format!("{}:{}", r.harness.name(), r.account),
-                label: r.label.filter(|l| l.len() <= 64),
+                label: r.label.filter(|l| !l.is_empty() && l.len() <= 64),
                 config_dir: r.config_dir,
                 session: r.session.filter(|s| s.len() <= 128),
             })

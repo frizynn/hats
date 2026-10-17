@@ -476,7 +476,7 @@ struct Row {
     key: u64,
     day: Day,
     utc_day: u16,
-    ctx: u16,
+    ctx: u32,
     tokens: [u64; 6],
 }
 
@@ -587,7 +587,7 @@ fn count(totals: &mut Totals, seen: &mut Seen, done: &Done, stats: &mut Stats) {
             continue;
         }
         stats.rows += 1;
-        let (account, model, repo) = ids[usize::from(row.ctx)];
+        let (account, model, repo) = ids[row.ctx as usize];
         let key = Key {
             day: row.day,
             harness: done.harness,
@@ -1143,17 +1143,17 @@ struct Out {
 }
 
 impl Out {
-    fn ctx(&mut self, account: &str, model: &str, repo: &str) -> u16 {
+    fn ctx(&mut self, account: &str, model: &str, repo: &str) -> u32 {
         let same = |c: &Ctx| c.account == account && c.model == model && c.repo == repo;
         if let Some(i) = self.ctxs.iter().rposition(same) {
-            return i as u16;
+            return i as u32;
         }
         self.ctxs.push(Ctx {
             account: account.to_owned(),
             model: model.to_owned(),
             repo: repo.to_owned(),
         });
-        (self.ctxs.len() - 1) as u16
+        (self.ctxs.len() - 1) as u32
     }
 }
 

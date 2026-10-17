@@ -326,31 +326,28 @@ impl Sources {
                 let id = account.provider_id(store).ok().flatten();
                 if let Some(id) = &id {
                     let full = format!("{}:{id}", harness.name());
-                    if known.contains(&account.dir) {
+                    // A directory hats does not manage has no label, only a path.
+                    let label = if known.contains(&account.dir) {
                         labels.insert(full.clone(), account.label.clone());
-                    }
+                        account.label.as_str()
+                    } else {
+                        ""
+                    };
                     if harness == Harness::Claude {
                         let last = own
                             .iter()
                             .rev()
                             .find(|l| l.config_dir == config_dir && l.session.is_none());
                         if last.is_none_or(|l| l.account != full) {
-                            let line = Switch::new(
-                                now,
-                                harness,
-                                id,
-                                &account.label,
-                                &account.dir,
-                                None,
-                                None,
-                            );
+                            let line =
+                                Switch::new(now, harness, id, label, &account.dir, None, None);
                             registry::append(&dir.join(SIGHTINGS), &line)
                                 .map_err(|e| e.to_string())?;
                             lines.push(SwitchLine {
                                 at: unix_ms(now),
                                 harness,
                                 account: full,
-                                label: Some(account.label.clone()),
+                                label: (!label.is_empty()).then(|| label.to_owned()),
                                 config_dir: config_dir.clone(),
                                 session: None,
                             });
