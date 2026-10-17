@@ -312,7 +312,7 @@ impl<'a> App<'a> {
             (false, KeyCode::BackTab) => {
                 self.show(Tab::ALL[(self.tab.index() + Tab::ALL.len() - 1) % Tab::ALL.len()])
             }
-            (false, KeyCode::Char(c @ '1'..='4')) if !self.settings.takes_digits(self) => {
+            (false, KeyCode::Char(c @ '1'..='4')) => {
                 self.show(Tab::ALL[usize::from(c as u8 - b'1')])
             }
             (false, KeyCode::Char('q')) => Step::Quit,

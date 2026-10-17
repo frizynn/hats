@@ -367,7 +367,10 @@ fn settings_change_in_place_and_are_saved_at_once() {
     assert_eq!(config(&store).claude.threshold, 91);
     app.on_key(shift(KeyCode::Left));
     assert_eq!(config(&store).claude.threshold, 86);
-    // Typing a number starts a new value; enter saves it.
+    // Enter opens the value to type; enter again saves it.
+    app.on_key(key(KeyCode::Enter));
+    app.on_key(key(KeyCode::Backspace));
+    app.on_key(key(KeyCode::Backspace));
     keys(&mut app, "75");
     assert_eq!(app.settings.edit.as_deref(), Some("75"));
     assert!(line_with(&text(&mut app), "threshold").contains("75"));

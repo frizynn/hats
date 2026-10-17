@@ -36,11 +36,6 @@ impl State {
     pub fn edit_shown(&self, tab: Tab) -> bool {
         tab == Tab::Settings && self.edit.is_some()
     }
-
-    /// Whether a digit starts typing a value instead of choosing a tab.
-    pub fn takes_digits(&self, app: &App) -> bool {
-        app.tab == Tab::Settings && matches!(keys()[self.row].1, "threshold" | "close_idle")
-    }
 }
 
 /// Every key of both harnesses, in the order `hats config` lists them.
@@ -86,11 +81,6 @@ impl App<'_> {
             KeyCode::Right => self.step(harness, name, by),
             KeyCode::Enter => {
                 self.settings.edit = Some(self.value(harness, name));
-                Step::Redraw
-            }
-            // A number typed over the value starts a new one.
-            KeyCode::Char(c @ '0'..='9') if self.settings.takes_digits(self) => {
-                self.settings.edit = Some(c.to_string());
                 Step::Redraw
             }
             _ => Step::Idle,
@@ -247,7 +237,6 @@ impl App<'_> {
         }
         let change = match name {
             "order" | "disabled" => ("enter", "type labels"),
-            "threshold" | "close_idle" => ("←→ or type", "change"),
             _ => ("←→", "change"),
         };
         vec![("↑↓", "setting"), change, ("enter", "type a value")]
