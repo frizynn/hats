@@ -29,6 +29,7 @@ use crate::auto::{self, Status};
 use crate::config::Config;
 use crate::registry::{self, Change};
 use crate::store::Store;
+use crate::supervisor;
 use crate::watch::Watch;
 use theme::Theme;
 
@@ -40,7 +41,10 @@ pub fn run(store: &Store) -> Result<(), String> {
     install_panic_hook();
     let mut screen =
         Screen::enter().map_err(|e| format!("could not open the interactive view: {e}"))?;
+    supervisor::remove_stale(store);
     let mut app = App::new(store, Theme::detect(color));
+    app.count_sessions = true;
+    app.unsupervised = supervisor::unsupervised();
     let result = event_loop(&mut app, &mut screen);
     drop(screen);
     // Back on the normal screen, say what closed the view: a terminal that
@@ -214,6 +218,11 @@ struct App<'a> {
     /// The key that closed the view.
     closed_by: Option<&'static str>,
     theme: Theme,
+    /// Whether to count the Claude Code sessions running without hats. Tests
+    /// leave it off: the count comes from every process of the user.
+    count_sessions: bool,
+    /// Claude Code sessions running without hats, as of the last reload.
+    unsupervised: usize,
 }
 
 impl<'a> App<'a> {
@@ -235,6 +244,8 @@ impl<'a> App<'a> {
             message: None,
             closed_by: None,
             theme,
+            count_sessions: false,
+            unsupervised: 0,
         };
         app.reload();
         if app.groups[0].statuses.is_empty() && !app.groups[1].statuses.is_empty() {
@@ -281,6 +292,9 @@ impl<'a> App<'a> {
         }
         self.changes = registry::recent(&self.store.registry(), CHANGES);
         self.activity.reload(self.store, &self.changes);
+        if self.count_sessions {
+            self.unsupervised = supervisor::unsupervised();
+        }
         if let Some(e) = error {
             self.fail(e);
         }

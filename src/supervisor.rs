@@ -1,32 +1,40 @@
 //! `hats run` as a small parent of Claude Code, so a running session can move
-//! to another account without touching credentials: when the account passes
-//! the threshold or hits its limit, and the agent is idle, the parent ends
-//! Claude Code with SIGTERM and starts it again with `--resume <session>` in
-//! the next account's directory, in the same terminal. A session left unused
-//! for `claude.close_idle` is ended the same way and not started again; the
+//! to another account without touching credentials: when the user chooses
+//! another account, or the session's account passes the threshold or hits
+//! its limit, and the agent is idle, the parent ends Claude Code with SIGTERM
+//! and starts it again with `--resume <session>` in the new account's
+//! directory, in the same terminal. A session left unused for
+//! `claude.close_idle` is ended the same way and not started again; the
 //! parent prints how to resume it.
 //!
 //! The parent shares the terminal and the process group with Claude Code and
 //! never reads or writes the terminal. It sleeps in `sigwait(2)`; the session's
-//! hooks and status line wake it with SIGUSR1 after writing to its run
-//! directory (`<state>/run/<pid>/`):
+//! hooks and status line, and `hats use`, wake it with SIGUSR1 after writing
+//! to its run directory (`<state>/run/<pid>/`):
 //!
-//! - `idle`: written by the `Stop` and `StopFailure` hooks with the time the
-//!   turn ended, removed by `UserPromptSubmit`. A move starts only within
-//!   `MOVE_WINDOW_MS` of that time, so a turn is never cut, a prompt being
-//!   typed later is never lost, and without the hooks a session is never
-//!   moved. A move asked for later waits for the next turn to end.
 //! - `turn`: when the agent last went quiet, with the session and its
-//!   transcript: written with `idle`, and by `SessionStart` when the session
-//!   opens, so one never used closes too; removed with `idle`, but kept across
-//!   a move. The session is unused from the later of that time and the
-//!   transcript's last write, in case something wakes the agent without
-//!   `UserPromptSubmit` (on 2.1.302 a finished background task does run it);
-//!   while the file is missing the agent is in a turn, maybe waiting for
-//!   approval, and is never closed. A turn cut with Esc runs no hook (measured
-//!   on 2.1.302, also no `idle_prompt` notification), so it stays a turn.
+//!   transcript: written by the `Stop` and `StopFailure` hooks when a turn
+//!   ends and by `SessionStart` when the session opens, removed by
+//!   `UserPromptSubmit`. While it is missing the agent is in a turn, maybe
+//!   waiting for approval, and is never moved or closed; without the hooks a
+//!   session is never moved. The session is unused from the later of that
+//!   time and the transcript's last write, in case something wakes the agent
+//!   without `UserPromptSubmit` (on 2.1.302 a finished background task does
+//!   run it). A turn cut with Esc runs no hook (measured on 2.1.302, also no
+//!   `idle_prompt` notification), so it stays a turn.
+//! - `idle`: the time a turn ended, written and removed with `turn`, for a
+//!   parent from before `turn`.
 //! - `move.json`: written by the status line wrapper when the session's
-//!   account passed the threshold, or by `StopFailure` on a rate limit.
+//!   account passed the threshold, by `StopFailure` on a rate limit, and by
+//!   `hats use` with the account the user chose.
+//! - `account`: the label of the account the agent runs on, for `hats use`.
+//!
+//! A move the user asked for starts as soon as the agent is idle: they chose
+//! elsewhere, so they are not typing here. One the limits asked for starts
+//! right after a turn ends, or once the session has been unused for
+//! `UNUSED_MS`, since in between the user may be typing the next prompt, and
+//! a prompt typed and not sent is lost (measured on Claude Code 2.1.302:
+//! after SIGTERM and `--resume` the prompt is empty and no file holds it).
 //!
 //! A background shell still running holds a move until the next turn end and
 //! counts as use for a close, for at most `close_idle` of its run time (see
@@ -56,6 +64,7 @@ use crate::background;
 use crate::config::{self, Config, HarnessConfig, Mode, Relaunch};
 use crate::limits::unix_millis;
 use crate::policy::Reason;
+use crate::process;
 use crate::registry::{self, Close, Switch};
 use crate::relaunch;
 use crate::store::Store;
@@ -67,11 +76,14 @@ pub const PID_ENV: &str = "HATS_SUPERVISOR";
 const GRACE_SECS: u32 = 1;
 /// Seconds after SIGTERM before SIGKILL.
 const KILL_SECS: u32 = 10;
-/// How long after a turn ends a move may start. Later, the user may be typing
-/// the next prompt. Measured on Claude Code 2.1.301: the status line, which
-/// asks for the move, runs 0.31 to 0.34 s after the `Stop` hook (its 300 ms
-/// debounce), and the wrapper asks before running the user's own command.
+/// How long after a turn ends a move the limits asked for may start at once.
+/// Measured on Claude Code 2.1.301: the status line, which asks for the move,
+/// runs 0.31 to 0.34 s after the `Stop` hook (its 300 ms debounce), and the
+/// wrapper asks before running the user's own command.
 const MOVE_WINDOW_MS: u64 = 2000;
+/// A session unused this long is taken as left alone, so a move the limits
+/// asked for may start even though no turn just ended.
+const UNUSED_MS: u64 = 60_000;
 /// Longest wait between checks of the clock for closing. The clock is the
 /// wall clock, which counts time the computer sleeps; alarm(3) may not (on
 /// macOS it is not documented, and `mach_absolute_time` stops in sleep), so
@@ -80,8 +92,14 @@ const CHECK_SECS: u64 = 15 * 60;
 
 #[derive(Serialize, Deserialize)]
 struct MoveRequest {
-    session: String,
+    /// The session to resume; `turn` has it when `hats use` asks. A parent
+    /// from before `hats use` asked reads only requests that have it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session: Option<String>,
     reason: Reason,
+    /// The account the user chose, when they did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    to: Option<String>,
 }
 
 fn run_dir(store: &Store, pid: u32) -> PathBuf {
@@ -107,16 +125,21 @@ fn write_file(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     fs::rename(tmp, dir.join(name))
 }
 
-fn write_request(dir: &Path, session: &str, reason: Reason) -> io::Result<()> {
-    let request = MoveRequest {
-        session: session.to_owned(),
-        reason,
-    };
+fn write_request(dir: &Path, request: &MoveRequest) -> io::Result<()> {
     write_file(
         dir,
         "move.json",
-        &serde_json::to_vec(&request).expect("plain struct"),
+        &serde_json::to_vec(request).expect("plain struct"),
     )
+}
+
+/// What the limits ask for: a move of `session` off its account.
+fn limits_request(session: &str, reason: Reason) -> MoveRequest {
+    MoveRequest {
+        session: Some(session.to_owned()),
+        reason,
+        to: None,
+    }
 }
 
 /// Whether running sessions move to another account.
@@ -143,9 +166,110 @@ pub fn request_move(
     let Some((_, reason)) = auto::next_account(&statuses, &account.label, config, now, None) else {
         return Ok(());
     };
-    write_request(&dir, session, reason).map_err(|e| e.to_string())?;
+    write_request(&dir, &limits_request(session, reason)).map_err(|e| e.to_string())?;
     wake(pid);
     Ok(())
+}
+
+/// A choice of default account by the user: asks every `hats run` parent
+/// whose agent runs on another account to move it to `to`, at once if the
+/// agent is idle, else when its turn ends. Returns how many were asked.
+pub fn move_running(store: &Store, config: &HarnessConfig, to: &Account) -> usize {
+    if to.harness != Harness::Claude || config.relaunch != Relaunch::Idle {
+        return 0;
+    }
+    let Some(me) = process::info(std::process::id()) else {
+        return 0;
+    };
+    let request = MoveRequest {
+        session: None,
+        reason: Reason::Manual,
+        to: Some(to.label.clone()),
+    };
+    parents(store)
+        .into_iter()
+        .filter(|(pid, dir)| {
+            // SIGUSR1 ends a process that does not handle it: never send it
+            // to a program that took the pid of a parent that is gone.
+            process::info(*pid).is_some_and(|p| p.name == me.name)
+                && fs::read(dir.join("account")).is_ok_and(|on| on != to.label.as_bytes())
+                && write_request(dir, &request).is_ok()
+        })
+        .inspect(|(pid, _)| wake(*pid))
+        .count()
+}
+
+/// The run directories of the `hats run` parents still running, with their
+/// pids. Removes those of parents that are gone: one killed outright, or
+/// from before this cleanup, leaves its directory behind.
+fn parents(store: &Store) -> Vec<(u32, PathBuf)> {
+    let Ok(entries) = fs::read_dir(store.state.join("run")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let pid = entry.file_name().to_str()?.parse().ok()?;
+            if process::alive(pid) {
+                return Some((pid, entry.path()));
+            }
+            let _ = fs::remove_dir_all(entry.path());
+            None
+        })
+        .collect()
+}
+
+/// Removes the run directories of `hats run` parents that are gone.
+pub fn remove_stale(store: &Store) {
+    parents(store);
+}
+
+/// Interactive Claude Code sessions of this user with no `hats run` parent:
+/// nothing moves or closes them until they are opened again through hats.
+/// Reads the kernel's names, parents and arguments, never the environment.
+pub fn unsupervised() -> usize {
+    let Some(hats) = process::info(std::process::id()) else {
+        return 0;
+    };
+    process::all()
+        .into_iter()
+        .filter(|&pid| runs_without(pid, &hats))
+        .count()
+}
+
+/// Whether `pid` is an interactive Claude Code session of the user running
+/// `hats`, whose parent is not a process of the same name.
+fn runs_without(pid: u32, hats: &process::Info) -> bool {
+    process::info(pid).is_some_and(|p| {
+        p.uid == hats.uid
+            && p.tty
+            && may_be_claude(&p.name)
+            && process::args(pid).is_some_and(|a| is_claude_session(&a))
+            && process::info(p.ppid).is_none_or(|parent| parent.name != hats.name)
+    })
+}
+
+/// The kernel's name of a Claude Code process: the native install runs a
+/// file named after its version (`2.1.302`), npm's runs `node`.
+fn may_be_claude(name: &[u8]) -> bool {
+    name == b"claude"
+        || name == b"node"
+        || (!name.is_empty() && name.iter().all(|b| b.is_ascii_digit() || *b == b'.'))
+}
+
+/// `claude [options]`, or `node …/claude [options]`, that hats would keep a
+/// parent for: no subcommand or print mode. From NUL-separated arguments.
+fn is_claude_session(args: &[u8]) -> bool {
+    let named = |arg: Option<&[u8]>, name: &[u8]| {
+        arg.is_some_and(|a| a.rsplit(|b| *b == b'/').next() == Some(name))
+    };
+    let mut args = args.split(|b| *b == 0);
+    let first = args.next();
+    if !named(first, b"claude") && !(named(first, b"node") && named(args.next(), b"claude")) {
+        return false;
+    }
+    let rest: Vec<OsString> = args.map(|a| OsStr::from_bytes(a).to_owned()).collect();
+    relaunch::args(&rest, "probe").is_some()
 }
 
 /// When the agent last went quiet: its turn ended, or the session opened. The
@@ -172,6 +296,17 @@ impl Turn {
             bytes.extend_from_slice(t.as_os_str().as_bytes());
         }
         write_file(dir, "turn", &bytes)
+    }
+
+    /// When the session was last used: the later of `ended` and the
+    /// transcript's last write.
+    fn used(&self) -> SystemTime {
+        let ended = UNIX_EPOCH + Duration::from_millis(self.ended);
+        let written = self
+            .transcript
+            .as_ref()
+            .and_then(|t| fs::metadata(t).and_then(|m| m.modified()).ok());
+        written.map_or(ended, |w| w.max(ended))
     }
 
     fn read(dir: &Path) -> Option<Self> {
@@ -231,7 +366,7 @@ pub fn mark_idle(
     // A parent from before `turn` reads only this.
     fs::write(dir.join("idle"), turn.ended.to_string())?;
     if rate_limited && moves(config) {
-        write_request(&dir, &turn.session, Reason::Limit)?;
+        write_request(&dir, &limits_request(&turn.session, Reason::Limit))?;
     }
     wake(pid);
     Ok(())
@@ -351,6 +486,7 @@ pub fn supervise(
     // `hats config set` reaches running sessions at their next check.
     let current = || Config::load(&store.config).unwrap_or_else(|_| config.clone());
     let me = std::process::id();
+    remove_stale(store);
     let dir = fresh_run_dir(store, me).map_err(|e| e.to_string())?;
     let _cleanup = RemoveOnDrop(dir.clone());
 
@@ -377,6 +513,8 @@ pub fn supervise(
     let sentinel = Sentinel::spawn();
 
     loop {
+        // `hats use` asks only a parent on another account to move.
+        let _ = write_file(&dir, "account", account.label.as_bytes());
         let mut cmd = Command::new(account.harness.program());
         cmd.args(&args).env(PID_ENV, me.to_string());
         account.select(&mut cmd);
@@ -397,7 +535,13 @@ pub fn supervise(
         }
         let mut ending: Option<Ending> = None;
         // After a move the clock goes on from the last turn.
-        schedule_close(&dir, child.id(), current().close_idle, SystemTime::now());
+        schedule(
+            &dir,
+            child.id(),
+            current().close_idle,
+            None,
+            SystemTime::now(),
+        );
 
         let status = loop {
             match waited.wait() {
@@ -416,22 +560,15 @@ pub fn supervise(
                     },
                     ChildState::Running => {}
                 },
-                libc::SIGUSR1 if ending.is_none() => {
-                    let config = current();
-                    if moves(&config.claude) && turn_just_ended(&dir, SystemTime::now()) {
-                        ending = plan_move(store, &config.claude, &account, &dir);
-                        if ending.is_some() {
-                            // SAFETY: alarm(3) schedules SIGALRM, which is blocked and waited for.
-                            unsafe { libc::alarm(GRACE_SECS) };
-                            continue;
-                        }
-                    }
-                    schedule_close(&dir, child.id(), config.close_idle, SystemTime::now());
+                // Something was written to the run directory, or it is time
+                // to check the clock.
+                libc::SIGUSR1 | libc::SIGALRM if ending.is_none() => {
+                    ending = check(store, &current(), &account, &dir, &child);
                 }
                 libc::SIGUSR1 => {}
                 libc::SIGALRM => match ending.as_mut() {
-                    None => ending = close_if_due(&dir, current().close_idle, &child),
-                    Some(Ending {
+                    None
+                    | Some(Ending {
                         plan: Plan::Leave, ..
                     }) => {}
                     Some(e) if e.term_sent => {
@@ -442,7 +579,7 @@ pub fn supervise(
                     Some(e) => {
                         let config = current();
                         let hold = config.close_idle.unwrap_or(config::CLOSE_IDLE);
-                        if dir.join("idle").exists()
+                        if dir.join("turn").exists()
                             && !shell_running(child.id(), hold, SystemTime::now())
                         {
                             terminate(&child, e);
@@ -453,14 +590,22 @@ pub fn supervise(
                         if let Some(Ending {
                             plan:
                                 Plan::Move {
-                                    reason, session, ..
+                                    to,
+                                    reason,
+                                    session,
+                                    ..
                                 },
                             ..
                         }) = ending.take()
                         {
-                            let _ = write_request(&dir, &session, reason);
+                            let request = MoveRequest {
+                                session: Some(session),
+                                reason,
+                                to: (reason == Reason::Manual).then_some(to.label),
+                            };
+                            let _ = write_request(&dir, &request);
                         }
-                        schedule_close(&dir, child.id(), config.close_idle, SystemTime::now());
+                        schedule(&dir, child.id(), config.close_idle, None, SystemTime::now());
                     }
                 },
                 // The terminal closed or someone asked us to stop: pass it on,
@@ -504,7 +649,6 @@ pub fn supervise(
                 registry::append(&store.registry(), &line).map_err(|e| e.to_string())?;
                 args = relaunch::args(&args, &session).expect("checked before supervising");
                 account = to;
-                let _ = fs::remove_file(dir.join("idle"));
             }
             Some(Ending {
                 plan: Plan::Close { after, session },
@@ -557,9 +701,8 @@ fn shell_running(agent: u32, hold: Duration, now: SystemTime) -> bool {
 }
 
 /// How long until the session closes, and its id, if the agent is idle:
-/// `after` from its last use, the latest of its last turn's end, its
-/// transcript's last write and the use of the newest background shell, which
-/// started at `shell`. Zero when it is due.
+/// `after` from its last use, the later of `Turn::used` and the use of the
+/// newest background shell, which started at `shell`. Zero when it is due.
 fn time_to_close(
     dir: &Path,
     after: Duration,
@@ -567,27 +710,30 @@ fn time_to_close(
     now: SystemTime,
 ) -> Option<(Duration, String)> {
     let turn = Turn::read(dir)?;
-    let ended = UNIX_EPOCH + Duration::from_millis(turn.ended);
-    let written = turn
-        .transcript
-        .and_then(|t| fs::metadata(t).and_then(|m| m.modified()).ok());
     let running = shell.map(|started| in_use_until(started, after, now));
-    let used = [written, running]
-        .into_iter()
-        .flatten()
-        .fold(ended, SystemTime::max);
+    let used = running.map_or(turn.used(), |r| r.max(turn.used()));
     let left = used.checked_add(after).map_or(Duration::MAX, |due| {
         due.duration_since(now).unwrap_or_default()
     });
     Some((left, turn.session))
 }
 
-/// Sets the alarm for the next check of the clock for closing, at most
-/// `CHECK_SECS` away, or clears it while the agent is busy or closing is off.
-fn schedule_close(dir: &Path, agent: u32, after: Option<Duration>, now: SystemTime) {
-    let left = after.and_then(|after| time_to_close(dir, after, background::newest(agent), now));
-    let secs = match left {
-        Some((left, _)) => {
+/// Sets the alarm for the next check: when the session is due to close or,
+/// `move_in` from now, a move held back may start; at most `CHECK_SECS`
+/// away. Clears it when there is nothing to wait for: the agent is busy, or
+/// closing is off and no move waits.
+fn schedule(
+    dir: &Path,
+    agent: u32,
+    after: Option<Duration>,
+    move_in: Option<Duration>,
+    now: SystemTime,
+) {
+    let close = after
+        .and_then(|after| time_to_close(dir, after, background::newest(agent), now))
+        .map(|(left, _)| left);
+    let secs = match close.into_iter().chain(move_in).min() {
+        Some(left) => {
             let whole = left
                 .as_secs()
                 .saturating_add(u64::from(left.subsec_nanos() > 0));
@@ -599,10 +745,27 @@ fn schedule_close(dir: &Path, agent: u32, after: Option<Duration>, now: SystemTi
     unsafe { libc::alarm(secs) };
 }
 
-/// At a check of the clock: ends the agent if the session went unused for
-/// `after`, else sets the next check.
-fn close_if_due(dir: &Path, after: Option<Duration>, child: &Child) -> Option<Ending> {
+/// At a wake or a check of the clock: starts a move if one was asked for and
+/// may start now, else ends the agent if the session went unused for
+/// `close_idle`, else sets the next check.
+fn check(
+    store: &Store,
+    config: &Config,
+    account: &Account,
+    dir: &Path,
+    child: &Child,
+) -> Option<Ending> {
     let now = SystemTime::now();
+    let move_in = match plan_move(store, &config.claude, account, dir, now) {
+        Next::Start(ending) => {
+            // SAFETY: alarm(3) schedules SIGALRM, which is blocked and waited for.
+            unsafe { libc::alarm(GRACE_SECS) };
+            return Some(ending);
+        }
+        Next::After(wait) => Some(wait),
+        Next::Nothing => None,
+    };
+    let after = config.close_idle;
     if let Some(after) = after
         && let Some((left, session)) =
             time_to_close(dir, after, background::newest(child.id()), now)
@@ -615,16 +778,18 @@ fn close_if_due(dir: &Path, after: Option<Duration>, child: &Child) -> Option<En
         terminate(child, &mut ending);
         return Some(ending);
     }
-    schedule_close(dir, child.id(), after, now);
+    schedule(dir, child.id(), after, move_in, now);
     None
 }
 
-/// Whether the agent is idle and its turn ended within `MOVE_WINDOW_MS`.
-fn turn_just_ended(dir: &Path, now: SystemTime) -> bool {
-    fs::read_to_string(dir.join("idle"))
-        .ok()
-        .and_then(|ended| ended.trim().parse::<u64>().ok())
-        .is_some_and(|ended| unix_millis(now).saturating_sub(ended) < MOVE_WINDOW_MS)
+/// What becomes of the move asked for in `move.json`.
+enum Next {
+    Start(Ending),
+    /// It may start then if the session stays unused.
+    After(Duration),
+    /// None was asked for, it waits for the agent's turn to end, or it was
+    /// dropped: moves are off, or there is no account to move to.
+    Nothing,
 }
 
 fn plan_move(
@@ -632,23 +797,79 @@ fn plan_move(
     config: &HarnessConfig,
     account: &Account,
     dir: &Path,
-) -> Option<Ending> {
-    let bytes = fs::read(dir.join("move.json")).ok()?;
-    let _ = fs::remove_file(dir.join("move.json"));
-    let request: MoveRequest = serde_json::from_slice(&bytes).ok()?;
-    let statuses = auto::statuses(store, account.harness, config).ok()?;
-    let forced = (request.reason == Reason::Limit).then_some(Reason::Limit);
-    let (to, reason) =
-        auto::next_account(&statuses, &account.label, config, SystemTime::now(), forced)?;
-    Some(Ending {
+    now: SystemTime,
+) -> Next {
+    let Ok(bytes) = fs::read(dir.join("move.json")) else {
+        return Next::Nothing;
+    };
+    let discard = || {
+        let _ = fs::remove_file(dir.join("move.json"));
+        Next::Nothing
+    };
+    let Ok(request) = serde_json::from_slice::<MoveRequest>(&bytes) else {
+        return discard();
+    };
+    let chosen = request.reason == Reason::Manual;
+    let allowed = if chosen {
+        config.relaunch == Relaunch::Idle
+    } else {
+        moves(config)
+    };
+    if !allowed {
+        return discard();
+    }
+    // In a turn: `Stop` wakes this parent again when it ends.
+    let Some(turn) = Turn::read(dir) else {
+        return Next::Nothing;
+    };
+    let unused = unix_millis(now).saturating_sub(unix_millis(turn.used()));
+    if !chosen && (MOVE_WINDOW_MS..UNUSED_MS).contains(&unused) {
+        return Next::After(Duration::from_millis(UNUSED_MS - unused));
+    }
+    let destination = if chosen {
+        chosen_account(store, account, request.to.as_deref())
+    } else {
+        next_account(store, config, account, request.reason, now)
+    };
+    discard();
+    let Some((to, id, reason)) = destination else {
+        return Next::Nothing;
+    };
+    Next::Start(Ending {
         plan: Plan::Move {
-            to: to.account.clone(),
-            id: to.id.clone()?,
+            to,
+            id,
             reason,
-            session: request.session,
+            session: request.session.unwrap_or(turn.session),
         },
         term_sent: false,
     })
+}
+
+/// The account the user chose, with its id, if it is another and signed in.
+fn chosen_account(
+    store: &Store,
+    from: &Account,
+    label: Option<&str>,
+) -> Option<(Account, String, Reason)> {
+    let to = Account::find(from.harness, label?, store).ok()?;
+    let id = to.provider_id(store).ok()??;
+    (to.dir != from.dir).then_some((to, id, Reason::Manual))
+}
+
+/// The account the switching policy moves `from` to, with its id, if `from`
+/// must leave: a limit hit forces it.
+fn next_account(
+    store: &Store,
+    config: &HarnessConfig,
+    from: &Account,
+    reason: Reason,
+    now: SystemTime,
+) -> Option<(Account, String, Reason)> {
+    let statuses = auto::statuses(store, from.harness, config).ok()?;
+    let forced = (reason == Reason::Limit).then_some(Reason::Limit);
+    let (to, reason) = auto::next_account(&statuses, &from.label, config, now, forced)?;
+    Some((to.account.clone(), to.id.clone()?, reason))
 }
 
 /// The terminal settings from before the agent started. Claude Code resets
@@ -811,23 +1032,229 @@ mod tests {
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
     }
 
-    #[test]
-    fn a_move_starts_only_right_after_a_turn_ends() {
-        use std::time::Duration;
-        let dir = tempfile::tempdir().unwrap();
-        let now = SystemTime::now();
-        let ended = |ago_ms: u64| {
-            let at = unix_millis(now - Duration::from_millis(ago_ms));
-            fs::write(dir.path().join("idle"), at.to_string()).unwrap();
-            turn_just_ended(dir.path(), now)
+    fn signed_in(store: &Store, label: &str, used: f64) -> Account {
+        let account = Account::managed(Harness::Claude, label, store).unwrap();
+        account.create(store).unwrap();
+        fs::write(
+            account.dir.join(".claude.json"),
+            format!(r#"{{"oauthAccount":{{"accountUuid":"{label}","organizationUuid":"o"}}}}"#),
+        )
+        .unwrap();
+        let id = account.provider_id(store).unwrap().unwrap();
+        let window = crate::limits::LimitWindow {
+            name: "five_hour".to_owned(),
+            used_percent: used,
+            resets_at: crate::limits::unix_secs(SystemTime::now()) + 3600,
         };
-        assert!(ended(0));
-        assert!(ended(MOVE_WINDOW_MS - 1));
-        assert!(!ended(MOVE_WINDOW_MS));
-        fs::write(dir.path().join("idle"), b"").unwrap();
-        assert!(!turn_just_ended(dir.path(), now), "no time, no move");
-        fs::remove_file(dir.path().join("idle")).unwrap();
-        assert!(!turn_just_ended(dir.path(), now), "busy");
+        crate::limits::save(store, &account, &id, vec![window], SystemTime::now()).unwrap();
+        account
+    }
+
+    #[test]
+    fn a_move_waits_for_the_session_to_be_left_alone_unless_the_user_chose() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::from_env(|k| (k == "HOME").then(|| tmp.path().into())).unwrap();
+        let work = signed_in(&store, "work", 95.0);
+        signed_in(&store, "side", 10.0);
+        let dir = tmp.path().join("run");
+        fs::create_dir_all(&dir).unwrap();
+        let now = UNIX_EPOCH + Duration::from_millis(unix_millis(SystemTime::now()));
+        let sec = Duration::from_secs(1);
+        let limits = limits_request("s-1", Reason::Threshold);
+        let chosen = |label: &str| MoveRequest {
+            session: None,
+            reason: Reason::Manual,
+            to: Some(label.to_owned()),
+        };
+        // What becomes of `request` when the session went quiet `ago`
+        // (`None`: in a turn): where it moves, or after how long it may.
+        let plan = |config: &HarnessConfig, request: &MoveRequest, ago: Option<Duration>| {
+            write_request(&dir, request).unwrap();
+            let _ = fs::remove_file(dir.join("turn"));
+            if let Some(ago) = ago {
+                Turn::new("s-1".into(), None, now - ago)
+                    .write(&dir)
+                    .unwrap();
+            }
+            let next = match plan_move(&store, config, &work, &dir, now) {
+                Next::Start(Ending {
+                    plan:
+                        Plan::Move {
+                            to,
+                            reason,
+                            session,
+                            ..
+                        },
+                    ..
+                }) => format!("{} {reason:?} {session}", to.label),
+                Next::After(wait) => format!("after {wait:?}"),
+                Next::Start(_) => unreachable!("only moves are planned"),
+                Next::Nothing => "nothing".to_owned(),
+            };
+            let kept = dir.join("move.json").exists();
+            (next, kept)
+        };
+        let auto = HarnessConfig::default();
+        let start = |to: &str, why: &str| (format!("{to} {why} s-1"), false);
+
+        assert_eq!(
+            plan(&auto, &limits, Some(sec / 2)),
+            start("side", "Threshold")
+        );
+        // The user may be typing the next prompt: it would be lost.
+        assert_eq!(
+            plan(&auto, &limits, Some(30 * sec)),
+            ("after 30s".into(), true)
+        );
+        assert_eq!(
+            plan(&auto, &limits, Some(61 * sec)),
+            start("side", "Threshold")
+        );
+        assert_eq!(plan(&auto, &limits, None), ("nothing".into(), true), "busy");
+        // The user chose elsewhere: at once, but never during a turn.
+        assert_eq!(
+            plan(&auto, &chosen("side"), Some(30 * sec)),
+            start("side", "Manual")
+        );
+        assert_eq!(plan(&auto, &chosen("side"), None), ("nothing".into(), true));
+        assert_eq!(
+            plan(&auto, &chosen("work"), Some(sec)),
+            ("nothing".into(), false)
+        );
+        assert_eq!(
+            plan(&auto, &chosen("gone"), Some(sec)),
+            ("nothing".into(), false)
+        );
+
+        // Manual mode: only the user's choice moves; relaunch off: nothing.
+        let manual = HarnessConfig {
+            mode: Mode::Manual,
+            ..HarnessConfig::default()
+        };
+        assert_eq!(
+            plan(&manual, &limits, Some(sec / 2)),
+            ("nothing".into(), false)
+        );
+        assert_eq!(
+            plan(&manual, &chosen("side"), Some(sec)),
+            start("side", "Manual")
+        );
+        let off = HarnessConfig {
+            relaunch: Relaunch::Off,
+            ..HarnessConfig::default()
+        };
+        assert_eq!(
+            plan(&off, &chosen("side"), Some(sec)),
+            ("nothing".into(), false)
+        );
+        assert_eq!(move_running(&store, &off, &work), 0);
+    }
+
+    #[test]
+    fn removes_only_the_run_directories_of_parents_that_are_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::from_env(|k| (k == "HOME").then(|| tmp.path().into())).unwrap();
+        let mut gone = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        gone.wait().unwrap();
+        let live = run_dir(&store, std::process::id());
+        let dead = run_dir(&store, gone.id());
+        for dir in [&live, &dead] {
+            fs::create_dir_all(dir).unwrap();
+            fs::write(dir.join("idle"), b"1").unwrap();
+        }
+        fs::create_dir_all(store.state.join("run/not-a-pid")).unwrap();
+
+        remove_stale(&store);
+        assert!(live.join("idle").exists(), "a live parent keeps its own");
+        assert!(!dead.exists());
+        assert!(store.state.join("run/not-a-pid").exists(), "not ours");
+    }
+
+    #[test]
+    fn finds_a_claude_code_session_in_a_terminal_by_its_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join("claude");
+        // Copied by another process: on Linux a file this one held open for
+        // writing could not be run (see `common::write_program`).
+        let copied = std::process::Command::new("cp")
+            .arg("/bin/sleep")
+            .arg(&claude)
+            .status()
+            .unwrap();
+        assert!(copied.success());
+        // macOS kills a copy of a system program unless it is signed again.
+        #[cfg(target_os = "macos")]
+        assert!(
+            std::process::Command::new("/usr/bin/codesign")
+                .args(["-s", "-", "-f"])
+                .arg(&claude)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let (mut master, mut slave) = (0, 0);
+        // SAFETY: openpty fills two descriptors, closed below.
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, 0);
+        let mut cmd = std::process::Command::new(&claude);
+        cmd.arg("30");
+        // SAFETY: only async-signal-safe calls between fork and exec: a new
+        // session whose controlling terminal is the pseudo-terminal.
+        unsafe {
+            cmd.pre_exec(move || {
+                libc::setsid();
+                libc::ioctl(slave, libc::TIOCSCTTY as _, 0);
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id();
+        let me = process::info(std::process::id()).unwrap();
+        // Until it has exec'd, the kernel shows this process's name.
+        let named = (0..100).any(|_| {
+            std::thread::sleep(Duration::from_millis(10));
+            process::info(pid).is_some_and(|p| p.name == b"claude" && p.tty)
+        });
+        let hats = process::Info {
+            name: b"hats".to_vec(),
+            ..process::info(std::process::id()).unwrap()
+        };
+        let found = (named, runs_without(pid, &hats), runs_without(pid, &me));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        // SAFETY: the descriptors from openpty.
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
+        // Its parent, this test, is named like the `me` it is checked against.
+        assert_eq!(found, (true, true, false));
+    }
+
+    #[test]
+    fn tells_an_interactive_claude_code_session() {
+        let session = |args: &[&str]| is_claude_session(args.join("\0").as_bytes());
+        assert!(session(&["claude"]));
+        assert!(session(&["/opt/bin/claude", "--model", "opus", "fix it"]));
+        assert!(session(&["node", "/usr/local/bin/claude", "-c"]));
+        assert!(!session(&["claude", "-p", "hi"]), "print mode");
+        assert!(!session(&["claude", "mcp", "serve"]), "a subcommand");
+        assert!(!session(&["node", "server.js"]));
+        assert!(!session(&["/bin/zsh", "-c", "claude"]));
+        assert!(may_be_claude(b"2.1.302") && may_be_claude(b"claude") && may_be_claude(b"node"));
+        assert!(!may_be_claude(b"zsh") && !may_be_claude(b"") && !may_be_claude(b"hats"));
     }
 
     #[test]
@@ -849,9 +1276,28 @@ mod tests {
         file.set_modified(now - hour).unwrap();
         assert_eq!(left(2 * hour), Some(hour), "a newer write restarts it");
         assert_eq!(left(Duration::MAX), Some(Duration::MAX), "never due");
-        schedule_close(dir.path(), std::process::id(), Some(Duration::MAX), now);
+        schedule(
+            dir.path(),
+            std::process::id(),
+            Some(Duration::MAX),
+            None,
+            now,
+        );
         // SAFETY: reads and clears the alarm just set.
         assert_eq!(unsafe { libc::alarm(0) }, CHECK_SECS as u32);
+        let soon = Some(Duration::from_millis(89_500));
+        schedule(
+            dir.path(),
+            std::process::id(),
+            Some(Duration::MAX),
+            soon,
+            now,
+        );
+        // SAFETY: reads and clears the alarm just set.
+        assert_eq!(unsafe { libc::alarm(0) }, 90, "a move held back is sooner");
+        schedule(dir.path(), std::process::id(), None, None, now);
+        // SAFETY: reads and clears the alarm, which nothing set.
+        assert_eq!(unsafe { libc::alarm(0) }, 0, "nothing to wait for");
         fs::remove_file(&transcript).unwrap();
         assert_eq!(left(4 * hour), Some(hour), "no transcript: the turn's end");
 
