@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::usage::accounts::{Book, SwitchLine, parse_switch_log};
+use crate::usage::tally::Sum;
 
 fn utc_day_of(ms: i64) -> Day {
     Day(ms.div_euclid(86_400_000) as i32)
@@ -190,7 +191,7 @@ fn the_seen_set_survives_a_save_so_a_later_copy_still_counts_once() {
     let state = f.home().join("state");
     fs::create_dir_all(&state).unwrap();
     f.tally.save(&state, 20_463).unwrap();
-    f.tally = Tally::load(&state, Day::parse("2026-01-10").unwrap());
+    f.tally = Tally::load(&state, Day::parse("2026-01-10").unwrap()).unwrap();
     f.write(&f.project.join("s2.jsonl"), &row);
     let r = f.run();
     assert_eq!((r.rows, r.duplicates, r.read), (0, 1, 1));
@@ -490,7 +491,7 @@ fn a_save_cut_short_leaves_the_last_whole_one() {
     )
     .unwrap();
     fs::write(state.join("seen.2.bin"), b"junk").unwrap();
-    f.tally = Tally::load(&state, Day::parse("2026-01-10").unwrap());
+    f.tally = Tally::load(&state, Day::parse("2026-01-10").unwrap()).unwrap();
     f.append(
         &file,
         &line(&assistant("msg_2", "b", "2026-01-10T12:01:00.000Z")),
@@ -504,7 +505,7 @@ fn a_save_cut_short_leaves_the_last_whole_one() {
         .collect();
     names.sort();
     assert_eq!(names, ["scan.2.json", "seen.2.bin", "totals.json"]);
-    let reloaded = Tally::load(&state, Day::parse("2026-01-10").unwrap());
+    let reloaded = Tally::load(&state, Day::parse("2026-01-10").unwrap()).unwrap();
     assert_eq!(named(&reloaded.totals), named(&f.tally.totals));
     assert_eq!(named(&reloaded.totals)[0].1[0], 2);
 }
@@ -535,7 +536,25 @@ fn a_seen_set_whose_size_does_not_match_its_count_is_not_trusted() {
     f.tally.save(&state, 20_463).unwrap();
     // A count of four billion keys in a file of four bytes.
     fs::write(state.join("seen.1.bin"), u32::MAX.to_le_bytes()).unwrap();
-    let tally = Tally::load(&state, Day::parse("2026-01-10").unwrap());
+    let tally = Tally::load(&state, Day::parse("2026-01-10").unwrap()).unwrap();
     assert_eq!(tally.seen.count, 0);
     assert_eq!(named(&tally.totals), named(&f.tally.totals));
+}
+
+#[test]
+fn a_token_count_no_request_could_have_counts_zero() {
+    let mut f = Fixture::new();
+    let garbage = |id: &str, req: &str| {
+        line(&assistant(id, req, "2026-01-10T12:00:00.000Z")).replace(
+            r#""input_tokens":10"#,
+            r#""input_tokens":99999999999999999999"#,
+        )
+    };
+    f.write(
+        &f.project.join("s1.jsonl"),
+        &(garbage("msg_1", "a") + &garbage("msg_2", "b")),
+    );
+    let r = f.run();
+    assert_eq!((r.rows, r.fallback), (2, 0));
+    assert_eq!(f.sum(Harness::Claude), [2, 0, 100, 400, 200, 2000, 0]);
 }

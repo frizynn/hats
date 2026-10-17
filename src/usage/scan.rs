@@ -4,22 +4,21 @@
 //! Only bytes appended since the last scan are read, and only whole lines: a
 //! half-written tail is read again next time. Rows are found by byte markers
 //! and their fields read in place (`bytes.rs`); a row the fast path cannot
-//! vouch for is parsed whole. Four threads read four logs at a time (the scan
-//! waits on the disk; more threads did not help), and their rows are counted
-//! in log order, so which copy of a repeated message counts does not depend
-//! on which thread finished first.
+//! vouch for is parsed whole. Several threads read a log each (`THREADS` in
+//! `mod.rs` says how many and why), and their rows are counted in log order,
+//! so which copy of a repeated message counts does not depend on which thread
+//! finished first.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
-use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, mpsc};
 use std::time::Instant;
 
 use memchr::{memchr, memmem, memrchr};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use super::Day;
 use super::accounts::{Book, CODEX_UNASSIGNED, codex_account};
@@ -28,401 +27,8 @@ use super::bytes::{
     text, top_level_fields, uint_at,
 };
 use super::repos::repo_of;
+use super::tally::{FileEntry, Key, Listing, ScanState, Seen, Tally, Totals};
 use crate::account::Harness;
-
-/// Requests, input, output, cache write 5 min, cache write 1 h, cache read,
-/// reasoning: Nenu's columns.
-pub type Sum = [u64; 7];
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Key {
-    pub day: Day,
-    pub harness: Harness,
-    pub account: u32,
-    pub model: u32,
-    pub repo: u32,
-}
-
-/// Daily totals, with account, model and project names kept once.
-#[derive(Default)]
-pub struct Totals {
-    /// First day hats kept totals of its own.
-    pub tracked_from: Day,
-    /// Earliest day any log had.
-    pub logs_from: Option<Day>,
-    names: Vec<String>,
-    index: HashMap<String, u32>,
-    pub sums: HashMap<Key, Sum>,
-    /// Project key to folder name.
-    pub repos: HashMap<String, String>,
-    files: Option<Generation>,
-}
-
-impl Totals {
-    pub fn name(&self, id: u32) -> &str {
-        &self.names[id as usize]
-    }
-
-    fn intern(&mut self, name: &str) -> u32 {
-        if let Some(&id) = self.index.get(name) {
-            return id;
-        }
-        let id = self.names.len() as u32;
-        self.names.push(name.to_owned());
-        self.index.insert(name.to_owned(), id);
-        id
-    }
-
-    fn add(&mut self, key: Key, tokens: &[u64; 6]) {
-        let sum = self.sums.entry(key).or_default();
-        sum[0] += 1;
-        for (s, t) in sum[1..].iter_mut().zip(tokens) {
-            *s += t;
-        }
-        if self.logs_from.is_none_or(|d| key.day < d) {
-            self.logs_from = Some(key.day);
-        }
-    }
-}
-
-/// What a scan remembers per log. Claude logs by path; Codex rollouts by id,
-/// because Codex moves them to `archived_sessions/`.
-#[derive(Clone, Default, Serialize, Deserialize)]
-pub struct FileEntry {
-    /// Bytes consumed, whole lines only.
-    o: u64,
-    /// Size at the last scan.
-    s: u64,
-    /// Project key.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    r: Option<String>,
-    /// Codex: model, account and cumulative totals so far.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    m: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    a: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    t: Option<[u64; 5]>,
-}
-
-/// A directory's mtime (ns), subdirectories and logs: an unchanged directory
-/// is not listed again.
-#[derive(Clone, Serialize, Deserialize)]
-struct Listing(i64, Vec<String>, Vec<String>);
-
-#[derive(Default, Serialize, Deserialize)]
-pub struct ScanState {
-    v: u32,
-    files: HashMap<String, FileEntry>,
-    dirs: HashMap<String, Listing>,
-    /// cwd to project key.
-    cwds: HashMap<String, String>,
-}
-
-/// Claude message keys already counted, so a response written once per
-/// content block, or copied into another transcript, counts once. Open
-/// addressing over two arrays: 10 bytes a slot instead of a map's entry.
-pub struct Seen {
-    keys: Vec<u64>,
-    /// Days since 1970 (UTC) of each key, to forget old ones when saving.
-    days: Vec<u16>,
-    count: usize,
-    added: usize,
-}
-
-impl Default for Seen {
-    fn default() -> Self {
-        Self::with_capacity(0)
-    }
-}
-
-impl Seen {
-    /// Room for `n` keys at most three quarters full.
-    fn with_capacity(n: usize) -> Self {
-        let size = (n * 4 / 3 + 1).next_power_of_two().max(1024);
-        Self {
-            keys: vec![0; size],
-            days: vec![0; size],
-            count: 0,
-            added: 0,
-        }
-    }
-
-    /// True when `key` was new and is now counted.
-    pub fn add(&mut self, key: u64, day: u16) -> bool {
-        let new = self.insert(key, day);
-        self.added += usize::from(new);
-        new
-    }
-
-    fn insert(&mut self, key: u64, day: u16) -> bool {
-        let mask = self.keys.len() - 1;
-        let mut i = (key.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 32) as usize & mask;
-        loop {
-            match self.keys[i] {
-                k if k == key => return false,
-                0 => break,
-                _ => i = (i + 1) & mask,
-            }
-        }
-        self.keys[i] = key;
-        self.days[i] = day;
-        self.count += 1;
-        // At most three quarters full, so a probe stays short.
-        if self.count * 4 > self.keys.len() * 3 {
-            let keys = std::mem::take(&mut self.keys);
-            let days = std::mem::take(&mut self.days);
-            *self = Self {
-                keys: vec![0; keys.len() * 2],
-                days: vec![0; keys.len() * 2],
-                count: 0,
-                added: self.added,
-            };
-            for (k, d) in keys.into_iter().zip(days) {
-                if k != 0 {
-                    self.insert(k, d);
-                }
-            }
-        }
-        true
-    }
-
-    /// `[u32 count]` and that many `[u64 key][u16 day]`, without keys older
-    /// than `keep` days before `today`.
-    fn write(&self, out: &mut impl Write, today: u16, keep: u16) -> io::Result<()> {
-        let cutoff = today.saturating_sub(keep);
-        let live = || {
-            self.keys
-                .iter()
-                .zip(&self.days)
-                .filter(move |(k, d)| **k != 0 && **d >= cutoff)
-        };
-        out.write_all(&(live().count() as u32).to_le_bytes())?;
-        for (k, d) in live() {
-            out.write_all(&k.to_le_bytes())?;
-            out.write_all(&d.to_le_bytes())?;
-        }
-        Ok(())
-    }
-
-    fn read(file: File) -> io::Result<Self> {
-        let len = file.metadata()?.len();
-        let mut input = io::BufReader::new(file);
-        let mut n = [0; 4];
-        input.read_exact(&mut n)?;
-        let n = u32::from_le_bytes(n) as usize;
-        if len != 4 + n as u64 * 10 {
-            return Err(io::ErrorKind::InvalidData.into());
-        }
-        let mut seen = Self::with_capacity(n);
-        let mut record = [0; 10];
-        for _ in 0..n {
-            input.read_exact(&mut record)?;
-            let (k, d) = record.split_at(8);
-            seen.insert(
-                u64::from_le_bytes(k.try_into().expect("8 bytes")),
-                u16::from_le_bytes(d.try_into().expect("2 bytes")),
-            );
-        }
-        Ok(seen)
-    }
-}
-
-/// The save these totals belong to: they were counted with
-/// `scan.<gen>.json` and `seen.<seen>.bin`.
-#[derive(Clone, Copy, Serialize, Deserialize)]
-struct Generation {
-    scan: u64,
-    seen: u64,
-}
-
-/// Totals, offsets and the seen set: everything a scan reads and saves.
-pub struct Tally {
-    pub totals: Totals,
-    state: ScanState,
-    seen: Seen,
-}
-
-/// Days of message keys kept for deduplication across logs; Claude Code
-/// deletes transcripts after 30.
-const SEEN_DAYS: u16 = 90;
-
-#[derive(Serialize, Deserialize)]
-struct TotalsFile {
-    v: u32,
-    #[serde(rename = "trackedFrom")]
-    tracked_from: String,
-    #[serde(rename = "logsFrom", default, skip_serializing_if = "Option::is_none")]
-    logs_from: Option<String>,
-    /// Day to `<harness>|<account>|<model>|<project>` to sum.
-    days: std::collections::BTreeMap<String, HashMap<String, Sum>>,
-    repos: HashMap<String, String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    files: Option<Generation>,
-}
-
-impl Tally {
-    pub fn empty(today: Day) -> Self {
-        Self {
-            totals: Totals {
-                tracked_from: today,
-                ..Totals::default()
-            },
-            state: ScanState {
-                v: 1,
-                ..ScanState::default()
-            },
-            seen: Seen::default(),
-        }
-    }
-
-    /// What the last save left, or an empty tally when there is none: totals
-    /// without the offsets they were counted with would count logs twice.
-    pub fn load(dir: &Path, today: Day) -> Self {
-        let read = |name: &str| fs::read(dir.join(name)).ok();
-        let Some(totals) = read("totals.json")
-            .and_then(|b| serde_json::from_slice::<TotalsFile>(&b).ok())
-            .filter(|t| t.v == 1)
-        else {
-            return Self::empty(today);
-        };
-        let Some(files) = totals.files else {
-            return Self::empty(today);
-        };
-        let Some(state) = read(&format!("scan.{}.json", files.scan))
-            .and_then(|b| serde_json::from_slice::<ScanState>(&b).ok())
-            .filter(|s| s.v == 1)
-        else {
-            return Self::empty(today);
-        };
-        let seen = File::open(dir.join(format!("seen.{}.bin", files.seen)))
-            .and_then(Seen::read)
-            .unwrap_or_default();
-        let mut out = Self {
-            totals: Totals {
-                tracked_from: Day::parse(&totals.tracked_from).unwrap_or(today),
-                logs_from: totals.logs_from.as_deref().and_then(Day::parse),
-                repos: totals.repos,
-                files: Some(files),
-                ..Totals::default()
-            },
-            state,
-            seen,
-        };
-        for (day, sums) in totals.days {
-            let Some(day) = Day::parse(&day) else {
-                continue;
-            };
-            for (key, sum) in sums {
-                let mut parts = key.splitn(4, '|');
-                let (Some(harness), Some(account), Some(model), Some(repo)) =
-                    (parts.next(), parts.next(), parts.next(), parts.next())
-                else {
-                    continue;
-                };
-                let harness = match harness {
-                    "claude" => Harness::Claude,
-                    "codex" => Harness::Codex,
-                    _ => continue,
-                };
-                let t = &mut out.totals;
-                let key = Key {
-                    day,
-                    harness,
-                    account: t.intern(account),
-                    model: t.intern(model),
-                    repo: t.intern(repo),
-                };
-                t.sums.insert(key, sum);
-            }
-        }
-        out
-    }
-
-    /// One rename commits a save: the offsets and the seen set go to new
-    /// names first, and `totals.json`, which names them, goes last. A scan
-    /// stopped anywhere leaves the last save whole, so a log is never counted
-    /// twice or skipped.
-    pub fn save(&mut self, dir: &Path, today_utc: u16) -> io::Result<()> {
-        let put = |name: &str,
-                   write: &dyn Fn(&mut io::BufWriter<File>) -> io::Result<()>|
-         -> io::Result<()> {
-            let tmp = dir.join(format!("{name}.tmp"));
-            let file = fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)?;
-            let mut out = io::BufWriter::new(file);
-            write(&mut out)?;
-            out.flush()?;
-            fs::rename(tmp, dir.join(name))
-        };
-        let prev = self.totals.files;
-        let scan = prev.map_or(0, |p| p.scan) + 1;
-        let seen = match prev {
-            Some(p) if self.seen.added == 0 => p.seen,
-            _ => scan,
-        };
-        if seen == scan {
-            put(&format!("seen.{scan}.bin"), &|out| {
-                self.seen.write(out, today_utc, SEEN_DAYS)
-            })?;
-        }
-        put(&format!("scan.{scan}.json"), &|out| {
-            serde_json::to_writer(out, &self.state).map_err(io::Error::other)
-        })?;
-        let t = &self.totals;
-        let mut days: std::collections::BTreeMap<String, HashMap<String, Sum>> = Default::default();
-        for (key, sum) in &t.sums {
-            let name = format!(
-                "{}|{}|{}|{}",
-                key.harness.name(),
-                t.name(key.account),
-                t.name(key.model),
-                t.name(key.repo)
-            );
-            days.entry(key.day.to_string())
-                .or_default()
-                .insert(name, *sum);
-        }
-        let file = TotalsFile {
-            v: 1,
-            tracked_from: t.tracked_from.to_string(),
-            logs_from: t.logs_from.map(|d| d.to_string()),
-            days,
-            repos: t.repos.clone(),
-            files: Some(Generation { scan, seen }),
-        };
-        put("totals.json", &|out| {
-            serde_json::to_writer(out, &file).map_err(io::Error::other)
-        })?;
-        self.totals.files = Some(Generation { scan, seen });
-        self.seen.added = 0;
-        // What this save replaced, and what a stopped one left behind.
-        for entry in fs::read_dir(dir)?.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let keep = |prefix: &str, n: u64| {
-                name.strip_prefix(prefix)
-                    .and_then(|rest| rest.split('.').next())
-                    .is_none_or(|g| g.parse() != Ok(n))
-            };
-            let stale = if name.starts_with("scan.") {
-                keep("scan.", scan)
-            } else if name.starts_with("seen.") {
-                keep("seen.", seen)
-            } else {
-                false
-            };
-            if stale {
-                let _ = fs::remove_file(entry.path());
-            }
-        }
-        Ok(())
-    }
-}
 
 /// Where to look: each Claude config dir's `projects` (one per real
 /// directory, since hats' accounts link theirs to one place) and each Codex
@@ -504,12 +110,8 @@ struct Done {
     index: usize,
     harness: Harness,
     entry: Option<FileEntry>,
-    ctxs: Vec<Ctx>,
-    rows: Vec<Row>,
     bytes: u64,
-    duplicates: u64,
-    fallback: u64,
-    skipped: u64,
+    out: Out,
 }
 
 pub fn scan(tally: &mut Tally, input: &Input) -> Stats {
@@ -571,11 +173,12 @@ pub fn scan(tally: &mut Tally, input: &Input) -> Stats {
 }
 
 fn count(totals: &mut Totals, seen: &mut Seen, done: &Done, stats: &mut Stats) {
+    let out = &done.out;
     stats.bytes += done.bytes;
-    stats.duplicates += done.duplicates;
-    stats.fallback += done.fallback;
-    stats.skipped += done.skipped;
-    let ids: Vec<(u32, u32, u32)> = done
+    stats.duplicates += out.duplicates;
+    stats.fallback += out.fallback;
+    stats.skipped += out.skipped;
+    let ids: Vec<(u32, u32, u32)> = out
         .ctxs
         .iter()
         .map(|c| {
@@ -586,7 +189,7 @@ fn count(totals: &mut Totals, seen: &mut Seen, done: &Done, stats: &mut Stats) {
             )
         })
         .collect();
-    for row in &done.rows {
+    for row in &out.rows {
         if row.key != 0 && !seen.add(row.key, row.utc_day) {
             stats.duplicates += 1;
             continue;
@@ -610,17 +213,17 @@ fn queue(state: &mut ScanState, input: &Input, stats: &mut Stats) -> Vec<Job> {
     let mut live_dirs = HashSet::new();
     let mut live_files = HashSet::new();
     let mut jobs = Vec::new();
-    let mut push = |state: &ScanState, path: PathBuf, key: String, job: Job| {
+    let mut push = |state: &ScanState, job: Job| {
         stats.files += 1;
-        if !live_files.insert(key.clone()) {
+        if !live_files.insert(job.key.clone()) {
             return;
         }
-        let Ok(size) = fs::metadata(&path).map(|m| m.len()) else {
+        let Ok(size) = fs::metadata(&job.path).map(|m| m.len()) else {
             return;
         };
         if state
             .files
-            .get(&key)
+            .get(&job.key)
             .is_some_and(|e| e.s == size && e.o <= size)
         {
             return;
@@ -642,14 +245,14 @@ fn queue(state: &mut ScanState, input: &Input, stats: &mut Stats) -> Vec<Job> {
             .map(|s| s.to_string_lossy().into_owned());
             let key = path.to_string_lossy().into_owned();
             let job = Job {
-                path: path.clone(),
-                key: key.clone(),
+                path,
+                key,
                 size: 0,
                 harness: Harness::Claude,
                 config_dir: config_dir.clone(),
                 session,
             };
-            push(state, path, key, job);
+            push(state, job);
         }
     }
     for home in &input.roots.codex {
@@ -662,14 +265,14 @@ fn queue(state: &mut ScanState, input: &Input, stats: &mut Stats) -> Vec<Job> {
                 let id = path.file_stem().unwrap_or_default().to_string_lossy();
                 let key = format!("codex:{id}");
                 let job = Job {
-                    path: path.clone(),
-                    key: key.clone(),
+                    path,
+                    key,
                     size: 0,
                     harness: Harness::Codex,
                     config_dir: home.to_string_lossy().into_owned(),
                     session: None,
                 };
-                push(state, path, key, job);
+                push(state, job);
             }
         }
     }
@@ -826,6 +429,10 @@ struct Reader<'a> {
     repos: &'a Mutex<Repos>,
     buf: Vec<u8>,
     days: HashMap<i64, Day>,
+    /// Keys of the log being read already in its rows: a response is
+    /// written once per content block, and only its first row needs to
+    /// reach the count.
+    keys: HashSet<u64>,
 }
 
 impl<'a> Reader<'a> {
@@ -835,6 +442,7 @@ impl<'a> Reader<'a> {
             repos,
             buf: vec![0; input.chunk],
             days: HashMap::new(),
+            keys: HashSet::new(),
         }
     }
 
@@ -861,27 +469,16 @@ impl<'a> Reader<'a> {
     }
 
     fn read(&mut self, index: usize, job: &Job, mut entry: FileEntry) -> Done {
-        let mut out = Out {
-            ctxs: Vec::new(),
-            rows: Vec::new(),
-            keys: HashSet::new(),
-            duplicates: 0,
-            fallback: 0,
-            skipped: 0,
-        };
-        let done = |entry, bytes, out: Out| Done {
-            index,
-            harness: job.harness,
-            entry,
-            ctxs: out.ctxs,
-            rows: out.rows,
-            bytes,
-            duplicates: out.duplicates,
-            fallback: out.fallback,
-            skipped: out.skipped,
-        };
+        let mut out = Out::default();
+        self.keys.clear();
         let Ok(file) = File::open(&job.path) else {
-            return done(None, 0, out);
+            return Done {
+                index,
+                harness: job.harness,
+                entry: None,
+                bytes: 0,
+                out,
+            };
         };
         if job.size < entry.o {
             // Rewritten: start over.
@@ -908,7 +505,13 @@ impl<'a> Reader<'a> {
         self.buf = buf;
         entry.o = offset;
         entry.s = job.size;
-        done(Some(entry), bytes, out)
+        Done {
+            index,
+            harness: job.harness,
+            entry: Some(entry),
+            bytes,
+            out,
+        }
     }
 
     fn claude_row(&mut self, b: &[u8], m: usize, job: &Job, entry: &mut FileEntry, out: &mut Out) {
@@ -1019,7 +622,7 @@ impl<'a> Reader<'a> {
         if msg.model == "<synthetic>" {
             return;
         }
-        if msg.key != 0 && !out.keys.insert(msg.key) {
+        if msg.key != 0 && !self.keys.insert(msg.key) {
             out.duplicates += 1;
             return;
         }
@@ -1136,12 +739,10 @@ impl<'a> Reader<'a> {
     }
 }
 
+#[derive(Default)]
 struct Out {
     ctxs: Vec<Ctx>,
     rows: Vec<Row>,
-    /// Keys already in `rows`: a response is written once per content
-    /// block, and only its first row needs to reach the count.
-    keys: HashSet<u64>,
     duplicates: u64,
     fallback: u64,
     skipped: u64,
