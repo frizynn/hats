@@ -214,7 +214,7 @@ pub fn parse_utc(text: &str) -> Option<i64> {
 
 /// A proleptic Gregorian date to days since 1970-01-01 (Howard Hinnant,
 /// "chrono-Compatible Low-Level Date Algorithms").
-fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+pub fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     let year = year - i64::from(month <= 2);
     let era = year.div_euclid(400);
     let yoe = year.rem_euclid(400);
@@ -226,7 +226,7 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
 
 /// Days since 1970-01-01 to a proleptic Gregorian date (Howard Hinnant,
 /// "chrono-Compatible Low-Level Date Algorithms").
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
+pub fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
