@@ -748,3 +748,30 @@ fn a_background_shell_holds_a_close_for_one_more_close_idle_at_most() {
         run.elapsed
     );
 }
+
+#[test]
+fn a_session_started_inside_another_does_not_speak_for_it() {
+    let sb = two_accounts();
+    // In its turn the agent runs `claude -p`, through hats as the `claude`
+    // function does. That session's turn end must not look like the outer
+    // agent's: the move waits for the outer turn to end.
+    let fake = FAKE
+        .replace(
+            "case \" $* \" in",
+            r#"case " $* " in *" -p "*) printf '{"session_id":"nested","hook_event_name":"Stop"}' | "$HATS" hook stop; echo nested >> "$FAKE_LOG"; exit 0 ;; esac
+case " $* " in"#,
+        )
+        .replace(
+            "echo \"turn ended\" >> \"$FAKE_LOG\"\n",
+            "\"$HATS\" run -- -p hi < /dev/null > /dev/null\nsleep 1.5\necho \"turn ended\" >> \"$FAKE_LOG\"\n",
+        );
+    let run = run_in_pty(&sb, &fake, |_| {});
+    let lines: Vec<&str> = run.log.lines().filter(|l| !l.contains("args=-p")).collect();
+    assert_eq!(
+        &lines[1..4],
+        ["nested", "turn ended", "term"],
+        "{}",
+        run.log
+    );
+    assert!(run.log.ends_with("resumed\n"), "{}", run.log);
+}
