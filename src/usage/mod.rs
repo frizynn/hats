@@ -189,9 +189,9 @@ pub fn report(store: &Store, now: SystemTime) -> Result<Report, String> {
         .open(dir.join(".lock"))
         .map_err(|e| e.to_string())?;
     lock.lock().map_err(|e| e.to_string())?;
-    let sources = Sources::read(store, &dir, now)?;
     let today = Day::local(now);
-    let mut tally = Tally::load(&dir, today);
+    let mut tally = Tally::load(&dir, today)?;
+    let sources = Sources::read(store, &dir, now)?;
     let stats = scan::scan(
         &mut tally,
         &Input {

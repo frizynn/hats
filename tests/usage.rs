@@ -250,3 +250,17 @@ fn the_summary_fits_80_columns_and_adds_tokens_from_110() {
     // 10 + 50 + 300 + 1000 tokens, in each of the four periods.
     assert_eq!(total.matches("1.4K").count(), 4, "{wide}");
 }
+
+#[test]
+fn totals_saved_by_a_newer_hats_are_left_alone() {
+    let sb = Sandbox::new();
+    let totals = sb.home.join(".local/state/hats/usage/totals.json");
+    // Days older than Claude Code keeps transcripts: only this file has them.
+    let newer = r#"{"v":2,"days":{"2025-01-01":{}}}"#;
+    write(&totals, newer);
+    let out = sb.cmd(&["usage"]).output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("newer hats"), "{stderr}");
+    assert_eq!(fs::read_to_string(&totals).unwrap(), newer);
+}

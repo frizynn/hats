@@ -278,22 +278,37 @@ impl Tally {
 
     /// What the last save left, or an empty tally when there is none: totals
     /// without the offsets they were counted with would count logs twice.
-    pub fn load(dir: &Path, today: Day) -> Self {
+    /// Totals a newer hats saved are refused, not replaced: they may hold
+    /// days whose logs are gone.
+    pub fn load(dir: &Path, today: Day) -> Result<Self, String> {
         let read = |name: &str| fs::read(dir.join(name)).ok();
-        let Some(totals) = read("totals.json")
-            .and_then(|b| serde_json::from_slice::<TotalsFile>(&b).ok())
-            .filter(|t| t.v == 1)
-        else {
-            return Self::empty(today);
+        let Some(bytes) = read("totals.json") else {
+            return Ok(Self::empty(today));
+        };
+        let totals = match serde_json::from_slice::<TotalsFile>(&bytes) {
+            Ok(totals) if totals.v == 1 => totals,
+            _ => {
+                #[derive(Deserialize)]
+                struct Version {
+                    v: u32,
+                }
+                return match serde_json::from_slice::<Version>(&bytes) {
+                    Ok(Version { v }) if v > 1 => Err(format!(
+                        "{}: saved by a newer hats (version {v}); use that one",
+                        dir.join("totals.json").display()
+                    )),
+                    _ => Ok(Self::empty(today)),
+                };
+            }
         };
         let Some(files) = totals.files else {
-            return Self::empty(today);
+            return Ok(Self::empty(today));
         };
         let Some(state) = read(&format!("scan.{}.json", files.scan))
             .and_then(|b| serde_json::from_slice::<ScanState>(&b).ok())
             .filter(|s| s.v == 1)
         else {
-            return Self::empty(today);
+            return Ok(Self::empty(today));
         };
         let seen = File::open(dir.join(format!("seen.{}.bin", files.seen)))
             .and_then(Seen::read)
@@ -336,7 +351,7 @@ impl Tally {
                 t.sums.insert(key, sum);
             }
         }
-        out
+        Ok(out)
     }
 
     /// One rename commits a save: the offsets and the seen set go to new
