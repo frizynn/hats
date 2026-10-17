@@ -83,7 +83,6 @@ impl App<'_> {
         }
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
-            KeyCode::Esc => Step::Quit,
             KeyCode::Up if shift => self.move_account(-1),
             KeyCode::Down if shift => self.move_account(1),
             KeyCode::Char('K') => self.move_account(-1),
