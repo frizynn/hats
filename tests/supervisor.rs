@@ -775,3 +775,143 @@ case " $* " in"#,
     );
     assert!(run.log.ends_with("resumed\n"), "{}", run.log);
 }
+
+/// One turn that ends below the threshold, then a quiet agent until SIGTERM,
+/// or until it gives up after about 8 s. `# later` marks where a test adds
+/// what happens after the turn.
+const QUIET: &str = r#"#!/bin/sh
+now() { perl -MTime::HiRes=time -e 'printf "%.3f", time'; }
+echo "start dir=$CLAUDE_CONFIG_DIR args=$*" >> "$FAKE_LOG"
+case " $* " in *" --resume "*) echo resumed >> "$FAKE_LOG"; exit 0 ;; esac
+trap 'echo "term $(now)" >> "$FAKE_LOG"; exit 143' TERM
+s=s-1
+printf '{"session_id":"%s","source":"startup"}' $s | "$HATS" hook session-start
+printf '{"session_id":"%s"}' $s | "$HATS" hook prompt
+printf '{"session_id":"%s","hook_event_name":"Stop"}' $s | "$HATS" hook stop
+echo "turn ended" >> "$FAKE_LOG"
+# later
+i=0
+while [ $i -lt 160 ]; do sleep 0.05; i=$((i + 1)); done
+echo "still open" >> "$FAKE_LOG"
+"#;
+
+fn quiet(steps: &str) -> String {
+    QUIET.replace("# later", steps)
+}
+
+/// Waits until the fake's log has `line`.
+fn wait_for(sb: &Sandbox, line: &str, within: Duration) -> bool {
+    let log = sb.home.join("fake.log");
+    let started = Instant::now();
+    while started.elapsed() < within {
+        if fs::read_to_string(&log).is_ok_and(|l| l.lines().any(|l| l == line)) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
+/// The log without the times the fake adds to `term` and `late repaint`.
+fn events(log: &str) -> Vec<&str> {
+    log.lines()
+        .map(|l| match l.rsplit_once(' ') {
+            Some((event @ ("term" | "late repaint"), _)) => event,
+            _ => l,
+        })
+        .collect()
+}
+
+/// The time the fake wrote after `event`.
+fn time_of(log: &str, event: &str) -> f64 {
+    log.lines()
+        .find_map(|l| l.strip_prefix(event)?.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no time for {event}: {log}"))
+}
+
+/// What the fake logs when its session moves from `work` to `side`.
+fn moved_to_side(sb: &Sandbox) -> Vec<String> {
+    vec![
+        format!(
+            "start dir={} args=--dangerously-skip-permissions",
+            sb.claude_dir("work").display()
+        ),
+        "turn ended".to_owned(),
+        "term".to_owned(),
+        format!(
+            "start dir={} args=--dangerously-skip-permissions --resume s-1",
+            sb.claude_dir("side").display()
+        ),
+        "resumed".to_owned(),
+    ]
+}
+
+#[test]
+fn a_manual_choice_moves_a_quiet_session_at_once() {
+    let sb = two_accounts();
+    // Well after the turn ended, the user chooses another account elsewhere
+    // (`hats use`, enter in the view): not typing in this session.
+    let mut moved_in = None;
+    let mut said = String::new();
+    let run = run_in_pty(&sb, QUIET, |_| {
+        assert!(wait_for(&sb, "turn ended", Duration::from_secs(5)));
+        std::thread::sleep(Duration::from_millis(2500));
+        said = sb.ok(&["use", "side"]);
+        let chosen = Instant::now();
+        if wait_for(&sb, "resumed", Duration::from_secs(5)) {
+            moved_in = Some(chosen.elapsed());
+        }
+    });
+    assert_eq!(events(&run.log), moved_to_side(&sb), "{}", run.log);
+    let moved_in = moved_in.expect("moved");
+    assert!(moved_in <= Duration::from_secs(2), "{moved_in:?}");
+    assert!(run.status.success());
+    assert_eq!(
+        said,
+        "New Claude Code sessions use 'side'. 1 running session moves to it.\n"
+    );
+    let moved = sb
+        .registry_lines()
+        .into_iter()
+        .find(|l| l["session"] == "s-1" && l["label"] == "side")
+        .expect("session line for the move");
+    assert_eq!(moved["reason"], "manual");
+}
+
+/// Makes the session look quiet since `secs` ago, as if its turn had ended
+/// then: `turn` in its parent's run directory holds that time.
+fn quiet_since(secs: u32) -> String {
+    format!(
+        r#"run="$HOME/.local/state/hats/run/$HATS_SUPERVISOR"
+printf '%s\n%s\n' $(( ($(date +%s) - {secs}) * 1000 )) $s > "$run/turn.tmp" && mv "$run/turn.tmp" "$run/turn""#
+    )
+}
+
+const REPAINT_PAST_THRESHOLD: &str = r#"printf '{"session_id":"%s","rate_limits":{"five_hour":{"used_percentage":95,"resets_at":4102444800}}}' $s | "$HATS" statusline > /dev/null
+echo "late repaint $(now)" >> "$FAKE_LOG""#;
+
+#[test]
+fn a_threshold_seen_in_a_session_quiet_for_a_minute_moves_it_at_once() {
+    let sb = two_accounts();
+    // The session went quiet two minutes ago; nobody is typing in it. A
+    // repaint (the prompt cache expiring, another session using the same
+    // account) reports the threshold passed.
+    let fake = quiet(&format!(
+        "sleep 2.5\n{}\n{REPAINT_PAST_THRESHOLD}",
+        quiet_since(120)
+    ));
+    let run = run_in_pty(&sb, &fake, |_| {});
+    assert_eq!(
+        events(&run.log),
+        [
+            &moved_to_side(&sb)[..2],
+            &["late repaint".to_owned()],
+            &moved_to_side(&sb)[2..]
+        ]
+        .concat(),
+        "{}",
+        run.log
+    );
+    let waited = time_of(&run.log, "term") - time_of(&run.log, "late repaint");
+    assert!(waited < 1.8, "one second of grace: {waited}");
+}
