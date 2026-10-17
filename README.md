@@ -165,8 +165,10 @@ Limits of the running-session move:
 - hats rebuilds the command line with `--resume`, keeping your options. If it
   finds an option it does not know followed by a value, it does not supervise
   that session (it starts it with `exec`) rather than guess.
-- The move restarts Claude Code: background shells and MCP servers it started
-  are restarted too.
+- The move restarts Claude Code: MCP servers start again, and background
+  shells still running end with it. Claude Code 2.1.302 then tells the agent
+  the command "didn't finish before the previous session ended"; the move
+  does not wait for them, since no hook says they are running.
 - If Claude Code dies of a signal it cannot handle (`kill -9`, the OOM
   killer), hats restores the terminal settings and modes before exiting.
 
