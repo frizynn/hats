@@ -127,32 +127,52 @@ enum Field {
     Threshold,
     Strategy,
     Relaunch,
+    CloseIdle,
     Order,
 }
 
 impl Field {
-    const ALL: [Field; 5] = [
-        Field::Mode,
-        Field::Threshold,
-        Field::Strategy,
-        Field::Relaunch,
-        Field::Order,
-    ];
+    /// The rows of one harness's settings; Codex has no `hats run` parent.
+    fn of(harness: Harness) -> &'static [Field] {
+        match harness {
+            Harness::Claude => &[
+                Field::Mode,
+                Field::Threshold,
+                Field::Strategy,
+                Field::Relaunch,
+                Field::CloseIdle,
+                Field::Order,
+            ],
+            Harness::Codex => &[
+                Field::Mode,
+                Field::Threshold,
+                Field::Strategy,
+                Field::Relaunch,
+                Field::Order,
+            ],
+        }
+    }
 
-    /// The key in `config.toml` and `config::KEYS`.
+    /// The key in `config.toml` and `config::keys`.
     fn key(self) -> &'static str {
         match self {
             Field::Mode => "mode",
             Field::Threshold => "threshold",
             Field::Strategy => "strategy",
             Field::Relaunch => "relaunch",
+            Field::CloseIdle => "close_idle",
             Field::Order => "order",
         }
     }
 
-    fn step(self, by: isize) -> Self {
-        let i = Self::ALL.iter().position(|f| *f == self).expect("in ALL") as isize;
-        Self::ALL[(i + by).rem_euclid(Self::ALL.len() as isize) as usize]
+    /// The row `by` places away in `harness`'s settings, or the nearest one
+    /// when this row is not one of them.
+    fn step(self, harness: Harness, by: isize) -> Self {
+        let all = Self::of(harness);
+        let Some(i) = all.iter().position(|f| *f == self) else {
+            return Field::Relaunch;
+        };
+        all[(i as isize + by).rem_euclid(all.len() as isize) as usize]
     }
 }
 
@@ -399,17 +419,21 @@ impl<'a> App<'a> {
 
     fn settings_key(&mut self, field: Field, key: KeyEvent) -> (Panel, Step) {
         if let Some(step) = self.shared_key(key) {
-            return (Panel::Settings(field), step);
+            // Tab may have changed the harness.
+            return (Panel::Settings(field.step(self.harness(), 0)), step);
         }
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let by = if shift { 5 } else { 1 };
         let step = match key.code {
             KeyCode::Esc | KeyCode::Char('c') => return (Panel::List, Step::Redraw),
             KeyCode::Up | KeyCode::Char('k') => {
-                return (Panel::Settings(field.step(-1)), Step::Redraw);
+                return (
+                    Panel::Settings(field.step(self.harness(), -1)),
+                    Step::Redraw,
+                );
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                return (Panel::Settings(field.step(1)), Step::Redraw);
+                return (Panel::Settings(field.step(self.harness(), 1)), Step::Redraw);
             }
             // On the order row, left and right pick the account to move.
             KeyCode::Left if field == Field::Order && shift => self.move_account(-1),
@@ -535,6 +559,20 @@ impl<'a> App<'a> {
                 }
                 next.to_string()
             }
+            // Whole hours; from 90m, right is 2h and left 1h.
+            Field::CloseIdle => {
+                let secs = self.config.close_idle.map_or(0, |d| d.as_secs());
+                let hours = if by > 0 {
+                    secs / 3600
+                } else {
+                    secs.div_ceil(3600)
+                };
+                let next = hours.saturating_add_signed(i64::from(by)) * 3600;
+                if next == secs {
+                    return Step::Idle;
+                }
+                config::show_close_idle((next > 0).then(|| Duration::from_secs(next)))
+            }
             Field::Order => return Step::Idle,
         };
         self.save(field.key(), &value)
@@ -619,7 +657,7 @@ impl<'a> App<'a> {
     fn draw(&self, frame: &mut Frame) {
         let now = SystemTime::now();
         let panel_height = if matches!(self.panel, Panel::Settings(_)) {
-            Field::ALL.len() as u16 + 3
+            Field::of(self.harness()).len() as u16 + 3
         } else {
             0
         };
@@ -744,7 +782,7 @@ impl<'a> App<'a> {
     fn draw_settings(&self, frame: &mut Frame, area: Rect, field: Field) {
         let harness = self.harness();
         let c = self.config.for_harness(harness);
-        let mut lines: Vec<Line> = Field::ALL
+        let mut lines: Vec<Line> = Field::of(harness)
             .iter()
             .map(|&f| {
                 let focused = f == field;
@@ -757,6 +795,7 @@ impl<'a> App<'a> {
                     Field::Threshold => format!("{} %", c.threshold),
                     Field::Strategy => c.strategy.as_str().to_owned(),
                     Field::Relaunch => c.relaunch.as_str().to_owned(),
+                    Field::CloseIdle => config::show_close_idle(self.config.close_idle),
                     Field::Order => {
                         spans.extend(self.order_spans(focused));
                         return Line::from(spans);
@@ -770,10 +809,7 @@ impl<'a> App<'a> {
                 Line::from(spans)
             })
             .collect();
-        let help = config::KEYS
-            .iter()
-            .find(|(k, _)| *k == field.key())
-            .map_or("", |(_, h)| *h);
+        let help = config::help(field.key());
         lines.push(Line::styled(format!("  {help}"), self.dim()));
         let block = Block::bordered().title(format!(" {} settings ", harness.name()));
         frame.render_widget(Paragraph::new(lines).block(block), area);
@@ -1125,6 +1161,44 @@ mod tests {
         assert_eq!(app.panel, Panel::List);
         assert_eq!(app.on_key(key(KeyCode::Esc)), Step::Quit);
         assert_eq!(app.closed_by, Some("Esc"));
+    }
+
+    #[test]
+    fn close_idle_is_a_claude_setting() {
+        let (_dir, store) = sandbox();
+        account(&store, "work", None);
+        let mut app = App::new(&store, true);
+        let close_idle = || {
+            Config::load(&store.config)
+                .unwrap()
+                .get("claude.close_idle")
+                .unwrap()
+        };
+
+        app.on_key(key(KeyCode::Char('c')));
+        for _ in 0..4 {
+            app.on_key(key(KeyCode::Down));
+        }
+        assert!(
+            line_with(&text(&app), "close_idle").contains("‹ 32h ›"),
+            "{}",
+            text(&app)
+        );
+        app.on_key(key(KeyCode::Right));
+        assert_eq!(close_idle(), "33h");
+        app.on_key(shift(KeyCode::Left));
+        assert_eq!(close_idle(), "28h");
+        config::set(&store.config, "claude.close_idle", "1h").unwrap();
+        app.reload();
+        app.on_key(key(KeyCode::Left));
+        assert_eq!(close_idle(), "off");
+        assert!(
+            text(&app).contains("never"),
+            "the help says how to turn it off"
+        );
+
+        app.on_key(key(KeyCode::Tab));
+        assert!(!text(&app).contains("close_idle"), "Codex has no parent");
     }
 
     #[test]

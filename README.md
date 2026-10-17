@@ -103,9 +103,10 @@ For Codex, add `--codex` to the same commands: `hats --codex add personal`,
   `oauthAccount.accountUuid` and `organizationUuid` from that directory's
   `.claude.json`, or `creator_account_id` from the newest Codex rollout header.
 - **Nothing stays running.** `hats run` replaces itself with the harness
-  (`exec`), except for interactive Claude Code sessions in auto mode, where a
-  small parent stays to move the session when needed (see below). Hooks and the
-  status line wrapper are short processes Claude Code already starts.
+  (`exec`), except for interactive Claude Code sessions, where a small parent
+  stays to move the session when needed and to close it when unused (see
+  below). Hooks and the status line wrapper are short processes Claude Code
+  already starts.
 
 ## Automatic switching
 
@@ -164,13 +165,70 @@ Limits of the running-session move:
 - hats rebuilds the command line with `--resume`, keeping your options. If it
   finds an option it does not know followed by a value, it does not supervise
   that session (it starts it with `exec`) rather than guess.
-- The move restarts Claude Code: background shells and MCP servers it started
-  are restarted too.
+- The move restarts Claude Code: MCP servers start again, and background
+  shells still running would end with it (Claude Code 2.1.302 then tells the
+  agent the command "didn't finish before the previous session ended"). So
+  while Claude Code has a background shell running, the move waits for the
+  next turn end; Claude Code wakes the agent when the task finishes, and the
+  move happens after that turn. A shell running longer than
+  `claude.close_idle` (32 hours with closing off) no longer holds it. hats
+  tells these shells by how Claude Code 2.1.302 starts them; if a version
+  starts them another way, the move stops waiting for them.
 - If Claude Code dies of a signal it cannot handle (`kill -9`, the OOM
   killer), hats restores the terminal settings and modes before exiting.
 
 Every change of account is recorded in the registry with its reason
 (`manual`, `threshold` or `limit`).
+
+## Closing unused sessions
+
+A Claude Code session started with `hats run` (or the `claude` function) that
+goes unused for `claude.close_idle`, 32 hours by default, is closed: hats ends
+Claude Code with `SIGTERM`, as for a move, does not start it again, and
+prints how to resume it before the shell prompt comes back:
+
+```
+hats: closed this session after 32h without use. Resume it with: claude --resume <id>
+```
+
+`hats config set claude.close_idle 8` makes it 8 hours; `90m` and `30s` are
+minutes and seconds, handy to try it; `0` or `off` turns it off. It works in
+manual mode and with `relaunch = "off"` too; moving still needs both on. A
+change reaches running sessions at their next check.
+
+What counts as use:
+
+- The clock starts when the session opens (the `SessionStart` hook) and when
+  a turn ends (`Stop` or `StopFailure`). A new prompt, another turn end or a
+  write to the session's transcript restarts it. On Claude Code 2.1.302 a
+  background task that finishes wakes the agent through `UserPromptSubmit`
+  too; the transcript covers any wake that does not.
+- A background shell still running is use, for at most `claude.close_idle` of
+  its run time: a task that never ends, such as a dev server, keeps the
+  session open for one more `close_idle` at most.
+- During a turn there is no clock, also while Claude Code waits for your
+  approval: a session is never closed mid-turn.
+- Hours are wall-clock hours and count time the computer sleeps. The parent
+  wakes at most every 15 minutes to compare with the clock, because the timer
+  it sleeps on may not count sleep; after a long sleep, a session already due
+  closes within 15 minutes of waking.
+
+Limits:
+
+- Only Claude Code: a Codex session has no hats parent, so there is no
+  `codex.close_idle`.
+- Only sessions whose `hats run` parent runs a version with this setting.
+  Sessions opened before you installed it keep their old parent and are never
+  closed; start them again to get it.
+- A session whose last turn was interrupted with Esc has no clock and stays
+  open: Claude Code 2.1.302 runs no hook then (no `Stop`, and no
+  `idle_prompt` notification either), so it looks like a turn in progress.
+- Background agents that run no shell at the moment are not seen: they end
+  with Claude Code.
+
+Each close is recorded in `closes.jsonl`, next to the registry (format
+below), for the interactive view. The registry itself records
+changes of account only.
 
 ## Token use
 
@@ -264,6 +322,7 @@ threshold = 90         # 1-100, percent of the 5-hour or weekly limit
 strategy = "headroom"  # headroom | next
 order = ["work", "personal"]   # preferred order; others follow by name
 relaunch = "idle"      # idle | off: move running `hats run` sessions
+close_idle = "32h"     # close a `hats run` session unused this long; 0 | off: never
 
 [codex]
 mode = "auto"
@@ -279,6 +338,7 @@ relaunch = "idle"
 |---|---|---|
 | Account directories | `$XDG_DATA_HOME/hats/<harness>/<label>/` (default `~/.local/share/hats`), or `$HATS_HOME` | 0700 |
 | Registry of account changes | `$XDG_STATE_HOME/hats/switches.jsonl` (default `~/.local/state/hats`), or `$HATS_STATE_DIR` | 0600 |
+| Sessions closed for going unused | `$XDG_STATE_HOME/hats/closes.jsonl` | 0600 |
 | Last limits per account | `$XDG_STATE_HOME/hats/limits.json` | 0600 |
 | Current account per harness | `$XDG_STATE_HOME/hats/current-claude`, `current-codex` | |
 | Token totals and scan offsets | `$XDG_STATE_HOME/hats/usage/` | 0600 |
@@ -311,7 +371,20 @@ on an `O_APPEND` descriptor so concurrent writers never interleave.
   `session` and `at <= t`, else to no account.
 
 The format is fixed by `tests/registry_format.rs` and
-`tests/fixtures/switches.jsonl`. `limits.json` holds
+`tests/fixtures/switches.jsonl`.
+
+`closes.jsonl`: one line per session closed for going unused, appended the
+same way. No credentials, no account id.
+
+```json
+{"v":1,"at":"2026-01-02T03:04:05.678Z","harness":"claude","session":"11111111-2222-4333-8444-555555555555","label":"work","idle":"32h","cwd":"/home/user/project"}
+```
+
+- `label`: the account the session ran on when it closed.
+- `idle`: `claude.close_idle` at that moment, as `hats config` shows it.
+- `cwd`: the directory `hats run` started the session in.
+
+`limits.json` holds
 `{"v":1,"accounts":[{"harness","account","label","observedAt","windows":[{"name","usedPercent","resetsAt"}],"limitedUntil"?}]}`.
 
 ## Migrating from claude-swap
@@ -401,6 +474,7 @@ which includes about 1.4 ms to start any process (`/usr/bin/true` measures
 | `statusline` / chained to another command | 2.7 / 3.7 ms | 2.6 MB |
 | Interactive view, open and quit | | 2.7 MB; 0.00 s of CPU in 10 s without keys |
 | `hats run` parent, waiting | 0.00 s of CPU in 10 s, 1 thread | 1.4 MB physical footprint (2.6 MB RSS with shared system libraries) |
+| Its check of the clock for closing | 0.2 to 0.5 ms of CPU, at most every 15 minutes while the agent is idle; reading Claude Code's background shells is 6 to 18 µs of it | |
 | Its sentinel, waiting | 0.00 s of CPU in 10 s | 0.8 MB physical footprint (1.0 MB RSS) |
 | Processes left running | 0 | |
 | `hats usage`, the first time, over a real history of 13.9 GB (3,540 logs) | 2.7 s | 21 to 23 MB |
