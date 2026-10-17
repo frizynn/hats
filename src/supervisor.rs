@@ -245,28 +245,29 @@ pub fn remove_stale(store: &Store) {
     parents(store);
 }
 
-/// Interactive Claude Code sessions of this user with no `hats run` parent:
-/// nothing moves or closes them until they are opened again through hats.
-/// Reads the kernel's names, parents and arguments, never the environment.
-pub fn unsupervised() -> usize {
-    let Some(hats) = process::info(std::process::id()) else {
-        return 0;
-    };
-    process::all()
+/// Interactive Claude Code sessions of this user whose parent is not one of
+/// the `hats run` parents with a run directory here: nothing moves or closes
+/// them until they are opened again through hats. Reads the kernel's names,
+/// parents and arguments, never the environment.
+pub fn unsupervised(store: &Store) -> usize {
+    let parents: Vec<u32> = parents(store).into_iter().map(|(pid, _)| pid).collect();
+    // SAFETY: getuid(2) takes no arguments.
+    let uid = unsafe { libc::getuid() };
+    process::of_user(uid)
         .into_iter()
-        .filter(|&pid| runs_without(pid, &hats))
+        .filter(|&pid| runs_without(pid, uid, &parents))
         .count()
 }
 
-/// Whether `pid` is an interactive Claude Code session of the user running
-/// `hats`, whose parent is not a process of the same name.
-fn runs_without(pid: u32, hats: &process::Info) -> bool {
+/// Whether `pid` is an interactive Claude Code session of `uid` whose
+/// parent is none of `parents`.
+fn runs_without(pid: u32, uid: u32, parents: &[u32]) -> bool {
     process::info(pid).is_some_and(|p| {
-        p.uid == hats.uid
+        p.uid == uid
             && p.tty
             && may_be_claude(&p.name)
             && process::args(pid).is_some_and(|a| is_claude_session(&a))
-            && process::info(p.ppid).is_none_or(|parent| parent.name != hats.name)
+            && !parents.contains(&p.ppid)
     })
 }
 
@@ -1242,17 +1243,20 @@ mod tests {
         }
         let mut child = cmd.spawn().unwrap();
         let pid = child.id();
-        let me = process::info(std::process::id()).unwrap();
+        let me = std::process::id();
         // Until it has exec'd, the kernel shows this process's name.
         let named = (0..100).any(|_| {
             std::thread::sleep(Duration::from_millis(10));
             process::info(pid).is_some_and(|p| p.name == b"claude" && p.tty)
         });
-        let hats = process::Info {
-            name: b"hats".to_vec(),
-            ..process::info(std::process::id()).unwrap()
-        };
-        let found = (named, runs_without(pid, &hats), runs_without(pid, &me));
+        // SAFETY: getuid(2) takes no arguments.
+        let uid = unsafe { libc::getuid() };
+        let found = (
+            named,
+            runs_without(pid, uid, &[]),
+            runs_without(pid, uid, &[me]),
+            runs_without(pid, uid + 1, &[]),
+        );
         child.kill().unwrap();
         child.wait().unwrap();
         // SAFETY: the descriptors from openpty.
@@ -1260,8 +1264,8 @@ mod tests {
             libc::close(master);
             libc::close(slave);
         }
-        // Its parent, this test, is named like the `me` it is checked against.
-        assert_eq!(found, (true, true, false));
+        // Its parent is this test: a hats parent only when listed as one.
+        assert_eq!(found, (true, true, false, false));
     }
 
     #[test]

@@ -44,7 +44,7 @@ pub fn run(store: &Store) -> Result<(), String> {
     supervisor::remove_stale(store);
     let mut app = App::new(store, Theme::detect(color));
     app.count_sessions = true;
-    app.unsupervised = supervisor::unsupervised();
+    app.unsupervised = supervisor::unsupervised(store);
     let result = event_loop(&mut app, &mut screen);
     drop(screen);
     // Back on the normal screen, say what closed the view: a terminal that
@@ -293,7 +293,7 @@ impl<'a> App<'a> {
         self.changes = registry::recent(&self.store.registry(), CHANGES);
         self.activity.reload(self.store, &self.changes);
         if self.count_sessions {
-            self.unsupervised = supervisor::unsupervised();
+            self.unsupervised = supervisor::unsupervised(self.store);
         }
         if let Some(e) = error {
             self.fail(e);

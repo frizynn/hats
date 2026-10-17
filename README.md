@@ -551,7 +551,7 @@ which includes about 1.4 ms to start any process (`/usr/bin/true` measures
 | `hats list` / `list --json` | 2.8 to 3.0 ms | 2.7 to 2.8 MB |
 | `hook session-start` / `prompt` / `stop` | 2.0 to 2.2 ms | 2.1 to 2.4 MB |
 | `statusline` / chained to another command | 2.7 / 3.7 ms | 2.6 MB |
-| Interactive view, open | 3.2 ms to the first frame; 0.1 s more on a terminal that does not say its background | 4.0 MB RSS; 0.00 s of CPU in 10 s without keys |
+| Interactive view, open | 3.5 ms to the first frame, 0.2 to 0.3 ms of it counting the Claude Code sessions without hats among the user's 430 processes; 0.1 s more on a terminal that does not say its background | 4.0 MB RSS; 0.00 s of CPU in 10 s without keys |
 | `hats run` parent, waiting | 0.00 s of CPU in 10 s, 1 thread | 1.4 MB physical footprint (2.6 MB RSS with shared system libraries) |
 | Its check of the clock for closing | 0.2 to 0.5 ms of CPU, at most every 15 minutes while the agent is idle; reading Claude Code's background shells is 6 to 18 µs of it | |
 | Its sentinel, waiting | 0.00 s of CPU in 10 s | 0.8 MB physical footprint (1.0 MB RSS) |

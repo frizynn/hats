@@ -10,6 +10,9 @@ const ARGS_MAX: usize = 4096;
 /// `PROC_FLAG_CONTROLT` in `<sys/proc_info.h>`: it has a controlling terminal.
 #[cfg(target_os = "macos")]
 const CONTROLT: u32 = 0x80;
+/// `PROC_UID_ONLY` in `<sys/proc_info.h>`: list the processes of one user.
+#[cfg(target_os = "macos")]
+const UID_ONLY: u32 = 4;
 
 /// What the kernel says about a process of any user it lets us see.
 pub struct Info {
@@ -27,16 +30,19 @@ pub fn alive(pid: u32) -> bool {
     libc::pid_t::try_from(pid).is_ok_and(|pid| pid > 0 && unsafe { libc::kill(pid, 0) } == 0)
 }
 
+/// The processes of `uid`. The kernel filters them: asking about every
+/// process, root's included, takes twice as long (measured with 715).
 #[cfg(target_os = "macos")]
-pub fn all() -> Vec<u32> {
-    // SAFETY: with no buffer it returns about how many there are; then the
-    // kernel writes at most the buffer's size and returns how many it wrote.
+pub fn of_user(uid: u32) -> Vec<u32> {
+    let pid_size = std::mem::size_of::<libc::pid_t>();
+    // SAFETY: with no buffer it returns about how many bytes they take; then
+    // the kernel writes at most the buffer's size and returns what it wrote.
     unsafe {
-        let n = libc::proc_listallpids(std::ptr::null_mut(), 0);
-        let mut pids = vec![0 as libc::pid_t; usize::try_from(n).unwrap_or(0) + 64];
+        let bytes = libc::proc_listpids(UID_ONLY, uid, std::ptr::null_mut(), 0);
+        let mut pids = vec![0 as libc::pid_t; usize::try_from(bytes).unwrap_or(0) / pid_size + 64];
         let size = libc::c_int::try_from(std::mem::size_of_val(pids.as_slice())).unwrap_or(0);
-        let n = libc::proc_listallpids(pids.as_mut_ptr().cast(), size);
-        pids.truncate(usize::try_from(n).unwrap_or(0));
+        let bytes = libc::proc_listpids(UID_ONLY, uid, pids.as_mut_ptr().cast(), size);
+        pids.truncate(usize::try_from(bytes).unwrap_or(0) / pid_size);
         pids.into_iter().map(|p| p as u32).collect()
     }
 }
@@ -161,8 +167,9 @@ pub fn started(pid: u32) -> Option<SystemTime> {
     std::time::UNIX_EPOCH.checked_add(since)
 }
 
+/// Every process: `info` tells whose it is.
 #[cfg(target_os = "linux")]
-pub fn all() -> Vec<u32> {
+pub fn of_user(_uid: u32) -> Vec<u32> {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return Vec::new();
     };
@@ -276,7 +283,9 @@ mod tests {
             found.as_deref(),
             Some(&b"/bin/sh\0-c\0sleep 5; exit 0\0named"[..])
         );
-        assert!(all().contains(&pid) && all().contains(&me));
+        // SAFETY: getuid(2) takes no arguments.
+        let mine = of_user(unsafe { libc::getuid() });
+        assert!(mine.contains(&pid) && mine.contains(&me));
         assert!(children(me).contains(&pid));
         let info = info(pid).unwrap();
         assert_eq!(info.ppid, me);
