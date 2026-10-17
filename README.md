@@ -172,6 +172,62 @@ Limits of the running-session move:
 Every change of account is recorded in the registry with its reason
 (`manual`, `threshold` or `limit`).
 
+## Token use
+
+```
+$ hats usage
+USAGE · what these tokens cost at API list price, not what a plan charges
+
+                                          TODAY     7 DAYS    30 DAYS    OCTOBER
+Total                                    $31.16    $127.83    $371.27    $330.87
+  tokens                                  46.3M     236.9M     702.4M     605.5M
+
+ACCOUNT
+  claude work                            $29.34    $108.80    $319.94    $288.97
+  claude personal                             -     $14.18     $43.98     $34.55
+  codex  personal                         $1.83      $4.85      $7.35      $7.35
+MODEL
+  Opus 5.5                               $29.34    $107.16    $313.67    $284.49
+  Sonnet 5.5                                  -     $14.18     $43.98     $34.55
+  GPT-6.1 Sol                             $1.83      $4.85      $7.35      $7.35
+  Haiku 5.5                                   -      $1.65      $6.26      $4.48
+PROJECT
+  api                                    $18.46     $65.50    $190.72    $178.49
+  web                                    $12.70     $52.21    $150.46    $129.79
+  notes                                       -      $8.48     $23.83     $18.11
+  infra                                       -      $1.65      $6.26      $4.48
+
+Logs from 2026-09-27; hats keeps what it counted after Claude Code deletes a
+transcript (30 days). Prices of 2026-10-16.
+```
+
+`hats usage` adds up the tokens in Claude Code's transcripts and Codex's
+rollouts, the files the harnesses already keep, per day, account, model and
+project. The cost is what those tokens would cost at the API's list price,
+with the prices' date and sources in `src/usage/prices.rs`. Claude and ChatGPT
+plans are flat-rate, so it is not what you pay. From 110 columns each cost has
+its tokens beside it. `hats usage --json` prints one row per day, harness,
+account, model and project, with every kind of token and its cost.
+
+How it counts:
+
+- Claude Code writes a response once per content block and copies messages
+  into subagent and resumed transcripts. Each response counts once, by its
+  message id and request id.
+- Codex writes running totals. Each row counts what it added, and a rollout
+  moved to `archived_sessions/` is the same rollout.
+- Codex names the account in every rollout. Claude Code does not, so a session
+  counts for the account of its own line in `switches.jsonl`, written by the
+  `SessionStart` hook that `hats setup` installs. Without one, it counts for
+  the last account seen in `~/.claude` before it (claude-swap's log says which,
+  if you used claude-swap), else for `unassigned`.
+- hats' accounts share one `projects` folder, and it is read once. A git
+  worktree counts with its repository.
+- Nothing runs in the background. The first `hats usage` reads every log and
+  takes seconds; later ones read only what was appended. Days are cut in
+  local time, and what hats counted stays after Claude Code deletes a
+  transcript at 30 days.
+
 ## Commands
 
 | Command | What it does |
@@ -187,6 +243,7 @@ Every change of account is recorded in the registry with its reason
 | `hats remove <label>` | sign out with the harness, then delete the directory (links only, never the shared files) |
 | `hats config [list\|get\|set\|edit\|path]` | settings; `hats config` lists every key with its meaning |
 | `hats setup [--dry-run\|--undo]` | install or remove the hooks, the status line wrapper and the shell functions; run it again after moving the binary |
+| `hats usage [--json]` | tokens per day, account, model and project from the agents' own logs, and what they would cost at API list price |
 | `hats import claude-swap [--from <dir>]` | take claude-swap's account order, settings and last limits (never its tokens) |
 | `hats completions <shell>` | shell completions |
 | `hats statusline [-- your command]` | the status line wrapper `setup` installs |
@@ -224,6 +281,7 @@ relaunch = "idle"
 | Registry of account changes | `$XDG_STATE_HOME/hats/switches.jsonl` (default `~/.local/state/hats`), or `$HATS_STATE_DIR` | 0600 |
 | Last limits per account | `$XDG_STATE_HOME/hats/limits.json` | 0600 |
 | Current account per harness | `$XDG_STATE_HOME/hats/current-claude`, `current-codex` | |
+| Token totals and scan offsets | `$XDG_STATE_HOME/hats/usage/` | 0600 |
 | Settings | `$XDG_CONFIG_HOME/hats/config.toml` | 0600 |
 | Credentials | where the harness keeps them; hats never reads them | |
 
@@ -336,7 +394,7 @@ which includes about 1.4 ms to start any process (`/usr/bin/true` measures
 
 | What | Time | Peak memory |
 |---|---|---|
-| Binary | | 1.2 MB (the interactive view is 0.2 MB of it) |
+| Binary | | 1.5 MB (the interactive view is 0.2 MB of it, `hats usage` 0.2 MB) |
 | `hats --version`, `config`, `env` | 2.0 to 2.2 ms | 2.0 to 2.2 MB |
 | `hats list` / `list --json` | 2.8 to 3.0 ms | 2.7 to 2.8 MB |
 | `hook session-start` / `prompt` / `stop` | 2.0 to 2.2 ms | 2.1 to 2.4 MB |
@@ -345,6 +403,11 @@ which includes about 1.4 ms to start any process (`/usr/bin/true` measures
 | `hats run` parent, waiting | 0.00 s of CPU in 10 s, 1 thread | 1.4 MB physical footprint (2.6 MB RSS with shared system libraries) |
 | Its sentinel, waiting | 0.00 s of CPU in 10 s | 0.8 MB physical footprint (1.0 MB RSS) |
 | Processes left running | 0 | |
+| `hats usage`, the first time, over a real history of 13.9 GB (3,540 logs) | 2.7 s | 21 to 23 MB |
+| `hats usage` after that, with nothing or a few KB new | 18 ms | 14 MB |
+
+`hats usage` was measured on a real history, read only, with a warm disk
+cache: wall time and peak memory from `/usr/bin/time -l`, three runs each.
 
 claude-swap 0.26.0 on the same machine: about 50 ms and 35 MB to print its
 version, and its auto-switch loop stays resident at about 27 MB.
