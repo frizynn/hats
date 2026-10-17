@@ -84,6 +84,50 @@ else in the meantime.
 For Codex, add `--codex` to the same commands: `hats --codex add personal`,
 `hats --codex login personal`.
 
+## The interactive view
+
+`hats` opens four tabs; `tab` and `shift+tab` go through them, `1` to `4` jump
+to one, `q` closes the view. The foot shows the keys of the tab you are on.
+The selected row is bold on a background a step lighter than a dark terminal's,
+or darker than a light one's, so its text keeps its colors; a terminal that
+does not say its background (OSC 11) gets the mark and bold only.
+
+```
+ 1 Accounts  2 Usage  3 Settings  4 Activity                  tab next · q quit
+────────────────────────────────────────────────────────────────────────────────
+ Claude Code 6   Codex 2   new sessions start in ● default
+Auto: at 90 % of either limit, it moves to the account with the most room.
+    ACCOUNT  5-HOUR LIMIT               WEEKLY LIMIT               UPDATED
+▌ ● default  ▰▰▱▱▱▱▱▱▱▱  21% 17:42      ▰▰▱▱▱▱▱▱▱▱  15% Wed 18:30  2 min ago
+    night    hit its limit at 14:30: counted as full until 19:30
+    old off  ▱▱▱▱▱▱▱▱▱▱   0% reset      ▰▰▰▰▰▰▰▱▱▱  71% Mon 15:30  3 days ago
+    side     no data yet: appears once you use this account
+    spare    not signed in: press l to sign in
+    work     ▰▰▰▰▰▰▰▰▰▰ 100% 17:00      ▰▰▰▰▰▰▱▱▱▱  64% Mon 20:30  10 min ago
+─ default ──────────────────────────────────────────────────────────────────────
+ Mail         dana@example.com
+ Organization –
+ Plan         Max
+ Folder       ~/.claude
+ Resets       5-hour 21 % until 17:42 · weekly 15 % until Wed 18:30
+ Updated      2 min ago
+ Auto switch  on: may move here when the current account fills
+ Last change  14:40  → default: you chose it
+
+↑↓ move  ←→ codex  enter use  space off  ⇧↑↓ order  a add  l login  d remove
+```
+
+| Tab | What it shows | Keys |
+|---|---|---|
+| Accounts | Claude Code or Codex, one line per account with its limits, and the selected account's mail, organization, plan, folder, resets and last change | `↑↓` move, `←→` the other harness, `enter` use, `space` turn off or on, `shift+↑↓` order, `a` add, `l` sign in, `d` remove (asks first) |
+| Usage | tokens and their cost at API list price today, in 7 and 30 days and in the month, by account, model and project, with a bar per day; the first scan runs on its own thread | `←→` one account or all, `↑↓` scroll, `r` scan again |
+| Settings | every key of `config.toml` for both harnesses with its help, where hats keeps its files and whether `hats setup` was applied | `↑↓` move, `←→` change, a number or `enter` to type a value, `enter` saves, `esc` cancels; a value that is not valid is refused with the reason |
+| Activity | changes of account and sessions closed for going unused, newest first | `↑↓` scroll, `home`/`end` |
+
+The view waits on kqueue (macOS) or inotify (Linux) and redraws when a status
+line, a hook or another `hats` changes the state; it uses no CPU while nothing
+happens.
+
 ## How it works
 
 - **Accounts are directories.** `hats add work` creates
@@ -137,6 +181,12 @@ the one with the most room (`strategy = "headroom"`) or the next in `order`
 it is taken only when no account with numbers has room, the first in `order`. This happens in the status line wrapper, in the
 `StopFailure` hook and when `hats run` starts. If no account has room, nothing
 moves.
+
+**Accounts turned off.** `hats disable <label>` (or space in the view) keeps
+auto switching from ever moving to an account, by the threshold or by a rate
+limit; `hats enable <label>` lets it again. `hats use` still takes it, and
+says it is off. With every other account off, nothing moves, and `hats auto`
+and the view say why. The labels go in `disabled = [...]` of `config.toml`.
 
 **Running sessions.** Started with `hats run` (or the `claude` function that
 `hats setup` installs), an interactive Claude Code session has hats as its
@@ -278,11 +328,12 @@ How it counts:
 
 | Command | What it does |
 |---|---|
-| `hats`, `hats tui` | interactive view: accounts, limits, switch, add, sign in, remove, settings |
+| `hats`, `hats tui` | interactive view in four tabs: accounts, token use, settings and activity |
 | `hats list [--json]` | accounts with their limits; `●` marks the one new sessions start with |
 | `hats add <label>` | create an account directory that shares your settings |
 | `hats login <label> [-- args]` | `claude auth login` (or `codex login`) inside that account |
 | `hats use <label>` | make it the default for new sessions |
+| `hats disable <label>`, `hats enable <label>` | keep auto switching from moving to an account, or let it again |
 | `hats auto [on\|off]` | say whether accounts switch by themselves and the last change, or turn it on or off; nothing has to stay open |
 | `hats run [label] [-- args]` | start the harness with that account (default: the current one) |
 | `hats env [label]` | print `export CLAUDE_CONFIG_DIR=...` for `eval` or a terminal multiplexer pane |
@@ -311,6 +362,7 @@ strategy = "headroom"  # headroom | next
 order = ["work", "personal"]   # preferred order; others follow by name
 relaunch = "idle"      # idle | off: move running `hats run` sessions
 close_idle = "32h"     # close a `hats run` session unused this long; 0 | off: never
+disabled = ["old"]     # accounts auto switching never moves to
 
 [codex]
 mode = "auto"
@@ -318,7 +370,10 @@ threshold = 90
 strategy = "headroom"
 order = []
 relaunch = "idle"
+disabled = []
 ```
+
+The Settings tab of the view changes the same keys in place.
 
 ## Where things live
 
@@ -441,9 +496,7 @@ which includes about 1.4 ms to start any process (`/usr/bin/true` measures
 
 | What | Time | Peak memory |
 |---|---|---|
-| Binary | | 1.3 MB (the interactive view is 0.2 MB of it) |
-
-| Binary | | 1.5 MB (the interactive view is 0.2 MB of it, `hats usage` 0.2 MB) |
+| Binary | | 1.6 MB; the four tabs of the interactive view added 83 KB, `hats usage` 0.2 MB |
 | `hats --version`, `config`, `env` | 2.0 to 2.2 ms | 2.0 to 2.2 MB |
 | `hats list` / `list --json` | 2.8 to 3.0 ms | 2.7 to 2.8 MB |
 | `hook session-start` / `prompt` / `stop` | 2.0 to 2.2 ms | 2.1 to 2.4 MB |

@@ -432,7 +432,15 @@ impl App<'_> {
         let id = &s.identity;
         let dash = || "–".to_owned();
         let mut rows: Vec<(&str, Line)> = vec![
-            ("Mail", Line::raw(id.email.clone().unwrap_or_else(dash))),
+            (
+                "Mail",
+                Line::raw(match (&id.email, s.account.harness) {
+                    (Some(mail), _) => mail.clone(),
+                    // Codex keeps it next to its tokens, which hats never reads.
+                    (None, Harness::Codex) => "not read: Codex keeps it with its login".to_owned(),
+                    (None, Harness::Claude) => dash(),
+                }),
+            ),
             (
                 "Organization",
                 Line::raw(id.organization.clone().unwrap_or_else(dash)),
