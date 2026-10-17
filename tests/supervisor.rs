@@ -1027,3 +1027,31 @@ fn with_relaunch_off_a_manual_choice_leaves_running_sessions() {
         run.log
     );
 }
+
+#[test]
+fn choosing_the_sessions_own_account_again_cancels_an_earlier_choice() {
+    let sb = two_accounts();
+    // During a turn the user chooses `side`, then changes their mind and
+    // chooses `work`, where the session runs: it must stay.
+    let fake = QUIET.replace(
+        "printf '{\"session_id\":\"%s\",\"hook_event_name\":\"Stop\"}' $s | \"$HATS\" hook stop\necho \"turn ended\"",
+        r#"echo "turn started" >> "$FAKE_LOG"
+while [ ! -e "$HOME/go" ]; do sleep 0.05; done
+printf '{"session_id":"%s","hook_event_name":"Stop"}' $s | "$HATS" hook stop
+echo "turn ended""#,
+    );
+    let mut said = String::new();
+    let run = run_in_pty(&sb, &fake, |_| {
+        assert!(wait_for(&sb, "turn started", Duration::from_secs(5)));
+        sb.ok(&["use", "side"]);
+        said = sb.ok(&["use", "work"]);
+        fs::write(sb.home.join("go"), b"").unwrap();
+    });
+    assert_eq!(said, "New claude sessions use 'work'.\n");
+    assert_eq!(
+        &events(&run.log)[1..],
+        ["turn started", "turn ended", "still open"],
+        "{}",
+        run.log
+    );
+}
