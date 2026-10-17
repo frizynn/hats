@@ -16,14 +16,21 @@
 //!   `MOVE_WINDOW_MS` of that time, so a turn is never cut, a prompt being
 //!   typed later is never lost, and without the hooks a session is never
 //!   moved. A move asked for later waits for the next turn to end.
-//! - `turn`: the same turn end with the session and its transcript,
-//!   written and removed with `idle`, but kept across a move. The session is
-//!   unused from the later of that time and the transcript's last write, in
-//!   case something wakes the agent without `UserPromptSubmit` (on 2.1.302 a
-//!   finished background task does run it); while the file is missing the
-//!   agent is in a turn, maybe waiting for approval, and is never closed.
+//! - `turn`: when the agent last went quiet, with the session and its
+//!   transcript: written with `idle`, and by `SessionStart` when the session
+//!   opens, so one never used closes too; removed with `idle`, but kept across
+//!   a move. The session is unused from the later of that time and the
+//!   transcript's last write, in case something wakes the agent without
+//!   `UserPromptSubmit` (on 2.1.302 a finished background task does run it);
+//!   while the file is missing the agent is in a turn, maybe waiting for
+//!   approval, and is never closed. A turn cut with Esc runs no hook (measured
+//!   on 2.1.302, also no `idle_prompt` notification), so it stays a turn.
 //! - `move.json`: written by the status line wrapper when the session's
 //!   account passed the threshold, or by `StopFailure` on a rate limit.
+//!
+//! A background shell still running holds a move until the next turn end and
+//! counts as use for a close, for at most `close_idle` of its run time (see
+//! `background`): either would end it with Claude Code.
 //!
 //! Measured on Claude Code 2.1.301: SIGTERM exits in about 0.26 s and resets
 //! the terminal modes Claude Code set (bracketed paste, focus, mouse, kitty
@@ -45,10 +52,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::account::{Account, Harness, create_private_dir};
 use crate::auto;
+use crate::background;
 use crate::config::{self, Config, HarnessConfig, Mode, Relaunch};
 use crate::limits::unix_millis;
 use crate::policy::Reason;
-use crate::registry::{self, Switch};
+use crate::registry::{self, Close, Switch};
+use crate::relaunch;
 use crate::store::Store;
 
 /// Set in the agent's environment: the pid of the `hats run` parent.
@@ -139,8 +148,9 @@ pub fn request_move(
     Ok(())
 }
 
-/// The turn that ended last. The file `turn` holds it as three lines: the
-/// time it ended in Unix milliseconds, the session, the transcript.
+/// When the agent last went quiet: its turn ended, or the session opened. The
+/// file `turn` holds it as three lines: that time in Unix milliseconds, the
+/// session, the transcript.
 pub struct Turn {
     session: String,
     transcript: Option<PathBuf>,
@@ -196,169 +206,36 @@ pub fn mark_busy(store: &Store) -> io::Result<()> {
     gone("idle").and(turn)
 }
 
+/// `SessionStart` hook: the session opened and waits for its first prompt.
+pub fn mark_opened(store: &Store, turn: &Turn) -> io::Result<()> {
+    let Some((pid, dir)) = parent_dir(store) else {
+        return Ok(());
+    };
+    turn.write(&dir)?;
+    wake(pid);
+    Ok(())
+}
+
 /// `Stop` and `StopFailure` hooks: the agent is idle. A rate limit error asks
-/// for a move even without status line data.
-pub fn mark_idle(store: &Store, turn: &Turn, rate_limited: bool) -> io::Result<()> {
+/// for a move even without status line data, when sessions move.
+pub fn mark_idle(
+    store: &Store,
+    config: &HarnessConfig,
+    turn: &Turn,
+    rate_limited: bool,
+) -> io::Result<()> {
     let Some((pid, dir)) = parent_dir(store) else {
         return Ok(());
     };
     turn.write(&dir)?;
     // A parent from before `turn` reads only this.
     fs::write(dir.join("idle"), turn.ended.to_string())?;
-    if rate_limited {
+    if rate_limited && moves(config) {
         write_request(&dir, &turn.session, Reason::Limit)?;
     }
     wake(pid);
     Ok(())
 }
-
-/// Claude Code arguments that select the conversation or start a new turn;
-/// on a relaunch they are replaced by `--resume <session>`.
-const DROP_WITH_VALUE: &[&str] = &["--session-id"];
-const DROP_WITH_OPTIONAL_VALUE: &[&str] = &["-r", "--resume", "--from-pr", "--teleport"];
-const DROP: &[&str] = &["-c", "--continue", "--fork-session"];
-/// Kept with their single value (Claude Code 2.1.301 `--help`).
-const WITH_VALUE: &[&str] = &[
-    "--agent",
-    "--agents",
-    "--append-system-prompt",
-    "--autocompact",
-    "--debug-file",
-    "--effort",
-    "--environment",
-    "--fallback-model",
-    "--input-format",
-    "--json-schema",
-    "--max-budget-usd",
-    "--model",
-    "-n",
-    "--name",
-    "--output-format",
-    "--permission-mode",
-    "--permission-prompt-tool",
-    "--remote-control-session-name-prefix",
-    "--setting-sources",
-    "--settings",
-    "--system-prompt",
-    "--system-prompt-snapshot",
-];
-/// Kept with every following value that does not start with `-`.
-const WITH_VALUES: &[&str] = &[
-    "--add-dir",
-    "--allowedTools",
-    "--allowed-tools",
-    "--betas",
-    "--disallowedTools",
-    "--disallowed-tools",
-    "--file",
-    "--mcp-config",
-    "--plugin-dir",
-    "--plugin-url",
-    "--tools",
-];
-/// Kept as they are; never followed by a value.
-const FLAGS: &[&str] = &[
-    "--allow-dangerously-skip-permissions",
-    "--ax-screen-reader",
-    "--bare",
-    "--brief",
-    "--chrome",
-    "--dangerously-skip-permissions",
-    "--disable-slash-commands",
-    "--exclude-dynamic-system-prompt-sections",
-    "--ide",
-    "--no-chrome",
-    "--restricted",
-    "--safe-mode",
-    "--strict-mcp-config",
-    "--verbose",
-];
-/// Not an interactive session: run as a plain exec.
-const NOT_INTERACTIVE: &[&str] = &["-p", "--print", "-h", "--help", "-v", "--version"];
-
-/// The arguments for `claude --resume <session>` that keep the user's
-/// options, or `None` when they cannot be read safely (a subcommand, print
-/// mode, or an option this table does not know followed by a value).
-pub fn relaunch_args(original: &[OsString], session: &str) -> Option<Vec<OsString>> {
-    let mut kept: Vec<OsString> = Vec::new();
-    let mut args = original.iter().peekable();
-    let is_value = |a: Option<&&OsString>| a.is_some_and(|a| !a.to_string_lossy().starts_with('-'));
-    let mut saw_prompt = false;
-    while let Some(arg) = args.next() {
-        let text = arg.to_str()?;
-        let name = text.split_once('=').map_or(text, |(n, _)| n);
-        let inline_value = text.contains('=');
-        if NOT_INTERACTIVE.contains(&name) {
-            return None;
-        }
-        if DROP.contains(&name) {
-            continue;
-        }
-        if DROP_WITH_VALUE.contains(&name) {
-            if !inline_value {
-                args.next()?;
-            }
-            continue;
-        }
-        if DROP_WITH_OPTIONAL_VALUE.contains(&name) {
-            if !inline_value && is_value(args.peek()) {
-                args.next();
-            }
-            continue;
-        }
-        if WITH_VALUE.contains(&name) {
-            kept.push(arg.clone());
-            if !inline_value {
-                kept.push(args.next()?.clone());
-            }
-            continue;
-        }
-        if WITH_VALUES.contains(&name) {
-            kept.push(arg.clone());
-            while is_value(args.peek()) {
-                kept.push(args.next()?.clone());
-            }
-            continue;
-        }
-        if FLAGS.contains(&name) {
-            kept.push(arg.clone());
-            continue;
-        }
-        if text.starts_with('-') {
-            // Unknown option: keep it only if it cannot be swallowing a value.
-            if is_value(args.peek()) {
-                return None;
-            }
-            kept.push(arg.clone());
-            continue;
-        }
-        // The first word is either a subcommand (`claude mcp ...`) or the
-        // initial prompt, which already ran and must not run again.
-        if kept.is_empty() && !saw_prompt && SUBCOMMANDS.contains(&text) {
-            return None;
-        }
-        saw_prompt = true;
-    }
-    kept.push("--resume".into());
-    kept.push(session.into());
-    Some(kept)
-}
-
-const SUBCOMMANDS: &[&str] = &[
-    "agents",
-    "auth",
-    "config",
-    "doctor",
-    "gateway",
-    "install",
-    "mcp",
-    "migrate-installer",
-    "plugin",
-    "plugins",
-    "setup-token",
-    "update",
-    "upgrade",
-];
 
 /// Whether `hats run` should stay as the parent of this launch: an
 /// interactive Claude Code session that may move or close, whose settings
@@ -369,7 +246,7 @@ pub fn should_supervise(account: &Account, config: &Config, args: &[OsString]) -
     account.harness == Harness::Claude
         && (moves(&config.claude) || config.close_idle.is_some())
         && tty
-        && relaunch_args(args, "probe").is_some()
+        && relaunch::args(args, "probe").is_some()
         && idle_hooks_installed(&account.dir.join("settings.json"))
 }
 
@@ -448,14 +325,17 @@ enum Plan {
         to: Account,
         id: String,
         reason: Reason,
+        session: String,
     },
     /// The session went unused this long: close it.
-    Close(Duration),
+    Close { after: Duration, session: String },
+    /// A signal was passed on to the agent: no move or close, leave when it
+    /// does.
+    Leave,
 }
 
 struct Ending {
     plan: Plan,
-    session: String,
     term_sent: bool,
 }
 
@@ -517,7 +397,7 @@ pub fn supervise(
         }
         let mut ending: Option<Ending> = None;
         // After a move the clock goes on from the last turn.
-        schedule_close(&dir, current().close_idle, SystemTime::now());
+        schedule_close(&dir, child.id(), current().close_idle, SystemTime::now());
 
         let status = loop {
             match waited.wait() {
@@ -546,35 +426,55 @@ pub fn supervise(
                             continue;
                         }
                     }
-                    schedule_close(&dir, config.close_idle, SystemTime::now());
+                    schedule_close(&dir, child.id(), config.close_idle, SystemTime::now());
                 }
                 libc::SIGUSR1 => {}
-                libc::SIGALRM => {
-                    let Some(e) = ending.as_mut() else {
-                        ending = close_if_due(&dir, current().close_idle, &child);
-                        continue;
-                    };
-                    if e.term_sent {
+                libc::SIGALRM => match ending.as_mut() {
+                    None => ending = close_if_due(&dir, current().close_idle, &child),
+                    Some(Ending {
+                        plan: Plan::Leave, ..
+                    }) => {}
+                    Some(e) if e.term_sent => {
                         // SAFETY: our own child.
                         unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGKILL) };
-                    } else if !dir.join("idle").exists() {
-                        // A prompt arrived during a move's grace period: try
-                        // again at the next idle point.
-                        let e = ending.take().expect("checked");
-                        if let Plan::Move { reason, .. } = e.plan {
-                            let _ = write_request(&dir, &e.session, reason);
-                        }
-                        schedule_close(&dir, current().close_idle, SystemTime::now());
-                    } else {
-                        terminate(&child, e);
                     }
-                }
+                    // The end of a move's grace period.
+                    Some(e) => {
+                        let config = current();
+                        let hold = config.close_idle.unwrap_or(config::CLOSE_IDLE);
+                        if dir.join("idle").exists()
+                            && !shell_running(child.id(), hold, SystemTime::now())
+                        {
+                            terminate(&child, e);
+                            continue;
+                        }
+                        // A prompt arrived, or a background shell is still
+                        // running: try again at the next idle point.
+                        if let Some(Ending {
+                            plan:
+                                Plan::Move {
+                                    reason, session, ..
+                                },
+                            ..
+                        }) = ending.take()
+                        {
+                            let _ = write_request(&dir, &session, reason);
+                        }
+                        schedule_close(&dir, child.id(), config.close_idle, SystemTime::now());
+                    }
+                },
                 // The terminal closed or someone asked us to stop: pass it on,
                 // drop any move or close and leave when the agent does.
                 sig => {
-                    ending = None;
-                    // SAFETY: our own child.
-                    unsafe { libc::kill(child.id() as libc::pid_t, sig) };
+                    ending = Some(Ending {
+                        plan: Plan::Leave,
+                        term_sent: false,
+                    });
+                    // SAFETY: cancels a pending alarm; our own child.
+                    unsafe {
+                        libc::alarm(0);
+                        libc::kill(child.id() as libc::pid_t, sig);
+                    }
                 }
             }
         };
@@ -583,8 +483,13 @@ pub fn supervise(
 
         match ending {
             Some(Ending {
-                plan: Plan::Move { to, id, reason },
-                session,
+                plan:
+                    Plan::Move {
+                        to,
+                        id,
+                        reason,
+                        session,
+                    },
                 term_sent: true,
             }) => {
                 let line = Switch::new(
@@ -597,18 +502,29 @@ pub fn supervise(
                     Some(reason),
                 );
                 registry::append(&store.registry(), &line).map_err(|e| e.to_string())?;
-                args = relaunch_args(&args, &session).expect("checked before supervising");
+                args = relaunch::args(&args, &session).expect("checked before supervising");
                 account = to;
                 let _ = fs::remove_file(dir.join("idle"));
             }
             Some(Ending {
-                plan: Plan::Close(after),
-                session,
+                plan: Plan::Close { after, session },
                 term_sent: true,
             }) => {
-                eprintln!(
-                    "hats: closed this session after {} without use. Resume it with: claude --resume {session}",
-                    config::show_close_idle(Some(after))
+                let idle = config::show_close_idle(Some(after));
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let line = Close::new(
+                    SystemTime::now(),
+                    &session,
+                    &account.label,
+                    idle.clone(),
+                    &cwd,
+                );
+                // Both are a courtesy: the session is closed either way, and a
+                // closed terminal must not turn into a crash.
+                let _ = registry::append(&store.closes(), &line);
+                let _ = writeln!(
+                    io::stderr(),
+                    "hats: closed this session after {idle} without use. Resume it with: claude --resume {session}"
                 );
                 return Ok(0);
             }
@@ -628,16 +544,38 @@ fn terminate(child: &Child, ending: &mut Ending) {
     }
 }
 
+/// Until when a background shell that started at `started` counts as use:
+/// while it runs, for at most `hold` of its run time, so one that never ends
+/// does not hold the session forever.
+fn in_use_until(started: SystemTime, hold: Duration, now: SystemTime) -> SystemTime {
+    started.checked_add(hold).map_or(now, |end| end.min(now))
+}
+
+/// Whether `agent` runs a background shell that still counts as use.
+fn shell_running(agent: u32, hold: Duration, now: SystemTime) -> bool {
+    background::newest(agent).is_some_and(|started| in_use_until(started, hold, now) >= now)
+}
+
 /// How long until the session closes, and its id, if the agent is idle:
-/// `after` from its last use, the later of its last turn's end and its
-/// transcript's last write. Zero when it is due.
-fn time_to_close(dir: &Path, after: Duration, now: SystemTime) -> Option<(Duration, String)> {
+/// `after` from its last use, the latest of its last turn's end, its
+/// transcript's last write and the use of the newest background shell, which
+/// started at `shell`. Zero when it is due.
+fn time_to_close(
+    dir: &Path,
+    after: Duration,
+    shell: Option<SystemTime>,
+    now: SystemTime,
+) -> Option<(Duration, String)> {
     let turn = Turn::read(dir)?;
     let ended = UNIX_EPOCH + Duration::from_millis(turn.ended);
     let written = turn
         .transcript
         .and_then(|t| fs::metadata(t).and_then(|m| m.modified()).ok());
-    let used = written.map_or(ended, |w| w.max(ended));
+    let running = shell.map(|started| in_use_until(started, after, now));
+    let used = [written, running]
+        .into_iter()
+        .flatten()
+        .fold(ended, SystemTime::max);
     let left = used.checked_add(after).map_or(Duration::MAX, |due| {
         due.duration_since(now).unwrap_or_default()
     });
@@ -646,8 +584,9 @@ fn time_to_close(dir: &Path, after: Duration, now: SystemTime) -> Option<(Durati
 
 /// Sets the alarm for the next check of the clock for closing, at most
 /// `CHECK_SECS` away, or clears it while the agent is busy or closing is off.
-fn schedule_close(dir: &Path, after: Option<Duration>, now: SystemTime) {
-    let secs = match after.and_then(|after| time_to_close(dir, after, now)) {
+fn schedule_close(dir: &Path, agent: u32, after: Option<Duration>, now: SystemTime) {
+    let left = after.and_then(|after| time_to_close(dir, after, background::newest(agent), now));
+    let secs = match left {
         Some((left, _)) => {
             let whole = left
                 .as_secs()
@@ -665,18 +604,18 @@ fn schedule_close(dir: &Path, after: Option<Duration>, now: SystemTime) {
 fn close_if_due(dir: &Path, after: Option<Duration>, child: &Child) -> Option<Ending> {
     let now = SystemTime::now();
     if let Some(after) = after
-        && let Some((left, session)) = time_to_close(dir, after, now)
+        && let Some((left, session)) =
+            time_to_close(dir, after, background::newest(child.id()), now)
         && left.is_zero()
     {
         let mut ending = Ending {
-            plan: Plan::Close(after),
-            session,
+            plan: Plan::Close { after, session },
             term_sent: false,
         };
         terminate(child, &mut ending);
         return Some(ending);
     }
-    schedule_close(dir, after, now);
+    schedule_close(dir, child.id(), after, now);
     None
 }
 
@@ -706,8 +645,8 @@ fn plan_move(
             to: to.account.clone(),
             id: to.id.clone()?,
             reason,
+            session: request.session,
         },
-        session: request.session,
         term_sent: false,
     })
 }
@@ -855,64 +794,6 @@ impl Drop for RemoveOnDrop {
 mod tests {
     use super::*;
 
-    fn args(list: &[&str]) -> Vec<OsString> {
-        list.iter().map(OsString::from).collect()
-    }
-
-    fn relaunch(list: &[&str]) -> Option<Vec<String>> {
-        relaunch_args(&args(list), "S")
-            .map(|v| v.into_iter().map(|a| a.into_string().unwrap()).collect())
-    }
-
-    #[test]
-    fn keeps_options_and_resumes_the_session() {
-        assert_eq!(relaunch(&[]).unwrap(), ["--resume", "S"]);
-        assert_eq!(
-            relaunch(&[
-                "--dangerously-skip-permissions",
-                "--model",
-                "opus",
-                "--add-dir",
-                "a",
-                "b",
-                "--verbose"
-            ])
-            .unwrap(),
-            [
-                "--dangerously-skip-permissions",
-                "--model",
-                "opus",
-                "--add-dir",
-                "a",
-                "b",
-                "--verbose",
-                "--resume",
-                "S"
-            ]
-        );
-        assert_eq!(
-            relaunch(&["--effort=high", "-c"]).unwrap(),
-            ["--effort=high", "--resume", "S"]
-        );
-    }
-
-    #[test]
-    fn drops_the_old_session_and_the_initial_prompt() {
-        assert_eq!(
-            relaunch(&["--resume", "OLD", "--model", "x"]).unwrap(),
-            ["--model", "x", "--resume", "S"]
-        );
-        assert_eq!(relaunch(&["-r"]).unwrap(), ["--resume", "S"]);
-        assert_eq!(
-            relaunch(&["--session-id", "ID", "fix the bug"]).unwrap(),
-            ["--resume", "S"]
-        );
-        assert_eq!(
-            relaunch(&["--model", "x", "fix the bug"]).unwrap(),
-            ["--model", "x", "--resume", "S"]
-        );
-    }
-
     #[test]
     fn a_run_directory_starts_empty() {
         let tmp = tempfile::tempdir().unwrap();
@@ -959,7 +840,7 @@ mod tests {
         let now = UNIX_EPOCH + Duration::from_millis(unix_millis(SystemTime::now()));
         let turn = Turn::new("s".into(), Some(transcript.clone()), now - 3 * hour);
         turn.write(dir.path()).unwrap();
-        let left = |after: Duration| time_to_close(dir.path(), after, now).map(|(l, _)| l);
+        let left = |after: Duration| time_to_close(dir.path(), after, None, now).map(|(l, _)| l);
 
         let file = fs::File::options().write(true).open(&transcript).unwrap();
         file.set_modified(now - 5 * hour).unwrap();
@@ -968,21 +849,27 @@ mod tests {
         file.set_modified(now - hour).unwrap();
         assert_eq!(left(2 * hour), Some(hour), "a newer write restarts it");
         assert_eq!(left(Duration::MAX), Some(Duration::MAX), "never due");
-        schedule_close(dir.path(), Some(Duration::MAX), now);
+        schedule_close(dir.path(), std::process::id(), Some(Duration::MAX), now);
         // SAFETY: reads and clears the alarm just set.
         assert_eq!(unsafe { libc::alarm(0) }, CHECK_SECS as u32);
         fs::remove_file(&transcript).unwrap();
         assert_eq!(left(4 * hour), Some(hour), "no transcript: the turn's end");
 
+        // A background shell is use while it runs, up to `after` of its run.
+        let shell = |started: SystemTime, after: Duration| {
+            time_to_close(dir.path(), after, Some(started), now).map(|(l, _)| l)
+        };
+        assert_eq!(shell(now - hour, 4 * hour), Some(4 * hour), "running");
+        assert_eq!(shell(now - 5 * hour, 4 * hour), Some(3 * hour), "for 4h");
+        assert_eq!(
+            shell(now - 9 * hour, 4 * hour),
+            Some(hour),
+            "the turn is later"
+        );
+        assert!(in_use_until(now - hour, 2 * hour, now) >= now);
+        assert!(in_use_until(now - 3 * hour, 2 * hour, now) < now);
+
         fs::remove_file(dir.path().join("turn")).unwrap();
         assert_eq!(left(hour), None, "busy");
-    }
-
-    #[test]
-    fn refuses_what_it_cannot_read() {
-        assert_eq!(relaunch(&["-p", "hi"]), None);
-        assert_eq!(relaunch(&["mcp", "list"]), None);
-        assert_eq!(relaunch(&["--unknown-option", "value"]), None);
-        assert!(relaunch(&["--unknown-flag"]).is_some());
     }
 }

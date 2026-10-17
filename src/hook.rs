@@ -1,8 +1,9 @@
 //! Claude Code hooks. They inherit the session's environment, so
 //! `CLAUDE_CONFIG_DIR` names the account, and get the session on stdin.
 //!
-//! - `SessionStart`: records which account the session runs with. A resume
-//!   under another account writes a new line; the newest line wins.
+//! - `SessionStart`: records which account the session runs with, and starts
+//!   a `hats run` parent's clock for closing. A resume under another account
+//!   writes a new line; the newest line wins.
 //! - `UserPromptSubmit`, `Stop`, `StopFailure`: tell a `hats run` parent when
 //!   the agent is working or idle; a rate limit error marks the account full
 //!   and moves the default off it.
@@ -59,10 +60,22 @@ pub fn session_start(
     now: SystemTime,
 ) -> Result<(), String> {
     let input = read_input(stdin)?;
-    // Compaction keeps the session and its account.
+    // Compaction keeps the session and its account, and may run mid-turn.
     if input.source.as_deref() == Some("compact") {
         return Ok(());
     }
+    let recorded = record_account(store, config_dir, &input.session_id, now);
+    let turn = supervisor::Turn::new(input.session_id, input.transcript_path, now);
+    supervisor::mark_opened(store, &turn).map_err(|e| e.to_string())?;
+    recorded
+}
+
+fn record_account(
+    store: &Store,
+    config_dir: Option<OsString>,
+    session: &str,
+    now: SystemTime,
+) -> Result<(), String> {
     let account = session_account(store, config_dir);
     let Some(id) = account.provider_id(store).map_err(|e| e.to_string())? else {
         return Ok(());
@@ -74,7 +87,7 @@ pub fn session_start(
         &id,
         &account.label,
         &account.dir,
-        Some(&input.session_id),
+        Some(session),
         None,
     );
     registry::append(&store.registry(), &line).map_err(|e| e.to_string())
@@ -110,5 +123,5 @@ pub fn stop(
         )?;
     }
     let turn = supervisor::Turn::new(input.session_id, input.transcript_path, now);
-    supervisor::mark_idle(store, &turn, rate_limited).map_err(|e| e.to_string())
+    supervisor::mark_idle(store, config, &turn, rate_limited).map_err(|e| e.to_string())
 }

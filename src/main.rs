@@ -1,11 +1,13 @@
 mod account;
 mod auto;
+mod background;
 mod config;
 mod hook;
 mod import;
 mod limits;
 mod policy;
 mod registry;
+mod relaunch;
 mod setup;
 mod statusline;
 mod store;
@@ -442,7 +444,9 @@ fn launch(
         return Err(Failure::Exit(code.clamp(0, 255) as u8));
     }
     let mut cmd = Command::new(harness.program());
-    cmd.args(args);
+    // Started from inside a supervised session (`claude -p` in the agent's
+    // turn), its hooks must not tell that session's parent it is idle.
+    cmd.args(args).env_remove(supervisor::PID_ENV);
     Err(exec(cmd, &account).into())
 }
 
