@@ -110,12 +110,8 @@ struct Done {
     index: usize,
     harness: Harness,
     entry: Option<FileEntry>,
-    ctxs: Vec<Ctx>,
-    rows: Vec<Row>,
     bytes: u64,
-    duplicates: u64,
-    fallback: u64,
-    skipped: u64,
+    out: Out,
 }
 
 pub fn scan(tally: &mut Tally, input: &Input) -> Stats {
@@ -177,11 +173,12 @@ pub fn scan(tally: &mut Tally, input: &Input) -> Stats {
 }
 
 fn count(totals: &mut Totals, seen: &mut Seen, done: &Done, stats: &mut Stats) {
+    let out = &done.out;
     stats.bytes += done.bytes;
-    stats.duplicates += done.duplicates;
-    stats.fallback += done.fallback;
-    stats.skipped += done.skipped;
-    let ids: Vec<(u32, u32, u32)> = done
+    stats.duplicates += out.duplicates;
+    stats.fallback += out.fallback;
+    stats.skipped += out.skipped;
+    let ids: Vec<(u32, u32, u32)> = out
         .ctxs
         .iter()
         .map(|c| {
@@ -192,7 +189,7 @@ fn count(totals: &mut Totals, seen: &mut Seen, done: &Done, stats: &mut Stats) {
             )
         })
         .collect();
-    for row in &done.rows {
+    for row in &out.rows {
         if row.key != 0 && !seen.add(row.key, row.utc_day) {
             stats.duplicates += 1;
             continue;
@@ -216,17 +213,17 @@ fn queue(state: &mut ScanState, input: &Input, stats: &mut Stats) -> Vec<Job> {
     let mut live_dirs = HashSet::new();
     let mut live_files = HashSet::new();
     let mut jobs = Vec::new();
-    let mut push = |state: &ScanState, path: PathBuf, key: String, job: Job| {
+    let mut push = |state: &ScanState, job: Job| {
         stats.files += 1;
-        if !live_files.insert(key.clone()) {
+        if !live_files.insert(job.key.clone()) {
             return;
         }
-        let Ok(size) = fs::metadata(&path).map(|m| m.len()) else {
+        let Ok(size) = fs::metadata(&job.path).map(|m| m.len()) else {
             return;
         };
         if state
             .files
-            .get(&key)
+            .get(&job.key)
             .is_some_and(|e| e.s == size && e.o <= size)
         {
             return;
@@ -248,14 +245,14 @@ fn queue(state: &mut ScanState, input: &Input, stats: &mut Stats) -> Vec<Job> {
             .map(|s| s.to_string_lossy().into_owned());
             let key = path.to_string_lossy().into_owned();
             let job = Job {
-                path: path.clone(),
-                key: key.clone(),
+                path,
+                key,
                 size: 0,
                 harness: Harness::Claude,
                 config_dir: config_dir.clone(),
                 session,
             };
-            push(state, path, key, job);
+            push(state, job);
         }
     }
     for home in &input.roots.codex {
@@ -268,14 +265,14 @@ fn queue(state: &mut ScanState, input: &Input, stats: &mut Stats) -> Vec<Job> {
                 let id = path.file_stem().unwrap_or_default().to_string_lossy();
                 let key = format!("codex:{id}");
                 let job = Job {
-                    path: path.clone(),
-                    key: key.clone(),
+                    path,
+                    key,
                     size: 0,
                     harness: Harness::Codex,
                     config_dir: home.to_string_lossy().into_owned(),
                     session: None,
                 };
-                push(state, path, key, job);
+                push(state, job);
             }
         }
     }
@@ -432,6 +429,10 @@ struct Reader<'a> {
     repos: &'a Mutex<Repos>,
     buf: Vec<u8>,
     days: HashMap<i64, Day>,
+    /// Keys of the log being read already in its rows: a response is
+    /// written once per content block, and only its first row needs to
+    /// reach the count.
+    keys: HashSet<u64>,
 }
 
 impl<'a> Reader<'a> {
@@ -441,6 +442,7 @@ impl<'a> Reader<'a> {
             repos,
             buf: vec![0; input.chunk],
             days: HashMap::new(),
+            keys: HashSet::new(),
         }
     }
 
@@ -467,27 +469,16 @@ impl<'a> Reader<'a> {
     }
 
     fn read(&mut self, index: usize, job: &Job, mut entry: FileEntry) -> Done {
-        let mut out = Out {
-            ctxs: Vec::new(),
-            rows: Vec::new(),
-            keys: HashSet::new(),
-            duplicates: 0,
-            fallback: 0,
-            skipped: 0,
-        };
-        let done = |entry, bytes, out: Out| Done {
-            index,
-            harness: job.harness,
-            entry,
-            ctxs: out.ctxs,
-            rows: out.rows,
-            bytes,
-            duplicates: out.duplicates,
-            fallback: out.fallback,
-            skipped: out.skipped,
-        };
+        let mut out = Out::default();
+        self.keys.clear();
         let Ok(file) = File::open(&job.path) else {
-            return done(None, 0, out);
+            return Done {
+                index,
+                harness: job.harness,
+                entry: None,
+                bytes: 0,
+                out,
+            };
         };
         if job.size < entry.o {
             // Rewritten: start over.
@@ -514,7 +505,13 @@ impl<'a> Reader<'a> {
         self.buf = buf;
         entry.o = offset;
         entry.s = job.size;
-        done(Some(entry), bytes, out)
+        Done {
+            index,
+            harness: job.harness,
+            entry: Some(entry),
+            bytes,
+            out,
+        }
     }
 
     fn claude_row(&mut self, b: &[u8], m: usize, job: &Job, entry: &mut FileEntry, out: &mut Out) {
@@ -625,7 +622,7 @@ impl<'a> Reader<'a> {
         if msg.model == "<synthetic>" {
             return;
         }
-        if msg.key != 0 && !out.keys.insert(msg.key) {
+        if msg.key != 0 && !self.keys.insert(msg.key) {
             out.duplicates += 1;
             return;
         }
@@ -742,12 +739,10 @@ impl<'a> Reader<'a> {
     }
 }
 
+#[derive(Default)]
 struct Out {
     ctxs: Vec<Ctx>,
     rows: Vec<Row>,
-    /// Keys already in `rows`: a response is written once per content
-    /// block, and only its first row needs to reach the count.
-    keys: HashSet<u64>,
     duplicates: u64,
     fallback: u64,
     skipped: u64,

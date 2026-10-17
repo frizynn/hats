@@ -404,18 +404,13 @@ impl Tally {
         for entry in fs::read_dir(dir)?.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            let keep = |prefix: &str, n: u64| {
-                name.strip_prefix(prefix)
-                    .and_then(|rest| rest.split('.').next())
-                    .is_none_or(|g| g.parse() != Ok(n))
-            };
-            let stale = if name.starts_with("scan.") {
-                keep("scan.", scan)
-            } else if name.starts_with("seen.") {
-                keep("seen.", seen)
-            } else {
-                false
-            };
+            let stale = [("scan.", scan), ("seen.", seen)]
+                .iter()
+                .any(|(prefix, n)| {
+                    name.strip_prefix(prefix).is_some_and(|rest| {
+                        rest.split('.').next().and_then(|g| g.parse().ok()) != Some(*n)
+                    })
+                });
             if stale {
                 let _ = fs::remove_file(entry.path());
             }
