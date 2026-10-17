@@ -24,8 +24,8 @@ use serde::{Deserialize, Serialize};
 use super::Day;
 use super::accounts::{Book, CODEX_UNASSIGNED, codex_account};
 use super::bytes::{
-    find, hash, iso_ms_at, object_end, rfind, starts_with_at, string_end, text, top_level_fields,
-    uint_at,
+    find, hash, iso_ms_at, object_at, object_end, rfind, starts_with_at, string_at, string_end,
+    text, top_level_fields, uint_at,
 };
 use super::repos::repo_of;
 use crate::account::Harness;
@@ -773,6 +773,36 @@ static NEEDLES: LazyLock<Needles> = LazyLock::new(|| Needles {
     request_id: memmem::FinderRev::new(REQUEST_ID),
 });
 
+const CODEX_USAGE_KEYS: [&[u8]; 5] = [
+    b"input_tokens",
+    b"cached_input_tokens",
+    b"output_tokens",
+    b"reasoning_output_tokens",
+    b"cache_write_input_tokens",
+];
+
+/// The tokens in the `usage` object spanning `[open, close]`.
+fn usage_of(b: &[u8], (open, close): (usize, usize)) -> Message<'static> {
+    let [input, output, write, read, cache_creation, speed] =
+        top_level_fields(b, open, close, &USAGE_KEYS);
+    let num = |at: Option<usize>| at.map_or(0, |at| uint_at(b, at));
+    let write_1h = object_at(b, cache_creation).map_or(0, |(open, close)| {
+        let [v] = top_level_fields(b, open, close, &[b"ephemeral_1h_input_tokens"]);
+        num(v)
+    });
+    Message {
+        key: 0,
+        ms: 0,
+        model: "",
+        fast: string_at(b, speed) == Some(b"fast"),
+        input: num(input),
+        output: num(output),
+        write: num(write),
+        write_1h,
+        read: num(read),
+    }
+}
+
 /// A Claude request as read from its row.
 struct Message<'b> {
     key: u64,
@@ -912,28 +942,12 @@ impl<'a> Reader<'a> {
                 let from = c + CWD.len();
                 string_end(b, from, le).map(|to| &b[from..to])
             });
-            let [input, output, write, read, cache_creation, speed] =
-                top_level_fields(b, open, close, &USAGE_KEYS);
-            let write_1h = cache_creation
-                .filter(|&at| b[at] == b'{')
-                .and_then(|at| {
-                    let end = object_end(b, at, close + 1)?;
-                    let [v] = top_level_fields(b, at, end, &[b"ephemeral_1h_input_tokens"]);
-                    v.map(|v| uint_at(b, v))
-                })
-                .unwrap_or(0);
-            let num = |at: Option<usize>| at.map_or(0, |at| uint_at(b, at));
             Some((
                 Message {
                     key: hash(&b[id_from..id_to], &b[req_from..req_to]),
                     ms,
                     model,
-                    fast: speed.is_some_and(|at| starts_with_at(b, at, br#""fast""#)),
-                    input: num(input),
-                    output: num(output),
-                    write: num(write),
-                    write_1h,
-                    read: num(read),
+                    ..usage_of(b, (open, close))
                 },
                 cwd,
             ))
@@ -951,76 +965,47 @@ impl<'a> Reader<'a> {
         }
     }
 
-    /// A row the fast path cannot vouch for, parsed whole. Same result,
-    /// slower.
+    /// A row the fast path cannot vouch for, read by its structure, in any
+    /// key order. Same result, slower.
     fn claude_fallback(&mut self, b: &[u8], job: &Job, entry: &mut FileEntry, out: &mut Out) {
-        #[derive(Deserialize)]
-        struct Line {
-            #[serde(rename = "type")]
-            kind: Option<serde_json::Value>,
-            cwd: Option<serde_json::Value>,
-            #[serde(rename = "requestId")]
-            request_id: Option<serde_json::Value>,
-            timestamp: Option<serde_json::Value>,
-            message: Option<Msg>,
-        }
-        #[derive(Deserialize)]
-        struct Msg {
-            id: Option<serde_json::Value>,
-            model: Option<serde_json::Value>,
-            usage: Option<serde_json::Value>,
-        }
         out.fallback += 1;
-        let Ok(line) = serde_json::from_slice::<Line>(b) else {
+        let Some((open, close)) = object_at(b, memchr(b'{', b)) else {
             out.skipped += 1;
             return;
         };
+        let [kind, cwd, req, ts, message] = top_level_fields(
+            b,
+            open,
+            close,
+            &[b"type", b"cwd", b"requestId", b"timestamp", b"message"],
+        );
         if entry.r.is_none()
-            && let Some(cwd) = line.cwd.as_ref().and_then(|v| v.as_str())
+            && let Some(cwd) = string_at(b, cwd)
         {
-            entry.r = Some(self.repo(cwd));
+            entry.r = Some(self.repo(&text(cwd)));
         }
-        let message = line.message.as_ref();
-        let usage = message
-            .and_then(|m| m.usage.as_ref())
-            .filter(|u| u.is_object());
-        let ms = line
-            .timestamp
-            .as_ref()
-            .and_then(|v| v.as_str())
-            .and_then(|s| iso_ms_at(s.as_bytes(), 0));
-        let (Some(usage), Some(ms)) = (usage, ms) else {
+        let Some((open, close)) = object_at(b, message) else {
             return;
         };
-        if line.kind.as_ref().and_then(|v| v.as_str()) != Some("assistant") {
+        let [id, model, usage] = top_level_fields(b, open, close, &[b"id", b"model", b"usage"]);
+        let ms = string_at(b, ts).and_then(|t| iso_ms_at(t, 0));
+        let (Some(usage), Some(ms)) = (object_at(b, usage), ms) else {
+            return;
+        };
+        if string_at(b, kind) != Some(b"assistant") {
             return;
         }
-        let n = |v: Option<&serde_json::Value>| v.and_then(|v| v.as_u64()).unwrap_or(0);
-        let id = message.and_then(|m| m.id.as_ref()?.as_str()).unwrap_or("");
-        let req = line
-            .request_id
-            .as_ref()
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let model = message
-            .and_then(|m| m.model.as_ref()?.as_str())
-            .unwrap_or("unknown");
+        let (id, req) = (string_at(b, id), string_at(b, req));
         let msg = Message {
-            key: if id.is_empty() || req.is_empty() {
-                0
-            } else {
-                hash(id.as_bytes(), req.as_bytes())
+            key: match (id, req) {
+                (Some(id), Some(req)) if !id.is_empty() && !req.is_empty() => hash(id, req),
+                _ => 0,
             },
             ms,
-            model,
-            fast: usage.get("speed").and_then(|v| v.as_str()) == Some("fast"),
-            input: n(usage.get("input_tokens")),
-            output: n(usage.get("output_tokens")),
-            write: n(usage.get("cache_creation_input_tokens")),
-            write_1h: n(usage
-                .get("cache_creation")
-                .and_then(|c| c.get("ephemeral_1h_input_tokens"))),
-            read: n(usage.get("cache_read_input_tokens")),
+            model: string_at(b, model)
+                .and_then(|m| std::str::from_utf8(m).ok())
+                .unwrap_or("unknown"),
+            ..usage_of(b, usage)
         };
         self.claude_count(&msg, job, entry, out);
     }
@@ -1087,67 +1072,41 @@ impl<'a> Reader<'a> {
             }
             return;
         }
-        #[derive(Deserialize)]
-        struct Line {
-            timestamp: Option<String>,
-            payload: Option<Payload>,
-        }
-        #[derive(Deserialize)]
-        struct Payload {
-            #[serde(rename = "type")]
-            kind: Option<String>,
-            info: Option<Info>,
-        }
-        #[derive(Deserialize)]
-        struct Info {
-            total_token_usage: Option<Usage>,
-            last_token_usage: Option<Usage>,
-        }
-        #[derive(Deserialize, Default)]
-        struct Usage {
-            input_tokens: Option<serde_json::Number>,
-            cached_input_tokens: Option<serde_json::Number>,
-            output_tokens: Option<serde_json::Number>,
-            reasoning_output_tokens: Option<serde_json::Number>,
-            cache_write_input_tokens: Option<serde_json::Number>,
-        }
-        impl Usage {
-            fn cols(&self) -> [u64; 5] {
-                [
-                    &self.input_tokens,
-                    &self.cached_input_tokens,
-                    &self.output_tokens,
-                    &self.reasoning_output_tokens,
-                    &self.cache_write_input_tokens,
-                ]
-                .map(|n| n.as_ref().and_then(serde_json::Number::as_u64).unwrap_or(0))
-            }
-        }
-        let Ok(line) = serde_json::from_slice::<Line>(b) else {
+        let Some((open, close)) = object_at(b, memchr(b'{', b)) else {
             out.skipped += 1;
             return;
         };
-        let Some(payload) = line
-            .payload
-            .filter(|p| p.kind.as_deref() == Some("token_count"))
-        else {
+        let [ts, payload] = top_level_fields(b, open, close, &[b"timestamp", b"payload"]);
+        let Some((open, close)) = object_at(b, payload) else {
             return;
         };
-        let Some(ms) = line.timestamp.and_then(|t| iso_ms_at(t.as_bytes(), 0)) else {
+        let [kind, info] = top_level_fields(b, open, close, &[b"type", b"info"]);
+        if string_at(b, kind) != Some(b"token_count") {
+            return;
+        }
+        let Some(ms) = string_at(b, ts).and_then(|t| iso_ms_at(t, 0)) else {
             return;
         };
-        let Some(info) = payload.info else {
+        let Some((open, close)) = object_at(b, info) else {
             return;
         };
-        let Some(total) = info.total_token_usage else {
+        let [total, last] =
+            top_level_fields(b, open, close, &[b"total_token_usage", b"last_token_usage"]);
+        let Some(total) = object_at(b, total) else {
             return;
         };
-        let now = total.cols();
+        let cols = |object: Option<(usize, usize)>| {
+            object.map_or([0; 5], |(open, close)| {
+                top_level_fields(b, open, close, &CODEX_USAGE_KEYS)
+                    .map(|at| at.map_or(0, |at| uint_at(b, at)))
+            })
+        };
+        let now = cols(Some(total));
         let prev = entry.t.unwrap_or_default();
         // A counter that went down was reset (a resumed or compacted
         // session): this row's own use.
         let d = if now.iter().zip(prev).any(|(n, p)| *n < p) {
-            info.last_token_usage.unwrap_or_default().cols()
+            cols(object_at(b, last))
         } else {
             std::array::from_fn(|i| now[i] - prev[i])
         };

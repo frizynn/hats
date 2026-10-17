@@ -55,6 +55,18 @@ pub fn object_end(b: &[u8], open: usize, to: usize) -> Option<usize> {
     None
 }
 
+/// The span of the object whose `{` is at `at`.
+pub fn object_at(b: &[u8], at: Option<usize>) -> Option<(usize, usize)> {
+    let at = at.filter(|&at| b.get(at) == Some(&b'{'))?;
+    object_end(b, at, b.len()).map(|end| (at, end))
+}
+
+/// The bytes of the string whose opening quote is at `at`, as written.
+pub fn string_at(b: &[u8], at: Option<usize>) -> Option<&[u8]> {
+    let at = at.filter(|&at| b.get(at) == Some(&QUOTE))?;
+    string_end(b, at + 1, b.len()).map(|end| &b[at + 1..end])
+}
+
 /// End (exclusive) of the JSON string whose first character is at `from`.
 pub fn string_end(b: &[u8], from: usize, to: usize) -> Option<usize> {
     let mut i = from;
