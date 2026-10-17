@@ -264,3 +264,116 @@ fn totals_saved_by_a_newer_hats_are_left_alone() {
     assert!(stderr.contains("newer hats"), "{stderr}");
     assert_eq!(fs::read_to_string(&totals).unwrap(), newer);
 }
+
+/// `(date, account, account label, requests)` of each Claude row.
+fn claude_rows(doc: &Value) -> Vec<(String, String, String, u64)> {
+    doc["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["harness"] == "claude")
+        .map(|r| {
+            (
+                r["date"].as_str().unwrap().to_owned(),
+                r["account"].as_str().unwrap().to_owned(),
+                r["accountLabel"].as_str().unwrap().to_owned(),
+                r["requests"].as_u64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn claude_swap_slots_become_their_hats_accounts_and_stay_so_once_it_is_gone() {
+    let sb = Sandbox::new();
+    sb.signed_in("work", "org-work");
+    let work = format!("claude:{}", account_id(&sb, "work"));
+    let swap = sb.home.join(".claude-swap-backup");
+    // Local times: 09:00 three hours west is 12:00 UTC.
+    write(
+        &swap.join("claude-swap.log"),
+        "2026-01-30 09:00:00,000 - INFO - Added account 1\n\
+         2026-01-31 09:00:00,000 - INFO - Switched from account 1 to 2\n\
+         2026-02-01 09:00:00,000 - INFO - Switched from account 2 to 1\n",
+    );
+    // A session under hats the same day slot 1 was in use.
+    write(
+        &sb.registry(),
+        &format!(
+            "{}\n",
+            json!({"v": 1, "at": "2026-02-01T12:00:00.000Z", "harness": "claude",
+                "account": work.trim_start_matches("claude:"), "label": "work",
+                "configDir": sb.claude_dir("work"), "session": "s5"})
+        ),
+    );
+    let project = sb.home.join(".claude/projects/-work-demo");
+    write(
+        &project.join("s.jsonl"),
+        &[
+            assistant("msg_1", "a", "2026-01-30T15:00:00.000Z"),
+            assistant("msg_2", "b", "2026-01-31T15:00:00.000Z"),
+            assistant("msg_3", "c", "2026-02-01T15:00:00.000Z"),
+        ]
+        .concat(),
+    );
+    write(
+        &project.join("s5.jsonl"),
+        &assistant("msg_4", "d", "2026-02-01T16:00:00.000Z")
+            .replace(r#""sessionId":"s""#, r#""sessionId":"s5""#),
+    );
+    let row = |date: &str, account: &str, label: &str, requests| {
+        (
+            date.to_owned(),
+            account.to_owned(),
+            label.to_owned(),
+            requests,
+        )
+    };
+
+    // Without claude-swap's copies, as an older hats saved them: slots by number.
+    let slots = json_usage(&sb);
+    assert_eq!(
+        claude_rows(&slots),
+        [
+            row("2026-01-30", "claude:swap-1", "Account 1", 1),
+            row("2026-01-31", "claude:swap-2", "Account 2", 1),
+            row("2026-02-01", "claude:swap-1", "Account 1", 1),
+            row("2026-02-01", &work, "work", 1),
+        ]
+    );
+
+    // claude-swap's copy of slot 1; slot 2 has none.
+    write(
+        &swap.join("configs/.claude-config-1-user@example.com.json"),
+        &format!(
+            r#"{{"oauthAccount":{{"accountUuid":"{}","organizationUuid":"org-work","emailAddress":"user@example.com"}}}}"#,
+            common::ACCOUNT_UUID
+        ),
+    );
+    let joined = json_usage(&sb);
+    assert_eq!(
+        joined["scan"]["read"], 0,
+        "saved totals, not logs read again"
+    );
+    let expected = [
+        row("2026-01-30", &work, "work", 1),
+        row("2026-01-31", "claude:swap-2", "Account 2", 1),
+        row("2026-02-01", &work, "work", 2),
+    ];
+    assert_eq!(claude_rows(&joined), expected);
+
+    // `cswap purge` deletes the whole folder.
+    fs::remove_dir_all(&swap).unwrap();
+    let gone = json_usage(&sb);
+    assert_eq!(claude_rows(&gone), expected);
+    let state = sb.home.join(".local/state/hats");
+    for entry in fs::read_dir(state.join("usage")).unwrap() {
+        let path = entry.unwrap().path();
+        let text = String::from_utf8_lossy(&fs::read(&path).unwrap()).into_owned();
+        assert!(
+            !text.contains("example.com"),
+            "a mail in {}",
+            path.display()
+        );
+    }
+}

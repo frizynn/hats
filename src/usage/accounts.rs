@@ -5,7 +5,8 @@
 //! claude-swap's log when it exists.
 //!
 //! Ids carry their harness, as in Nenu: `claude:<16 hex>`, `claude:swap-2`,
-//! `codex:<16 hex>`, and `<harness>:unassigned`.
+//! `codex:<16 hex>`, and `<harness>:unassigned`. A claude-swap slot is
+//! counted under its number and shown as the account hats found in it.
 
 use std::collections::{HashMap, HashSet};
 
@@ -16,7 +17,7 @@ use crate::account::Harness;
 
 pub const CLAUDE_UNASSIGNED: &str = "claude:unassigned";
 pub const CODEX_UNASSIGNED: &str = "codex:unassigned";
-const SWAP_PREFIX: &str = "claude:swap-";
+pub const SWAP_PREFIX: &str = "claude:swap-";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SwitchLine {
@@ -82,7 +83,7 @@ pub fn parse_claude_swap_log(
                 at: local_ms(time)?,
                 harness: Harness::Claude,
                 account: format!("{SWAP_PREFIX}{slot}"),
-                label: Some(format!("Account {slot}")),
+                label: None,
                 config_dir: config_dir.to_owned(),
                 session: None,
             })
@@ -135,6 +136,15 @@ fn swap_event(line: &str) -> Option<([i64; 7], &str)> {
     };
     let digits = slot.bytes().take_while(u8::is_ascii_digit).count();
     (digits > 0).then(|| (time, &slot[..digits]))
+}
+
+/// The slot of claude-swap's copy of an account's `.claude.json`, named
+/// `.claude-config-<slot>-<mail>.json`. The mail is left where it is.
+pub fn swap_slot(file_name: &str) -> Option<&str> {
+    let rest = file_name.strip_prefix(".claude-config-")?;
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    (digits > 0 && rest[digits..].starts_with('-') && rest.ends_with(".json"))
+        .then(|| &rest[..digits])
 }
 
 pub fn codex_account(creator_account_id: Option<&str>) -> String {
@@ -299,23 +309,12 @@ not json
                    2026-01-02 11:00:00 - INFO - Switched from account 1 to 2\n\
                    garbage\n";
         let lines = parse_claude_swap_log(log, DEFAULT, as_utc);
-        let got: Vec<_> = lines
-            .iter()
-            .map(|l| (l.at, l.account.as_str(), l.label.as_deref()))
-            .collect();
+        let got: Vec<_> = lines.iter().map(|l| (l.at, l.account.as_str())).collect();
         assert_eq!(
             got,
             [
-                (
-                    ms("2026-01-02T10:00:00.123Z"),
-                    "claude:swap-1",
-                    Some("Account 1")
-                ),
-                (
-                    ms("2026-01-02T11:00:00Z"),
-                    "claude:swap-2",
-                    Some("Account 2")
-                ),
+                (ms("2026-01-02T10:00:00.123Z"), "claude:swap-1"),
+                (ms("2026-01-02T11:00:00Z"), "claude:swap-2"),
             ]
         );
         let book = Book::new(&lines, &HashSet::from([DEFAULT.to_owned()]));
@@ -346,6 +345,26 @@ not json
             alone.claude(DEFAULT, None, ms("2025-06-01T00:00:00Z")),
             "claude:0123456789abcdef"
         );
+    }
+
+    #[test]
+    fn only_the_slot_is_read_from_the_name_of_a_claude_swap_copy() {
+        assert_eq!(
+            swap_slot(".claude-config-3-user@example.com.json"),
+            Some("3")
+        );
+        assert_eq!(
+            swap_slot(".claude-config-12-a-b@example.com.json"),
+            Some("12")
+        );
+        for other in [
+            ".claude-config--user@example.com.json",
+            ".claude-config-3.json",
+            ".claude-config-3-user@example.com.json.tmp",
+            "claude-config-3-user@example.com.json",
+        ] {
+            assert_eq!(swap_slot(other), None, "{other}");
+        }
     }
 
     #[test]

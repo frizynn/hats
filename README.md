@@ -122,9 +122,12 @@ Auto: at 90 % of either limit, it moves to the account with the most room.
 | Tab | What it shows | Keys |
 |---|---|---|
 | Accounts | Claude Code or Codex, one line per account with its limits, and the selected account's mail, organization, plan, folder, resets and last change; how many Claude Code sessions run without hats | `↑↓` move, `←→` the other harness, `enter` use, `space` turn off or on, `shift+↑↓` order, `a` add, `l` sign in, `d` remove (asks first) |
-| Usage | tokens and their cost at API list price today, in 7 and 30 days and in the month, by account, model and project, with a bar per day; the first scan runs on its own thread | `←→` one account or all, `↑↓` scroll, `r` scan again |
+| Usage | tokens and their cost at API list price today, in 7 and 30 days and in the month, by account, model and project, with a bar per day; the first scan runs on its own thread | `←→` one account or all, `esc` all again, `↑↓` scroll, `r` scan again |
 | Settings | every key of `config.toml` for both harnesses with its help, where hats keeps its files and whether `hats setup` was applied | `↑↓` move, `←→` change, `enter` to type a value and `enter` again to save it, `esc` cancels; a value that is not valid is refused with the reason |
 | Activity | changes of account and sessions closed for going unused, newest first | `↑↓` scroll, `home`/`end` |
+
+`q` closes the view and `esc` never does: it cancels what is open, a value
+being typed, a prompt or the account filter of Usage.
 
 The view waits on kqueue (macOS) or inotify (Linux) and redraws when a status
 line, a hook or another `hats` changes the state; it uses no CPU while nothing
@@ -343,12 +346,18 @@ How it counts:
   `SessionStart` hook that `hats setup` installs. Without one, it counts for
   the last account seen in `~/.claude` before it (claude-swap's log says which,
   if you used claude-swap), else for `unassigned`.
+- A claude-swap slot counts as the account in it, with its hats label: hats
+  reads the account (never the mail) from claude-swap's copy of that slot's
+  `.claude.json` once and keeps it, so the days stay with that account after
+  `cswap purge`. A slot whose copy hats never saw shows as `Account <n>`.
 - hats' accounts share one `projects` folder, and it is read once. A git
   worktree counts with its repository.
 - Nothing runs in the background. The first `hats usage` reads every log and
   takes seconds; later ones read only what was appended. Days are cut in
   local time, and what hats counted stays after Claude Code deletes a
-  transcript at 30 days.
+  transcript at 30 days. Each save reaches the disk step by step (a barrier
+  on macOS, `fsync` elsewhere, about 5 ms a scan), so a power cut leaves the
+  last save whole.
 
 ## Commands
 

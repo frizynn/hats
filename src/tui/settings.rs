@@ -74,7 +74,6 @@ impl App<'_> {
             1
         };
         match key.code {
-            KeyCode::Esc => Step::Quit,
             KeyCode::Up | KeyCode::Char('k') => self.move_row(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_row(1),
             KeyCode::Left => self.step(harness, name, -by),
