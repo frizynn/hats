@@ -77,6 +77,9 @@ pub struct Layout {
     /// goes on a second line.
     who: Option<usize>,
     bar: usize,
+    /// Who it is goes under the account when it has no column; the
+    /// interactive view shows it apart instead.
+    second_line: bool,
 }
 
 impl Layout {
@@ -102,6 +105,7 @@ impl Layout {
                 label,
                 who: Some(who),
                 bar: bars(width - wide).min(10),
+                second_line: true,
             }
         } else {
             Self {
@@ -109,8 +113,15 @@ impl Layout {
                 label,
                 who: None,
                 bar: bars(width.saturating_sub(fixed)).clamp(3, 10),
+                second_line: true,
             }
         }
+    }
+
+    /// One line per account: who it is shows elsewhere when it has no column.
+    pub fn one_line(mut self) -> Self {
+        self.second_line = false;
+        self
     }
 
     fn window(&self) -> usize {
@@ -229,7 +240,7 @@ pub fn block(
             }
             line.extend(state(s, harness, config, layout, now, hints));
             let mut rows = vec![line];
-            if layout.who.is_none() && !who.is_empty() {
+            if layout.who.is_none() && layout.second_line && !who.is_empty() {
                 // Under the label and a step in, so it reads as part of it.
                 rows.push(vec![cell(
                     format!("    {}", fit(&who, width.saturating_sub(4))),
@@ -396,7 +407,7 @@ pub fn change(c: &Change, now: SystemTime) -> String {
 }
 
 /// `default → work: default hit its limit`.
-fn what_changed(c: &Change) -> String {
+pub fn what_changed(c: &Change) -> String {
     let route = match &c.from {
         Some(from) => format!("{from} → {}", c.to),
         None => format!("→ {}", c.to),

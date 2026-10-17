@@ -451,6 +451,9 @@ fn parse_threshold(raw: &str) -> Result<u8, String> {
 macro_rules! choice {
     ($ty:ident { $($variant:ident => $text:literal),+ }) => {
         impl $ty {
+            /// Every value, in the order `←→` steps through them.
+            pub const NAMES: &'static [&'static str] = &[$($text),+];
+
             pub fn as_str(self) -> &'static str {
                 match self { $($ty::$variant => $text),+ }
             }

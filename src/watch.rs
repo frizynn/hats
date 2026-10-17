@@ -22,6 +22,8 @@ pub struct Watch {
     queue: OwnedFd,
     #[cfg(target_os = "linux")]
     input: RawFd,
+    #[cfg(target_os = "linux")]
+    wake: RawFd,
     #[cfg(target_os = "macos")]
     dir: OwnedFd,
     /// The registry is appended in place, which its directory does not see.
@@ -46,8 +48,9 @@ fn owned(fd: libc::c_int) -> io::Result<OwnedFd> {
 
 #[cfg(target_os = "macos")]
 impl Watch {
-    /// Watches `state`, which must exist, and the terminal on `input`.
-    pub fn new(state: &Path, input: RawFd) -> io::Result<Self> {
+    /// Watches `state`, which must exist, the terminal on `input`, and
+    /// `wake`, a pipe another thread writes to when it has news.
+    pub fn new(state: &Path, input: RawFd, wake: Option<RawFd>) -> io::Result<Self> {
         // SAFETY: kqueue(2) takes no arguments.
         let queue = owned(unsafe { libc::kqueue() })?;
         let dir = open_event_only(state)?;
@@ -69,6 +72,9 @@ impl Watch {
             ),
         ];
         watch.register(&changes)?;
+        if let Some(wake) = wake {
+            watch.register(&[event(wake as usize, libc::EVFILT_READ, 0)])?;
+        }
         watch.watch_registry()?;
         Ok(watch)
     }
@@ -158,8 +164,9 @@ fn open_event_only(path: &Path) -> io::Result<OwnedFd> {
 
 #[cfg(target_os = "linux")]
 impl Watch {
-    /// Watches `state`, which must exist, and the terminal on `input`.
-    pub fn new(state: &Path, input: RawFd) -> io::Result<Self> {
+    /// Watches `state`, which must exist, the terminal on `input`, and
+    /// `wake`, a pipe another thread writes to when it has news.
+    pub fn new(state: &Path, input: RawFd, wake: Option<RawFd>) -> io::Result<Self> {
         use std::os::unix::ffi::OsStrExt;
         // SAFETY: inotify_init1(2) with flags.
         let queue = owned(unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) })?;
@@ -170,7 +177,9 @@ impl Watch {
         let mask = libc::IN_MODIFY | libc::IN_MOVED_TO | libc::IN_CREATE | libc::IN_DELETE;
         // SAFETY: a valid inotify descriptor and a NUL-terminated path.
         check(unsafe { libc::inotify_add_watch(queue.as_raw_fd(), path.as_ptr(), mask) })?;
-        Ok(Self { queue, input })
+        // poll(2) skips a negative descriptor.
+        let wake = wake.unwrap_or(-1);
+        Ok(Self { queue, input, wake })
     }
 
     /// Blocks until the terminal has input or the state changed.
@@ -186,9 +195,14 @@ impl Watch {
                 events: libc::POLLIN,
                 revents: 0,
             },
+            libc::pollfd {
+                fd: self.wake,
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
-        // SAFETY: two valid pollfds; -1 blocks.
-        match check(unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) }) {
+        // SAFETY: three valid pollfds; -1 blocks.
+        match check(unsafe { libc::poll(fds.as_mut_ptr(), 3, -1) }) {
             // A resize (SIGWINCH) interrupts poll(2); crossterm reports it.
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {
                 return Ok(Wake {
@@ -206,8 +220,9 @@ impl Watch {
                 > 0
             {}
         }
+        // The wake pipe counts as input: the loop collects its news.
         Ok(Wake {
-            input: fds[0].revents != 0,
+            input: fds[0].revents != 0 || fds[2].revents != 0,
             changed: fds[1].revents != 0,
         })
     }
@@ -231,7 +246,7 @@ mod tests {
         let mut pipe = [0; 2];
         // SAFETY: pipe(2) fills two descriptors.
         assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
-        let mut watch = Watch::new(dir.path(), pipe[0]).unwrap();
+        let mut watch = Watch::new(dir.path(), pipe[0], None).unwrap();
         let replace = |name: &str| {
             let tmp = dir.path().join(format!("{name}.tmp"));
             std::fs::write(&tmp, "x").unwrap();
