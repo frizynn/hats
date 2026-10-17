@@ -15,6 +15,7 @@ mod prices;
 mod repos;
 mod scan;
 pub mod summary;
+mod tally;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -31,7 +32,8 @@ use crate::store::Store;
 use accounts::{Book, CLAUDE_UNASSIGNED, CODEX_UNASSIGNED, SwitchLine};
 pub use prices::{PRICES_CHECKED, model_label};
 pub use scan::Stats;
-use scan::{Input, Roots, Tally};
+use scan::{Input, Roots};
+use tally::Tally;
 
 /// A calendar day in local time, as days since 1970-01-01.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -104,7 +106,7 @@ pub struct Tokens {
 }
 
 impl Tokens {
-    fn from_sum(s: &scan::Sum) -> Self {
+    fn from_sum(s: &tally::Sum) -> Self {
         Self {
             requests: s[0],
             input: s[1],

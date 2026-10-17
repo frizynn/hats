@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::usage::accounts::{Book, SwitchLine, parse_switch_log};
+use crate::usage::tally::Sum;
 
 fn utc_day_of(ms: i64) -> Day {
     Day(ms.div_euclid(86_400_000) as i32)
