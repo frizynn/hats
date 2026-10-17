@@ -88,9 +88,11 @@ For Codex, add `--codex` to the same commands: `hats --codex add personal`,
 
 `hats` opens four tabs; `tab` and `shift+tab` go through them, `1` to `4` jump
 to one, `q` closes the view. The foot shows the keys of the tab you are on.
-The selected row is bold on a background a step lighter than a dark terminal's,
-or darker than a light one's, so its text keeps its colors; a terminal that
-does not say its background (OSC 11) gets the mark and bold only.
+The selected row is bold, with nothing dim, on a background a step from the
+terminal's own toward its text color: the largest step that keeps every text
+color of the row at 4.5:1 or more, from the colors the terminal says when
+asked (OSC 11, 10 and 4). A terminal that does not say its background gets the
+mark and bold only.
 
 ```
  1 Accounts  2 Usage  3 Settings  4 Activity                  tab next · q quit
@@ -121,7 +123,7 @@ Auto: at 90 % of either limit, it moves to the account with the most room.
 |---|---|---|
 | Accounts | Claude Code or Codex, one line per account with its limits, and the selected account's mail, organization, plan, folder, resets and last change | `↑↓` move, `←→` the other harness, `enter` use, `space` turn off or on, `shift+↑↓` order, `a` add, `l` sign in, `d` remove (asks first) |
 | Usage | tokens and their cost at API list price today, in 7 and 30 days and in the month, by account, model and project, with a bar per day; the first scan runs on its own thread | `←→` one account or all, `↑↓` scroll, `r` scan again |
-| Settings | every key of `config.toml` for both harnesses with its help, where hats keeps its files and whether `hats setup` was applied | `↑↓` move, `←→` change, a number or `enter` to type a value, `enter` saves, `esc` cancels; a value that is not valid is refused with the reason |
+| Settings | every key of `config.toml` for both harnesses with its help, where hats keeps its files and whether `hats setup` was applied | `↑↓` move, `←→` change, `enter` to type a value and `enter` again to save it, `esc` cancels; a value that is not valid is refused with the reason |
 | Activity | changes of account and sessions closed for going unused, newest first | `↑↓` scroll, `home`/`end` |
 
 The view waits on kqueue (macOS) or inotify (Linux) and redraws when a status
