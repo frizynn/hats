@@ -119,8 +119,42 @@ fn tabs_change_with_tab_and_digits_and_the_foot_shows_their_keys() {
         "{foot}"
     );
     assert_eq!(app.on_key(key(KeyCode::Char('3'))), Step::Idle);
-    assert_eq!(app.on_key(key(KeyCode::Esc)), Step::Quit);
-    assert_eq!(app.closed_by, Some("Esc"));
+    assert_eq!(app.on_key(key(KeyCode::Char('q'))), Step::Quit);
+    assert_eq!(app.closed_by, Some("q"));
+}
+
+#[test]
+fn esc_cancels_what_is_open_and_only_q_closes() {
+    let (_dir, store) = sandbox();
+    account(&store, "work", Some(42.0));
+    let mut app = App::new(&store, DARK);
+    for tab in Tab::ALL {
+        app.show(tab);
+        assert_eq!(app.on_key(key(KeyCode::Esc)), Step::Idle, "{tab:?}");
+        assert_eq!(app.tab, tab);
+    }
+
+    setting(&mut app, Harness::Claude, "threshold");
+    app.on_key(key(KeyCode::Enter));
+    keys(&mut app, "5");
+    assert_eq!(app.on_key(key(KeyCode::Esc)), Step::Redraw);
+    assert_eq!(app.settings.edit, None);
+    assert_eq!(app.on_key(key(KeyCode::Esc)), Step::Idle);
+
+    app.show(Tab::Accounts);
+    app.on_key(key(KeyCode::Char('a')));
+    assert_eq!(app.on_key(key(KeyCode::Esc)), Step::Redraw);
+    assert_eq!(app.accounts.prompt, None);
+    app.select_label(Some("work"));
+    app.on_key(key(KeyCode::Char('d')));
+    assert_eq!(app.on_key(key(KeyCode::Esc)), Step::Redraw);
+    assert_eq!(app.accounts.prompt, None);
+    assert_eq!(app.on_key(key(KeyCode::Esc)), Step::Idle);
+
+    assert_eq!(app.closed_by, None);
+    assert_eq!(app.on_key(key(KeyCode::Char('q'))), Step::Quit);
+    assert_eq!(app.closed_by, Some("q"));
+    assert_eq!(config(&store), Config::default(), "nothing saved");
 }
 
 #[test]
@@ -535,6 +569,16 @@ fn usage_scans_on_its_own_thread_and_sums_per_account() {
     let screen = text_at(&mut app, 140, 40);
     assert!(screen.contains("‹ claude work ›"), "{screen}");
     assert!(!screen.contains("BY ACCOUNT"), "one account needs no split");
+    assert!(
+        screen.lines().last().unwrap().contains("esc all"),
+        "{screen}"
+    );
+    // Esc drops the filter, and only the filter.
+    assert_eq!(app.on_key(key(KeyCode::Esc)), Step::Redraw);
+    let screen = text_at(&mut app, 140, 40);
+    assert!(screen.contains("‹ all accounts ›"), "{screen}");
+    assert!(!screen.lines().last().unwrap().contains("esc"), "{screen}");
+    assert_eq!(app.on_key(key(KeyCode::Esc)), Step::Idle);
 }
 
 #[test]

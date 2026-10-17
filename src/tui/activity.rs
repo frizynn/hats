@@ -114,7 +114,6 @@ impl App<'_> {
         let len = self.activity.events.len();
         let state = &mut self.activity;
         let next = match key.code {
-            KeyCode::Esc => return Step::Quit,
             KeyCode::Up | KeyCode::Char('k') => state.selected.checked_sub(1),
             KeyCode::Down | KeyCode::Char('j') => Some(state.selected + 1),
             KeyCode::PageUp => Some(state.selected.saturating_sub(10)),

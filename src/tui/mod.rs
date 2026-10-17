@@ -44,7 +44,7 @@ pub fn run(store: &Store) -> Result<(), String> {
     let result = event_loop(&mut app, &mut screen);
     drop(screen);
     // Back on the normal screen, say what closed the view: a terminal that
-    // sends Esc or Ctrl+C on its own would otherwise close it unseen.
+    // sends Ctrl+C on its own would otherwise close it unseen.
     if let Some(key) = app.closed_by {
         println!("hats: closed with {key}.");
     }
@@ -315,7 +315,10 @@ impl<'a> App<'a> {
             (false, KeyCode::Char(c @ '1'..='4')) => {
                 self.show(Tab::ALL[usize::from(c as u8 - b'1')])
             }
-            (false, KeyCode::Char('q')) => Step::Quit,
+            (false, KeyCode::Char('q')) => {
+                self.closed_by = Some("q");
+                Step::Quit
+            }
             (false, KeyCode::Char('r')) => {
                 self.reload();
                 if self.tab == Tab::Usage {
@@ -333,12 +336,6 @@ impl<'a> App<'a> {
                 Tab::Activity => self.activity_key(key),
             },
         };
-        if step == Step::Quit && self.closed_by.is_none() {
-            self.closed_by = Some(match key.code {
-                KeyCode::Esc => "Esc",
-                _ => "q",
-            });
-        }
         match step {
             Step::Idle if cleared => Step::Redraw,
             step => step,

@@ -265,7 +265,7 @@ impl App<'_> {
         let options = names.len() + 1;
         let usage = &mut self.usage;
         match key.code {
-            KeyCode::Esc => return Step::Quit,
+            KeyCode::Esc if usage.filter > 0 => usage.filter = 0,
             KeyCode::Left => usage.filter = (usage.filter + options - 1) % options,
             KeyCode::Right => usage.filter = (usage.filter + 1) % options,
             KeyCode::Up | KeyCode::Char('k') => usage.scroll = usage.scroll.saturating_sub(1),
@@ -282,7 +282,10 @@ impl App<'_> {
         frame: &mut Frame,
         area: Rect,
     ) -> Vec<(&'static str, &'static str)> {
-        let keys = vec![("←→", "account"), ("↑↓", "scroll"), ("r", "scan again")];
+        let mut keys = vec![("←→", "account"), ("↑↓", "scroll"), ("r", "scan again")];
+        if self.usage.filter > 0 {
+            keys.push(("esc", "all accounts"));
+        }
         let width = usize::from(area.width);
         let note = "What these tokens would cost at API list price, not what a plan charges.";
         let mut head: Vec<Line> = view::wrap(note, width)
