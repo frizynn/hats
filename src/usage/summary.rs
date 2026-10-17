@@ -98,13 +98,15 @@ pub fn render(report: &Report, width: usize) -> Vec<String> {
     let line = |name: &str, cells: &Cells| -> String {
         let mut s = fit(name, name_width);
         for p in 0..4 {
-            let cost = if cells.unpriced[p] && cells.cost[p] == 0.0 {
-                "no price".to_owned()
+            let (cost, tokens) = if cells.tokens[p] == 0 {
+                ("-".to_owned(), "-".to_owned())
+            } else if cells.unpriced[p] && cells.cost[p] == 0.0 {
+                ("no price".to_owned(), count(cells.tokens[p]))
             } else {
-                money(cells.cost[p])
+                (money(cells.cost[p]), count(cells.tokens[p]))
             };
             if wide {
-                s.push_str(&format!("{cost:>11} {:>7}", count(cells.tokens[p])));
+                s.push_str(&format!("{cost:>11} {tokens:>7}"));
             } else {
                 s.push_str(&format!("{cost:>11}"));
             }
@@ -113,15 +115,20 @@ pub fn render(report: &Report, width: usize) -> Vec<String> {
     };
 
     let mut head = " ".repeat(name_width);
+    let mut kinds = " ".repeat(name_width);
     for title in titles {
         let title = title.to_uppercase();
         if wide {
             head.push_str(&format!("{title:>19}"));
+            kinds.push_str(&format!("{:>11} {:>7}", "cost", "tokens"));
         } else {
             head.push_str(&format!("{title:>11}"));
         }
     }
     out.push(head);
+    if wide {
+        out.push(kinds);
+    }
     out.push(line("Total", &total));
     if !wide {
         let mut tokens = fit("  tokens", name_width);
@@ -158,10 +165,18 @@ pub fn render(report: &Report, width: usize) -> Vec<String> {
         out.push(line(&format!("  {name}"), &cells));
     }
     out.push("PROJECT".to_owned());
+    // Two repositories with one folder name are told apart by their hash.
+    let mut names: HashMap<&str, usize> = HashMap::new();
+    for (label, _) in projects.values() {
+        *names.entry(label).or_default() += 1;
+    }
     let projects = sorted(
         projects
-            .into_values()
-            .map(|(label, c)| (label.to_owned(), c))
+            .into_iter()
+            .map(|(id, (label, c))| match id.rsplit_once('~') {
+                Some((_, hash)) if names[label] > 1 => (format!("{label} ~{hash}"), c),
+                _ => (label.to_owned(), c),
+            })
             .collect(),
     );
     for (name, cells) in projects.iter().take(TOP_PROJECTS) {
@@ -287,16 +302,10 @@ mod tests {
         assert_eq!(find(" ").last(), Some(&"FEBRUARY"));
         assert_eq!(find("Total"), ["$0.50", "$11.50", "$11.50", "$1.50"]);
         assert_eq!(find("  tokens"), ["2.0K", "4.0K", "4.0K", "3.0K"]);
-        assert_eq!(
-            find("  claude work"),
-            ["$0.00", "$11.00", "$11.00", "$1.00"]
-        );
+        assert_eq!(find("  claude work"), ["-", "$11.00", "$11.00", "$1.00"]);
         // A long prompt is its model's use; fast mode is apart.
         assert_eq!(find("  Haiku 5.5"), ["$0.50", "$0.50", "$0.50", "$0.50"]);
-        assert_eq!(
-            find("  Opus 5.5 · fast"),
-            ["$0.00", "$1.00", "$1.00", "$1.00"]
-        );
+        assert_eq!(find("  Opus 5.5 · fast"), ["-", "$1.00", "$1.00", "$1.00"]);
         assert_eq!(find("  mystery"), ["no", "price"].repeat(4));
         assert!(!text.iter().any(|l| l.contains("old")));
         assert!(text.iter().any(|l| l.contains("No list price for mystery")));
