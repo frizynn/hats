@@ -177,6 +177,21 @@ mod tests {
     use std::process::Command;
     use std::time::Duration;
 
+    /// Each child with its arguments and start, for a failure message.
+    fn describe(agent: u32) -> String {
+        let children = children(agent);
+        let each = children.iter().map(|&pid| {
+            let args = args(pid)
+                .map(|a| String::from_utf8_lossy(&a[..a.len().min(300)]).replace('\0', " "));
+            format!("{pid} {args:?} {:?}", started(pid))
+        });
+        format!(
+            "{} [{}]",
+            children.len(),
+            each.collect::<Vec<_>>().join("; ")
+        )
+    }
+
     #[test]
     fn tells_a_background_shell_by_its_command_line() {
         let shell = b"/bin/zsh\0-c\0source /h/.claude/shell-snapshots/snapshot-zsh-1.sh 2>/dev/null || true && eval 'sleep 9' < /dev/null";
@@ -214,7 +229,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
                 newest(me)
             })
-            .expect("the shell is found");
+            .unwrap_or_else(|| panic!("the shell is found; children: {}", describe(me)));
         assert!(
             started >= before && started <= SystemTime::now(),
             "{started:?}"
