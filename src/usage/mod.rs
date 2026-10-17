@@ -17,7 +17,7 @@ mod scan;
 pub mod summary;
 mod tally;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
@@ -26,14 +26,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-use crate::account::{Account, Harness, create_private_dir};
+use crate::account::{self, Account, Harness, create_private_dir};
 use crate::registry::{self, Switch};
 use crate::store::Store;
-use accounts::{Book, CLAUDE_UNASSIGNED, CODEX_UNASSIGNED, SwitchLine};
+use accounts::{Book, CLAUDE_UNASSIGNED, CODEX_UNASSIGNED, SWAP_PREFIX, SwitchLine};
 pub use prices::{PRICES_CHECKED, model_label};
 pub use scan::Stats;
 use scan::{Input, Roots};
-use tally::Tally;
+use tally::{Sum, Tally};
 
 /// A calendar day in local time, as days since 1970-01-01.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -130,8 +130,8 @@ impl Tokens {
 pub struct Row {
     pub date: Day,
     pub harness: Harness,
-    /// `claude:<16 hex>`, `claude:swap-<n>`, `codex:<16 hex>` or
-    /// `<harness>:unassigned`.
+    /// `claude:<16 hex>`, `codex:<16 hex>`, `<harness>:unassigned`, or
+    /// `claude:swap-<n>` for a claude-swap slot whose account hats never saw.
     pub account: String,
     /// The account's hats label, else one from the switch logs.
     pub account_label: String,
@@ -193,6 +193,7 @@ pub fn report(store: &Store, now: SystemTime) -> Result<Report, String> {
     lock.lock().map_err(|e| e.to_string())?;
     let today = Day::local(now);
     let mut tally = Tally::load(&dir, today)?;
+    pair_swap_slots(&store.home, &mut tally.totals.swap_slots);
     let sources = Sources::read(store, &dir, now)?;
     let stats = scan::scan(
         &mut tally,
@@ -225,18 +226,27 @@ fn build(
     scan: Stats,
 ) -> Report {
     let t = &tally.totals;
-    let mut rows: Vec<Row> = t
-        .sums
-        .iter()
-        .filter(|(key, _)| key.day <= today)
-        .map(|(key, sum)| {
-            let account = t.name(key.account);
-            let model = t.name(key.model);
-            let project_id = t.name(key.repo);
-            let tokens = Tokens::from_sum(sum);
+    // A claude-swap slot counts as the account in it, saved days included.
+    let mut sums: HashMap<(Day, Harness, &str, u32, u32), Sum> = HashMap::new();
+    for (key, sum) in t.sums.iter().filter(|(key, _)| key.day <= today) {
+        let account = t.name(key.account);
+        let account = t.swap_slots.get(account).map_or(account, String::as_str);
+        let total = sums
+            .entry((key.day, key.harness, account, key.model, key.repo))
+            .or_default();
+        for (total, n) in total.iter_mut().zip(sum) {
+            *total += n;
+        }
+    }
+    let mut rows: Vec<Row> = sums
+        .into_iter()
+        .map(|((date, harness, account, model, repo), sum)| {
+            let model = t.name(model);
+            let project_id = t.name(repo);
+            let tokens = Tokens::from_sum(&sum);
             Row {
-                date: key.day,
-                harness: key.harness,
+                date,
+                harness,
                 account: account.to_owned(),
                 account_label: account_label(account, labels),
                 model: model.to_owned(),
@@ -285,9 +295,37 @@ fn account_label(id: &str, labels: &HashMap<String, String>) -> String {
     if id == CLAUDE_UNASSIGNED || id == CODEX_UNASSIGNED {
         return "unassigned".to_owned();
     }
+    if let Some(slot) = id.strip_prefix(SWAP_PREFIX) {
+        return format!("Account {slot}");
+    }
     // An account hats does not know (any more): its id is all there is.
     let hex = id.split_once(':').map_or(id, |(_, h)| h);
     hex.get(..8).unwrap_or(hex).to_owned()
+}
+
+/// claude-swap's folder, which `cswap purge` deletes.
+const CLAUDE_SWAP: &str = ".claude-swap-backup";
+
+/// Pairs each claude-swap slot not paired yet with the account of its copy
+/// of `.claude.json`. Once paired a slot stays so: its days keep their
+/// account after claude-swap is gone.
+fn pair_swap_slots(home: &Path, slots: &mut BTreeMap<String, String>) {
+    let Ok(copies) = fs::read_dir(home.join(CLAUDE_SWAP).join("configs")) else {
+        return;
+    };
+    for copy in copies.flatten() {
+        let name = copy.file_name();
+        let Some(slot) = name.to_str().and_then(accounts::swap_slot) else {
+            continue;
+        };
+        let slot = format!("{SWAP_PREFIX}{slot}");
+        if slots.contains_key(&slot) {
+            continue;
+        }
+        if let Ok(Some(id)) = account::claude_id(&copy.path()) {
+            slots.insert(slot, format!("claude:{id}"));
+        }
+    }
 }
 
 /// Who was signed in when, where the logs are, and what each account is
@@ -379,7 +417,7 @@ impl Sources {
         let default_claude = Account::default_for(Harness::Claude, store).dir;
         let default_claude = default_claude.to_string_lossy().into_owned();
         let mut swap_dirs = HashSet::new();
-        let swap_log = store.home.join(".claude-swap-backup/claude-swap.log");
+        let swap_log = store.home.join(CLAUDE_SWAP).join("claude-swap.log");
         if let Ok(text) = fs::read_to_string(&swap_log) {
             lines.extend(accounts::parse_claude_swap_log(
                 &text,

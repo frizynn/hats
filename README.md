@@ -334,6 +334,10 @@ How it counts:
   `SessionStart` hook that `hats setup` installs. Without one, it counts for
   the last account seen in `~/.claude` before it (claude-swap's log says which,
   if you used claude-swap), else for `unassigned`.
+- A claude-swap slot counts as the account in it, with its hats label: hats
+  reads the account (never the mail) from claude-swap's copy of that slot's
+  `.claude.json` once and keeps it, so the days stay with that account after
+  `cswap purge`. A slot whose copy hats never saw shows as `Account <n>`.
 - hats' accounts share one `projects` folder, and it is read once. A git
   worktree counts with its repository.
 - Nothing runs in the background. The first `hats usage` reads every log and

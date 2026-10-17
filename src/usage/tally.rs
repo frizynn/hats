@@ -2,7 +2,7 @@
 //! under `<state>/usage/`: daily totals, offsets per log, directory listings
 //! and the seen set of Claude message keys.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -38,6 +38,9 @@ pub struct Totals {
     pub sums: HashMap<Key, Sum>,
     /// Project key to folder name.
     pub repos: HashMap<String, String>,
+    /// claude-swap slot (`claude:swap-<n>`) to the account hats found in it,
+    /// kept for when claude-swap is gone.
+    pub swap_slots: BTreeMap<String, String>,
 }
 
 impl Totals {
@@ -239,8 +242,14 @@ struct TotalsFile {
     #[serde(rename = "logsFrom", default, skip_serializing_if = "Option::is_none")]
     logs_from: Option<String>,
     /// Day to `<harness>|<account>|<model>|<project>` to sum.
-    days: std::collections::BTreeMap<String, HashMap<String, Sum>>,
+    days: BTreeMap<String, HashMap<String, Sum>>,
     repos: HashMap<String, String>,
+    #[serde(
+        rename = "swapSlots",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    swap_slots: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     files: Option<Generation>,
 }
@@ -313,6 +322,7 @@ impl Tally {
                 tracked_from: Day::parse(&totals.tracked_from).unwrap_or(today),
                 logs_from: totals.logs_from.as_deref().and_then(Day::parse),
                 repos: totals.repos,
+                swap_slots: totals.swap_slots,
                 ..Totals::default()
             },
             state,
@@ -384,7 +394,7 @@ impl Tally {
             serde_json::to_writer(out, &self.state).map_err(io::Error::other)
         })?;
         let t = &self.totals;
-        let mut days: std::collections::BTreeMap<String, HashMap<String, Sum>> = Default::default();
+        let mut days: BTreeMap<String, HashMap<String, Sum>> = BTreeMap::new();
         for (key, sum) in &t.sums {
             let name = format!(
                 "{}|{}|{}|{}",
@@ -403,6 +413,7 @@ impl Tally {
             logs_from: t.logs_from.map(|d| d.to_string()),
             days,
             repos: t.repos.clone(),
+            swap_slots: t.swap_slots.clone(),
             files: Some(Generation { scan, seen }),
         };
         put("totals.json", &|out| {
