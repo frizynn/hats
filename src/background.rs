@@ -19,6 +19,7 @@ use std::time::SystemTime;
 const SOURCE: &[u8] = b"source ";
 const SNAPSHOTS: &[u8] = b"/shell-snapshots/";
 /// The start of a command line is enough to tell; longer ones are cut.
+#[cfg(target_os = "linux")]
 const ARGS_MAX: usize = 4096;
 
 /// When the newest background shell of `agent` started, if it has one.
@@ -60,7 +61,10 @@ fn children(agent: u32) -> Vec<u32> {
 /// the executable's path, padding, then the arguments and the environment.
 #[cfg(target_os = "macos")]
 fn args(pid: u32) -> Option<Vec<u8>> {
-    let mut buf = vec![0u8; ARGS_MAX];
+    // A buffer smaller than the process's arguments and environment fails
+    // or reads the wrong end on some macOS versions (seen on CI runners), so
+    // it takes the system's limit, as `ps` does. `calloc` maps it lazily.
+    let mut buf = vec![0u8; arg_max()?];
     let mut len = buf.len();
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
     // SAFETY: a valid name and a buffer of `len` bytes; the kernel sets
@@ -94,6 +98,26 @@ fn args(pid: u32) -> Option<Vec<u8>> {
         args.truncate(end);
     }
     Some(args)
+}
+
+/// `KERN_ARGMAX`: the most bytes of arguments and environment a process has.
+#[cfg(target_os = "macos")]
+fn arg_max() -> Option<usize> {
+    let mut max: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>();
+    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    // SAFETY: a valid name and an int-sized buffer.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            2,
+            (&mut max as *mut libc::c_int).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0).then(|| usize::try_from(max).ok()).flatten()
 }
 
 #[cfg(target_os = "macos")]
@@ -177,26 +201,13 @@ mod tests {
     use std::process::Command;
     use std::time::Duration;
 
-    /// Each child with its arguments, start, liveness and the errno of each
-    /// read, for a failure message.
+    /// Each child with its arguments and start, for a failure message.
     fn describe(agent: u32) -> String {
-        let errno = || std::io::Error::last_os_error().raw_os_error();
-        let children = children(agent);
-        let each = children.iter().map(|&pid| {
-            let args = args(pid)
-                .map(|a| String::from_utf8_lossy(&a[..a.len().min(300)]).replace('\0', " "));
-            let args_errno = errno();
-            let start = started(pid);
-            let start_errno = errno();
-            // SAFETY: signal 0 only checks that the process exists.
-            let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
-            format!("{pid} alive={alive} args={args:?} ({args_errno:?}) start={start:?} ({start_errno:?})")
+        let each = children(agent).into_iter().map(|pid| {
+            let args = args(pid).map(|a| String::from_utf8_lossy(&a).replace('\0', " "));
+            format!("{pid} {args:?} {:?}", started(pid))
         });
-        format!(
-            "{} [{}]",
-            children.len(),
-            each.collect::<Vec<_>>().join("; ")
-        )
+        each.collect::<Vec<_>>().join("; ")
     }
 
     #[test]
@@ -236,14 +247,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
                 newest(me)
             })
-            .unwrap_or_else(|| {
-                panic!(
-                    "the shell is found; children: {}; shell exited: {:?}; other exited: {:?}",
-                    describe(me),
-                    shell.try_wait(),
-                    other.try_wait()
-                )
-            });
+            .unwrap_or_else(|| panic!("the shell is found; children: {}", describe(me)));
         assert!(
             started >= before && started <= SystemTime::now(),
             "{started:?}"
