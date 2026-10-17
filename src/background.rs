@@ -171,21 +171,6 @@ fn started(pid: u32) -> Option<SystemTime> {
     SystemTime::now().checked_sub(up.checked_sub(at)?)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn children(_: u32) -> Vec<u32> {
-    Vec::new()
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn args(_: u32) -> Option<Vec<u8>> {
-    None
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn started(_: u32) -> Option<SystemTime> {
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
