@@ -46,6 +46,8 @@ pub struct HarnessConfig {
     pub strategy: Strategy,
     pub order: Vec<String>,
     pub relaunch: Relaunch,
+    /// Labels auto switching never moves to; the user can still choose them.
+    pub disabled: Vec<String>,
 }
 
 impl Default for HarnessConfig {
@@ -56,6 +58,7 @@ impl Default for HarnessConfig {
             strategy: Strategy::Headroom,
             order: Vec::new(),
             relaunch: Relaunch::Idle,
+            disabled: Vec::new(),
         }
     }
 }
@@ -103,6 +106,10 @@ pub const KEYS: &[(&str, &str)] = &[
         "relaunch",
         "idle | off: move running `hats run` sessions when the agent is idle",
     ),
+    (
+        "disabled",
+        "account labels auto switching never moves to, comma separated (`hats disable`)",
+    ),
 ];
 
 /// Keys only Claude Code has: they act through the `hats run` parent.
@@ -146,6 +153,9 @@ order = []
 # Running `hats run` sessions: idle = relaunch them on the new account when the
 # agent is idle, resuming the same conversation; off = leave them where they are.
 relaunch = "idle"
+# Accounts auto switching never moves to; you can still choose them with
+# `hats use`. `hats disable <label>` and `hats enable <label>` change it.
+disabled = []
 # Close a `hats run` session after this long without use: the clock starts when
 # a turn ends and restarts with a prompt, a turn end or a write to the session's
 # transcript. 32 or "32h" hours, "90m" minutes, "30s" seconds; 0 or "off" never.
@@ -158,6 +168,7 @@ threshold = 90
 strategy = "headroom"
 order = []
 relaunch = "idle"
+disabled = []
 "#;
 
 impl Config {
@@ -244,6 +255,7 @@ impl HarnessConfig {
             "strategy" => self.strategy.as_str().to_owned(),
             "order" => self.order.join(","),
             "relaunch" => self.relaunch.as_str().to_owned(),
+            "disabled" => self.disabled.join(","),
             _ => unreachable!("keys come from KEYS"),
         }
     }
@@ -262,23 +274,26 @@ impl HarnessConfig {
                 let n = item.as_integer().ok_or("expected a number from 1 to 100")?;
                 self.threshold = parse_threshold(&n.to_string())?;
             }
-            "order" => {
-                let array = item
-                    .as_array()
-                    .ok_or(r#"expected a list like ["work", "personal"]"#)?;
-                self.order = array
-                    .iter()
-                    .map(|v| {
-                        v.as_str()
-                            .map(str::to_owned)
-                            .ok_or("labels must be quoted strings")
-                    })
-                    .collect::<Result<_, _>>()?;
-            }
+            "order" => self.order = labels(item)?,
+            "disabled" => self.disabled = labels(item)?,
             _ => unreachable!("keys come from KEYS"),
         }
         Ok(())
     }
+}
+
+fn labels(item: &Item) -> Result<Vec<String>, String> {
+    let array = item
+        .as_array()
+        .ok_or(r#"expected a list like ["work", "personal"]"#)?;
+    array
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "labels must be quoted strings".to_owned())
+        })
+        .collect()
 }
 
 /// Sets one key in the file, creating it from the documented template the
@@ -291,7 +306,7 @@ pub fn set(path: &Path, full_key: &str, raw: &str) -> Result<(), String> {
         "relaunch" => value(raw.parse::<Relaunch>()?.as_str()),
         "threshold" => value(i64::from(parse_threshold(raw)?)),
         "close_idle" => value(show_close_idle(parse_close_idle(raw)?)),
-        "order" => {
+        "order" | "disabled" => {
             let labels = raw.split(',').map(str::trim).filter(|s| !s.is_empty());
             let mut array = Array::new();
             for label in labels {
@@ -318,6 +333,27 @@ pub fn set(path: &Path, full_key: &str, raw: &str) -> Result<(), String> {
     }
     doc[harness.name()][key] = item;
     write_new(path, doc.to_string().as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Turns an account on or off for auto switching: off adds it to
+/// `disabled`, on takes it out.
+pub fn set_enabled(
+    path: &Path,
+    harness: Harness,
+    label: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut disabled = Config::load(path)?.for_harness(harness).disabled.clone();
+    if enabled {
+        disabled.retain(|l| l != label);
+    } else if !disabled.iter().any(|l| l == label) {
+        disabled.push(label.to_owned());
+    }
+    set(
+        path,
+        &format!("{}.disabled", harness.name()),
+        &disabled.join(","),
+    )
 }
 
 /// Writes the template if there is no file yet, so `hats config edit` opens
@@ -539,6 +575,39 @@ mod tests {
         fs::write(&path, "[claude]\nclose_idle = 1.5\n").unwrap();
         let err = Config::load(&path).unwrap_err();
         assert!(err.contains("claude.close_idle"), "{err}");
+    }
+
+    #[test]
+    fn disabled_is_a_list_of_labels_kept_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let disabled = || Config::load(&path).unwrap().claude.disabled;
+        set_enabled(&path, Harness::Claude, "old", false).unwrap();
+        set_enabled(&path, Harness::Claude, "default", false).unwrap();
+        set_enabled(&path, Harness::Claude, "old", false).unwrap();
+        assert_eq!(
+            disabled(),
+            ["old", "default"],
+            "once each, in the order turned off"
+        );
+        set_enabled(&path, Harness::Claude, "old", true).unwrap();
+        assert_eq!(disabled(), ["default"]);
+        assert_eq!(
+            Config::load(&path).unwrap().codex.disabled,
+            Vec::<String>::new()
+        );
+        set(&path, "codex.disabled", "a, b").unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().get("codex.disabled").unwrap(),
+            "a,b"
+        );
+        let err = set(&path, "claude.disabled", "ok,../bad").unwrap_err();
+        assert!(err.contains("invalid label"), "{err}");
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("# Percent of the 5-hour"),
+            "comments kept:\n{text}"
+        );
     }
 
     #[test]

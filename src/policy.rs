@@ -46,6 +46,17 @@ pub fn rotation<'a>(labels: impl IntoIterator<Item = &'a str>, order: &[String])
     labels
 }
 
+/// Whether auto switching may move from `current` to `c`: another account,
+/// signed in and not turned off.
+fn eligible(c: &Candidate, current: &str, config: &HarnessConfig) -> bool {
+    c.logged_in && c.label != current && !config.disabled.contains(&c.label)
+}
+
+/// Whether any account but `current` could be switched to, room aside.
+pub fn has_destination(current: &str, candidates: &[Candidate], config: &HarnessConfig) -> bool {
+    candidates.iter().any(|c| eligible(c, current, config))
+}
+
 /// The account to switch to from `current`, or `None` if no account has
 /// enough room. An account never seen may be the spent one, so it is taken
 /// only when no account with data has room, the first in the order.
@@ -64,7 +75,7 @@ pub fn pick<'a>(
     let others: Vec<&Candidate> = (0..ring.len())
         .map(|i| ring[(start + i) % ring.len()])
         .filter_map(|l| candidates.iter().find(|c| c.label == l))
-        .filter(|c| c.logged_in && c.label != current)
+        .filter(|c| eligible(c, current, config))
         .collect();
     let with_room = others
         .iter()
@@ -168,6 +179,29 @@ mod tests {
         for strategy in [Strategy::Headroom, Strategy::Next] {
             let cfg = config(strategy, &["a", "d", "b", "c"]);
             assert_eq!(pick("a", &accounts, &cfg), Some("d"));
+        }
+    }
+
+    #[test]
+    fn an_account_turned_off_is_never_picked() {
+        let accounts = [
+            c("a", true, Some(97.0)),
+            c("b", true, Some(10.0)),
+            c("c", true, Some(50.0)),
+            c("d", true, None),
+        ];
+        let off = |strategy, labels: &[&str]| HarnessConfig {
+            disabled: labels.iter().map(|s| s.to_string()).collect(),
+            ..config(strategy, &[])
+        };
+        for strategy in [Strategy::Headroom, Strategy::Next] {
+            assert_eq!(pick("a", &accounts, &off(strategy, &["b"])), Some("c"));
+            // Off with room comes after an account never seen.
+            assert_eq!(pick("a", &accounts, &off(strategy, &["b", "c"])), Some("d"));
+            // Every other account off: stay.
+            assert_eq!(pick("a", &accounts, &off(strategy, &["b", "c", "d"])), None);
+            // The current account being off does not stop it from leaving.
+            assert_eq!(pick("a", &accounts, &off(strategy, &["a"])), Some("b"));
         }
     }
 

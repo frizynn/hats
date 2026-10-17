@@ -82,6 +82,18 @@ pub fn statuses(
     Ok(all)
 }
 
+/// Whether auto switching has an account to move to from `from`: one signed
+/// in and not turned off, whatever its room.
+pub fn has_destination(
+    statuses: &[Status],
+    from: &str,
+    config: &HarnessConfig,
+    now: SystemTime,
+) -> bool {
+    let candidates: Vec<Candidate> = statuses.iter().map(|s| s.candidate(now)).collect();
+    policy::has_destination(from, &candidates, config)
+}
+
 /// The account to move to from `from`, with the reason, if `from` passed the
 /// threshold (or `forced` says why it must move) and another account has room.
 pub fn next_account<'a>(

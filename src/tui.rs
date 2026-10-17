@@ -701,9 +701,13 @@ impl<'a> App<'a> {
     fn draw_list(&self, frame: &mut Frame, area: Rect, now: SystemTime) {
         let width = usize::from(area.width);
         let layout = view::Layout::new(
-            self.groups
-                .iter()
-                .map(|g| (g.harness, g.statuses.as_slice())),
+            self.groups.iter().map(|g| {
+                (
+                    g.harness,
+                    self.config.for_harness(g.harness),
+                    g.statuses.as_slice(),
+                )
+            }),
             width,
         );
         let mut lines = Vec::new();
