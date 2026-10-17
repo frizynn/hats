@@ -163,17 +163,22 @@ fn the_selected_row_keeps_its_colors_on_a_background() {
     account(&store, "side", Some(10.0));
     let mut app = App::new(&store, DARK);
     app.select_label(Some("work"));
-    let term = render(&mut app, 100, 30);
+    // Wide, so who it is has its column, dim on the other rows.
+    let term = render(&mut app, 140, 30);
     let buffer = term.backend().buffer();
     let y = (0..30)
         .find(|&y| {
-            (0..100)
+            (0..140)
                 .map(|x| buffer[(x, y)].symbol())
                 .collect::<String>()
                 .contains(" work ")
         })
         .unwrap();
-    let cells: Vec<_> = (0..100).map(|x| &buffer[(x, y)]).collect();
+    let cells: Vec<_> = (0..140).map(|x| &buffer[(x, y)]).collect();
+    assert!(
+        cells.iter().all(|c| !c.modifier.contains(Modifier::DIM)),
+        "nothing dim on the selected row"
+    );
     assert!(
         cells.iter().all(|c| c.bg == Color::Rgb(62, 64, 69)),
         "the whole row"

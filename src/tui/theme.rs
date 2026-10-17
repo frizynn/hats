@@ -15,6 +15,57 @@ use ratatui::style::{Color, Modifier, Style};
 /// answers neither.
 const ANSWER: Duration = Duration::from_millis(100);
 
+type Rgb = (u8, u8, u8);
+
+/// What the terminal said of its colors; `None` where it did not answer.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Colors {
+    pub bg: Option<Rgb>,
+    pub fg: Option<Rgb>,
+    /// Red and yellow: the colors of text the selected row may hold.
+    pub red: Option<Rgb>,
+    pub yellow: Option<Rgb>,
+}
+
+/// The least contrast between text and its background (WCAG AA).
+const MIN_CONTRAST: f64 = 4.5;
+
+/// WCAG relative luminance.
+fn luminance((r, g, b): Rgb) -> f64 {
+    let linear = |c: u8| {
+        let c = f64::from(c) / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+}
+
+/// WCAG contrast ratio, from 1 to 21.
+fn contrast(a: Rgb, b: Rgb) -> f64 {
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+/// The color a cell shows, from the 256-color palette when indexed.
+fn rgb(color: Color) -> Rgb {
+    const STEPS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    match color {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::Indexed(i @ 16..=231) => {
+            let i = usize::from(i - 16);
+            (STEPS[i / 36], STEPS[i / 6 % 6], STEPS[i % 6])
+        }
+        Color::Indexed(i @ 232..) => {
+            let level = 8 + 10 * (i - 232);
+            (level, level, level)
+        }
+        other => unreachable!("selections are 24-bit or of the 256 colors, not {other:?}"),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Theme {
     pub color: bool,
@@ -38,7 +89,15 @@ impl Theme {
             std::env::var("COLORTERM").is_ok_and(|v| matches!(v.as_str(), "truecolor" | "24bit"));
         Self {
             color,
-            selection: background().map(|bg| selection(bg, truecolor)),
+            selection: background().and_then(|bg| {
+                selection(
+                    &Colors {
+                        bg: Some(bg),
+                        ..Colors::default()
+                    },
+                    truecolor,
+                )
+            }),
         }
     }
 
@@ -66,7 +125,8 @@ impl Theme {
 
 /// A background a step away from `bg`: lighter on a dark one, darker on a
 /// light one.
-fn selection((r, g, b): (u8, u8, u8), truecolor: bool) -> Color {
+fn selection(colors: &Colors, truecolor: bool) -> Option<Color> {
+    let (r, g, b) = colors.bg?;
     let luma = 0.2126 * f64::from(r) + 0.7152 * f64::from(g) + 0.0722 * f64::from(b);
     let (toward, amount) = if luma < 128.0 {
         (255.0, 0.14)
@@ -75,11 +135,11 @@ fn selection((r, g, b): (u8, u8, u8), truecolor: bool) -> Color {
     };
     let mix = |c: u8| (f64::from(c) + (toward - f64::from(c)) * amount).round() as u8;
     let (r, g, b) = (mix(r), mix(g), mix(b));
-    if truecolor {
+    Some(if truecolor {
         Color::Rgb(r, g, b)
     } else {
         Color::Indexed(nearest_256(r, g, b))
-    }
+    })
 }
 
 /// The closest color of the xterm 256-color palette, from its 6×6×6 cube or
@@ -183,12 +243,60 @@ mod tests {
         assert!(!attributes_end(b"\x1b]11;rgb:ff/ff/ff\x07"));
     }
 
+    /// Herdr, as it answered: OSC 11 and OSC 10, no palette.
+    const HERDR: Colors = Colors {
+        bg: Some((0x28, 0x2c, 0x34)),
+        fg: Some((0xff, 0xff, 0xff)),
+        red: None,
+        yellow: None,
+    };
+    /// The light theme of the screen captures (GitHub light).
+    const LIGHT: Colors = Colors {
+        bg: Some((0xff, 0xff, 0xff)),
+        fg: Some((0x1f, 0x23, 0x28)),
+        red: Some((0xcf, 0x22, 0x2e)),
+        yellow: Some((0x4d, 0x2d, 0x00)),
+    };
+    /// The dark theme of the screen captures (GitHub dark).
+    const DARK: Colors = Colors {
+        bg: Some((0x0d, 0x11, 0x17)),
+        fg: Some((0xe6, 0xed, 0xf3)),
+        red: Some((0xff, 0x7b, 0x72)),
+        yellow: Some((0xd2, 0x99, 0x22)),
+    };
+
     #[test]
-    fn the_selection_is_a_step_from_the_background() {
-        assert_eq!(selection((0x1e, 0x21, 0x27), true), Color::Rgb(62, 64, 69));
-        assert_eq!(selection((255, 255, 255), true), Color::Rgb(232, 232, 232));
-        // Without 24-bit color, the nearest gray of the 256 colors.
-        assert_eq!(selection((0x1e, 0x21, 0x27), false), Color::Indexed(238));
-        assert_eq!(selection((255, 255, 255), false), Color::Indexed(254));
+    fn every_text_of_the_selected_row_keeps_4_5_to_1() {
+        for (name, colors) in [("herdr", HERDR), ("light", LIGHT), ("dark", DARK)] {
+            for truecolor in [true, false] {
+                let sel = rgb(selection(&colors, truecolor).expect("a background"));
+                let bg = colors.bg.unwrap();
+                assert_ne!(sel, bg, "{name}: a background that shows");
+                for text in [colors.fg, colors.red, colors.yellow].into_iter().flatten() {
+                    if contrast(text, bg) >= MIN_CONTRAST {
+                        let c = contrast(text, sel);
+                        assert!(
+                            c >= MIN_CONTRAST,
+                            "{name} {truecolor}: {text:?} on {sel:?} is {c:.2}"
+                        );
+                    }
+                }
+                if colors.red.is_none() {
+                    // A color the terminal did not say, at 5:1 on its background,
+                    // stays at 4.5:1 on the selection.
+                    let kept = contrast(bg, (0, 0, 0)).min(contrast(sel, (0, 0, 0)))
+                        / contrast(bg, (0, 0, 0)).max(contrast(sel, (0, 0, 0)));
+                    assert!(
+                        kept >= 0.9,
+                        "{name} {truecolor}: keeps {kept:.3} of the contrast"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            selection(&Colors::default(), true),
+            None,
+            "no background, no selection"
+        );
     }
 }
