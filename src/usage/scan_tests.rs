@@ -521,3 +521,21 @@ fn named(t: &Totals) -> Vec<(String, Sum)> {
     out.sort();
     out
 }
+
+#[test]
+fn a_seen_set_whose_size_does_not_match_its_count_is_not_trusted() {
+    let mut f = Fixture::new();
+    f.write(
+        &f.project.join("s1.jsonl"),
+        &line(&assistant("msg_1", "a", "2026-01-10T12:00:00.000Z")),
+    );
+    f.run();
+    let state = f.home().join("state");
+    fs::create_dir_all(&state).unwrap();
+    f.tally.save(&state, 20_463).unwrap();
+    // A count of four billion keys in a file of four bytes.
+    fs::write(state.join("seen.1.bin"), u32::MAX.to_le_bytes()).unwrap();
+    let tally = Tally::load(&state, Day::parse("2026-01-10").unwrap());
+    assert_eq!(tally.seen.count, 0);
+    assert_eq!(named(&tally.totals), named(&f.tally.totals));
+}

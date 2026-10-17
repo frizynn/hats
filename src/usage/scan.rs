@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -205,10 +205,15 @@ impl Seen {
         Ok(())
     }
 
-    fn read(input: &mut impl io::Read) -> io::Result<Self> {
+    fn read(file: File) -> io::Result<Self> {
+        let len = file.metadata()?.len();
+        let mut input = io::BufReader::new(file);
         let mut n = [0; 4];
         input.read_exact(&mut n)?;
         let n = u32::from_le_bytes(n) as usize;
+        if len != 4 + n as u64 * 10 {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
         let mut seen = Self::with_capacity(n);
         let mut record = [0; 10];
         for _ in 0..n {
@@ -291,7 +296,7 @@ impl Tally {
             return Self::empty(today);
         };
         let seen = File::open(dir.join(format!("seen.{}.bin", files.seen)))
-            .and_then(|f| Seen::read(&mut io::BufReader::new(f)))
+            .and_then(Seen::read)
             .unwrap_or_default();
         let mut out = Self {
             totals: Totals {
