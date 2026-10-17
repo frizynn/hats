@@ -663,7 +663,7 @@ fn background(command: &str) -> String {
     format!(
         r#"snapshot="$CLAUDE_CONFIG_DIR/shell-snapshots/snapshot-sh-1.sh"
 mkdir -p "${{snapshot%/*}}" && : > "$snapshot"
-/bin/sh -c "source $snapshot 2>/dev/null || true && eval '{command}' < /dev/null" &
+/bin/sh -c "source $snapshot 2>/dev/null || true && eval '{command}' < /dev/null && pwd -P >| /dev/null" &
 bg=$!"#
     )
 }

@@ -213,7 +213,10 @@ mod tests {
         std::fs::write(&snapshot, b"").unwrap();
         let mut shell = Command::new("/bin/sh")
             .arg("-c")
-            .arg(format!("source {} && sleep 5", snapshot.display()))
+            .arg(format!(
+                "source {} 2>/dev/null || true && sleep 5 && pwd -P",
+                snapshot.display()
+            ))
             .spawn()
             .unwrap();
         let mut other = Command::new("/bin/sh")
