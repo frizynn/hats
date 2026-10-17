@@ -137,8 +137,9 @@ impl Default for Seen {
 }
 
 impl Seen {
+    /// Room for `n` keys at most three quarters full.
     fn with_capacity(n: usize) -> Self {
-        let size = (n * 2).next_power_of_two().max(1024);
+        let size = (n * 4 / 3 + 1).next_power_of_two().max(1024);
         Self {
             keys: vec![0; size],
             days: vec![0; size],
@@ -186,43 +187,39 @@ impl Seen {
         true
     }
 
-    /// `[u32 count][u32 0][u64 keys][u16 days]`, without keys older than
-    /// `keep` days before `today`.
-    fn encode(&self, today: u16, keep: u16) -> Vec<u8> {
+    /// `[u32 count]` and that many `[u64 key][u16 day]`, without keys older
+    /// than `keep` days before `today`.
+    fn write(&self, out: &mut impl Write, today: u16, keep: u16) -> io::Result<()> {
         let cutoff = today.saturating_sub(keep);
-        let live: Vec<(u64, u16)> = self
-            .keys
-            .iter()
-            .zip(&self.days)
-            .filter(|(k, d)| **k != 0 && **d >= cutoff)
-            .map(|(k, d)| (*k, *d))
-            .collect();
-        let mut out = Vec::with_capacity(8 + live.len() * 10);
-        out.extend_from_slice(&(live.len() as u32).to_le_bytes());
-        out.extend_from_slice(&[0; 4]);
-        for (k, _) in &live {
-            out.extend_from_slice(&k.to_le_bytes());
+        let live = || {
+            self.keys
+                .iter()
+                .zip(&self.days)
+                .filter(move |(k, d)| **k != 0 && **d >= cutoff)
+        };
+        out.write_all(&(live().count() as u32).to_le_bytes())?;
+        for (k, d) in live() {
+            out.write_all(&k.to_le_bytes())?;
+            out.write_all(&d.to_le_bytes())?;
         }
-        for (_, d) in &live {
-            out.extend_from_slice(&d.to_le_bytes());
-        }
-        out
+        Ok(())
     }
 
-    fn decode(bytes: &[u8]) -> Self {
-        let n = match bytes.get(..4) {
-            Some(n) => u32::from_le_bytes(n.try_into().expect("4 bytes")) as usize,
-            None => return Self::default(),
-        };
-        if bytes.len() != 8 + n * 10 {
-            return Self::default();
+    fn read(input: &mut impl io::Read) -> io::Result<Self> {
+        let mut n = [0; 4];
+        input.read_exact(&mut n)?;
+        let n = u32::from_le_bytes(n) as usize;
+        let mut seen = Self::with_capacity(n);
+        let mut record = [0; 10];
+        for _ in 0..n {
+            input.read_exact(&mut record)?;
+            let (k, d) = record.split_at(8);
+            seen.insert(
+                u64::from_le_bytes(k.try_into().expect("8 bytes")),
+                u16::from_le_bytes(d.try_into().expect("2 bytes")),
+            );
         }
-        let mut seen = Self::with_capacity(n + 1024);
-        let (keys, days) = bytes[8..].split_at(n * 8);
-        for (k, d) in keys.as_chunks::<8>().0.iter().zip(days.as_chunks::<2>().0) {
-            seen.insert(u64::from_le_bytes(*k), u16::from_le_bytes(*d));
-        }
-        seen
+        Ok(seen)
     }
 }
 
@@ -293,8 +290,8 @@ impl Tally {
         else {
             return Self::empty(today);
         };
-        let seen = read(&format!("seen.{}.bin", files.seen))
-            .map(|b| Seen::decode(&b))
+        let seen = File::open(dir.join(format!("seen.{}.bin", files.seen)))
+            .and_then(|f| Seen::read(&mut io::BufReader::new(f)))
             .unwrap_or_default();
         let mut out = Self {
             totals: Totals {
@@ -342,17 +339,20 @@ impl Tally {
     /// stopped anywhere leaves the last save whole, so a log is never counted
     /// twice or skipped.
     pub fn save(&mut self, dir: &Path, today_utc: u16) -> io::Result<()> {
-        let put = |name: &str, data: &[u8]| -> io::Result<()> {
-            let path = dir.join(name);
+        let put = |name: &str,
+                   write: &dyn Fn(&mut io::BufWriter<File>) -> io::Result<()>|
+         -> io::Result<()> {
             let tmp = dir.join(format!("{name}.tmp"));
-            let mut file = fs::OpenOptions::new()
+            let file = fs::OpenOptions::new()
                 .create(true)
                 .write(true)
                 .truncate(true)
                 .mode(0o600)
                 .open(&tmp)?;
-            file.write_all(data)?;
-            fs::rename(tmp, path)
+            let mut out = io::BufWriter::new(file);
+            write(&mut out)?;
+            out.flush()?;
+            fs::rename(tmp, dir.join(name))
         };
         let prev = self.totals.files;
         let scan = prev.map_or(0, |p| p.scan) + 1;
@@ -361,15 +361,13 @@ impl Tally {
             _ => scan,
         };
         if seen == scan {
-            put(
-                &format!("seen.{scan}.bin"),
-                &self.seen.encode(today_utc, SEEN_DAYS),
-            )?;
+            put(&format!("seen.{scan}.bin"), &|out| {
+                self.seen.write(out, today_utc, SEEN_DAYS)
+            })?;
         }
-        put(
-            &format!("scan.{scan}.json"),
-            &serde_json::to_vec(&self.state).map_err(io::Error::other)?,
-        )?;
+        put(&format!("scan.{scan}.json"), &|out| {
+            serde_json::to_writer(out, &self.state).map_err(io::Error::other)
+        })?;
         let t = &self.totals;
         let mut days: std::collections::BTreeMap<String, HashMap<String, Sum>> = Default::default();
         for (key, sum) in &t.sums {
@@ -392,10 +390,9 @@ impl Tally {
             repos: t.repos.clone(),
             files: Some(Generation { scan, seen }),
         };
-        put(
-            "totals.json",
-            &serde_json::to_vec(&file).map_err(io::Error::other)?,
-        )?;
+        put("totals.json", &|out| {
+            serde_json::to_writer(out, &file).map_err(io::Error::other)
+        })?;
         self.totals.files = Some(Generation { scan, seen });
         self.seen.added = 0;
         // What this save replaced, and what a stopped one left behind.
@@ -505,6 +502,7 @@ struct Done {
     ctxs: Vec<Ctx>,
     rows: Vec<Row>,
     bytes: u64,
+    duplicates: u64,
     fallback: u64,
     skipped: u64,
 }
@@ -569,6 +567,7 @@ pub fn scan(tally: &mut Tally, input: &Input) -> Stats {
 
 fn count(totals: &mut Totals, seen: &mut Seen, done: &Done, stats: &mut Stats) {
     stats.bytes += done.bytes;
+    stats.duplicates += done.duplicates;
     stats.fallback += done.fallback;
     stats.skipped += done.skipped;
     let ids: Vec<(u32, u32, u32)> = done
@@ -744,10 +743,35 @@ const SESSION_META: &[u8] = br#""type":"session_meta""#;
 const MODEL: &[u8] = br#""model":""#;
 const CREATOR: &[u8] = br#""creator_account_id":""#;
 
-static CLAUDE_MARKERS: LazyLock<[memmem::Finder<'static>; 1]> =
-    LazyLock::new(|| [memmem::Finder::new(USAGE)]);
-static CODEX_MARKERS: LazyLock<[memmem::Finder<'static>; 3]> =
-    LazyLock::new(|| [TOKEN_COUNT, TURN_CONTEXT, SESSION_META].map(memmem::Finder::new));
+/// The byte strings rows are found and read by, with their searchers built
+/// once.
+struct Needles {
+    claude: [memmem::Finder<'static>; 1],
+    codex: [memmem::Finder<'static>; 3],
+    t_assist: memmem::Finder<'static>,
+    assistant: memmem::Finder<'static>,
+    msg_model: memmem::Finder<'static>,
+    timestamp: memmem::Finder<'static>,
+    cwd: memmem::Finder<'static>,
+    model: memmem::Finder<'static>,
+    creator: memmem::Finder<'static>,
+    usage: memmem::FinderRev<'static>,
+    request_id: memmem::FinderRev<'static>,
+}
+
+static NEEDLES: LazyLock<Needles> = LazyLock::new(|| Needles {
+    claude: [memmem::Finder::new(USAGE)],
+    codex: [TOKEN_COUNT, TURN_CONTEXT, SESSION_META].map(memmem::Finder::new),
+    t_assist: memmem::Finder::new(T_ASSIST),
+    assistant: memmem::Finder::new(ASSISTANT),
+    msg_model: memmem::Finder::new(MSG_MODEL),
+    timestamp: memmem::Finder::new(TIMESTAMP),
+    cwd: memmem::Finder::new(CWD),
+    model: memmem::Finder::new(MODEL),
+    creator: memmem::Finder::new(CREATOR),
+    usage: memmem::FinderRev::new(USAGE),
+    request_id: memmem::FinderRev::new(REQUEST_ID),
+});
 
 /// A Claude request as read from its row.
 struct Message<'b> {
@@ -805,6 +829,8 @@ impl<'a> Reader<'a> {
         let mut out = Out {
             ctxs: Vec::new(),
             rows: Vec::new(),
+            keys: HashSet::new(),
+            duplicates: 0,
             fallback: 0,
             skipped: 0,
         };
@@ -815,6 +841,7 @@ impl<'a> Reader<'a> {
             ctxs: out.ctxs,
             rows: out.rows,
             bytes,
+            duplicates: out.duplicates,
             fallback: out.fallback,
             skipped: out.skipped,
         };
@@ -827,8 +854,8 @@ impl<'a> Reader<'a> {
             entry.t = None;
         }
         let markers: &[memmem::Finder] = match job.harness {
-            Harness::Claude => &*CLAUDE_MARKERS,
-            Harness::Codex => &*CODEX_MARKERS,
+            Harness::Claude => &NEEDLES.claude,
+            Harness::Codex => &NEEDLES.codex,
         };
         let mut buf = std::mem::take(&mut self.buf);
         let (offset, bytes) =
@@ -851,17 +878,18 @@ impl<'a> Reader<'a> {
 
     fn claude_row(&mut self, b: &[u8], m: usize, job: &Job, entry: &mut FileEntry, out: &mut Out) {
         let le = b.len();
-        let Some(t) = find(b, T_ASSIST, m, le) else {
+        let n = &*NEEDLES;
+        let Some(t) = find(b, &n.t_assist, m, le) else {
             // Not the assistant row shape this knows. Tool results carry
             // `usage` too; only an assistant row is billed.
-            if find(b, ASSISTANT, 0, le).is_some() {
+            if find(b, &n.assistant, 0, le).is_some() {
                 self.claude_fallback(b, job, entry, out);
             }
             return;
         };
         let fast = || -> Option<(Message<'_>, Option<&[u8]>)> {
-            let mi = find(b, MSG_MODEL, 0, le).filter(|&mi| mi <= m)?;
-            let u0 = rfind(b, USAGE, 0, t)?;
+            let mi = find(b, &n.msg_model, 0, le).filter(|&mi| mi <= m)?;
+            let u0 = rfind(b, &n.usage, 0, t)?;
             let open = u0 + USAGE.len() - 1;
             let close = object_end(b, open, t)?;
             let model_from = mi + MSG_MODEL.len();
@@ -874,13 +902,13 @@ impl<'a> Reader<'a> {
             if !starts_with_at(b, id_from, b"msg_") {
                 return None;
             }
-            let ri = rfind(b, REQUEST_ID, close + 1, t)?;
+            let ri = rfind(b, &n.request_id, close + 1, t)?;
             let req_from = ri + REQUEST_ID.len();
             let req_to = string_end(b, req_from, t)?;
-            let ts = find(b, TIMESTAMP, t, le)?;
+            let ts = find(b, &n.timestamp, t, le)?;
             let ms = iso_ms_at(b, ts + TIMESTAMP.len())?;
             let model = std::str::from_utf8(&b[model_from..model_to]).ok()?;
-            let cwd = find(b, CWD, t, le).and_then(|c| {
+            let cwd = find(b, &n.cwd, t, le).and_then(|c| {
                 let from = c + CWD.len();
                 string_end(b, from, le).map(|to| &b[from..to])
             });
@@ -1001,6 +1029,10 @@ impl<'a> Reader<'a> {
         if msg.model == "<synthetic>" {
             return;
         }
+        if msg.key != 0 && !out.keys.insert(msg.key) {
+            out.duplicates += 1;
+            return;
+        }
         let model = if msg.model.starts_with("claude-haiku-5-5")
             && msg.input + msg.read + msg.write > 100_000
         {
@@ -1037,19 +1069,20 @@ impl<'a> Reader<'a> {
     /// previous one.
     fn codex_row(&mut self, b: &[u8], m: usize, entry: &mut FileEntry, out: &mut Out) {
         let le = b.len();
-        let string_after = |marker: &[u8], from: usize| {
-            let at = find(b, marker, from, le)? + marker.len();
+        let n = &*NEEDLES;
+        let string_after = |marker: &memmem::Finder, from: usize| {
+            let at = find(b, marker, from, le)? + marker.needle().len();
             string_end(b, at, le).map(|end| text(&b[at..end]))
         };
         if starts_with_at(b, m, SESSION_META) {
-            entry.a = Some(codex_account(string_after(CREATOR, 0).as_deref()));
-            if let Some(cwd) = string_after(CWD, 0) {
+            entry.a = Some(codex_account(string_after(&n.creator, 0).as_deref()));
+            if let Some(cwd) = string_after(&n.cwd, 0) {
                 entry.r = Some(self.repo(&cwd));
             }
             return;
         }
         if starts_with_at(b, m, TURN_CONTEXT) {
-            if let Some(model) = string_after(MODEL, m) {
+            if let Some(model) = string_after(&n.model, m) {
                 entry.m = Some(model);
             }
             return;
@@ -1142,6 +1175,10 @@ impl<'a> Reader<'a> {
 struct Out {
     ctxs: Vec<Ctx>,
     rows: Vec<Row>,
+    /// Keys already in `rows`: a response is written once per content
+    /// block, and only its first row needs to reach the count.
+    keys: HashSet<u64>,
+    duplicates: u64,
     fallback: u64,
     skipped: u64,
 }

@@ -9,21 +9,21 @@ const QUOTE: u8 = b'"';
 const BACKSLASH: u8 = b'\\';
 
 /// Where `needle` first starts in `b[from..to]`.
-pub fn find(b: &[u8], needle: &[u8], from: usize, to: usize) -> Option<usize> {
+pub fn find(b: &[u8], needle: &memmem::Finder, from: usize, to: usize) -> Option<usize> {
     let to = to.min(b.len());
     if from >= to {
         return None;
     }
-    memmem::find(&b[from..to], needle).map(|i| from + i)
+    needle.find(&b[from..to]).map(|i| from + i)
 }
 
 /// Where `needle` last starts in `b[from..to]`.
-pub fn rfind(b: &[u8], needle: &[u8], from: usize, to: usize) -> Option<usize> {
+pub fn rfind(b: &[u8], needle: &memmem::FinderRev, from: usize, to: usize) -> Option<usize> {
     let to = to.min(b.len());
     if from >= to {
         return None;
     }
-    memmem::rfind(&b[from..to], needle).map(|i| from + i)
+    needle.rfind(&b[from..to]).map(|i| from + i)
 }
 
 /// Index of the `}` or `]` that closes the one opened at `open`, if it comes

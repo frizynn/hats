@@ -508,10 +508,18 @@ fn usage_command(store: &Store, json: bool) -> Result<(), Failure> {
         eprintln!("Reading the agents' logs for the first time; later runs read only what is new.");
     }
     let report = usage::report(store, SystemTime::now())?;
-    let mut out = io::stdout().lock();
+    let mut out = io::BufWriter::new(io::stdout().lock());
     if json {
-        let mut doc = serde_json::to_value(&report).map_err(io::Error::other)?;
-        doc["v"] = 1.into();
+        #[derive(serde::Serialize)]
+        struct Doc<'a> {
+            v: u32,
+            #[serde(flatten)]
+            report: &'a usage::Report,
+        }
+        let doc = Doc {
+            v: 1,
+            report: &report,
+        };
         serde_json::to_writer(&mut out, &doc).map_err(io::Error::other)?;
         writeln!(out)?;
     } else {
