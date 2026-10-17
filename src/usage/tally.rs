@@ -42,7 +42,7 @@ pub struct Totals {
     pub repos: HashMap<String, String>,
     /// claude-swap slot (`claude:swap-<n>`) to the account hats found in it,
     /// kept for when claude-swap is gone.
-    pub swap_slots: BTreeMap<String, String>,
+    pub swap_slots: HashMap<String, String>,
 }
 
 impl Totals {
@@ -249,9 +249,9 @@ struct TotalsFile {
     #[serde(
         rename = "swapSlots",
         default,
-        skip_serializing_if = "BTreeMap::is_empty"
+        skip_serializing_if = "HashMap::is_empty"
     )]
-    swap_slots: BTreeMap<String, String>,
+    swap_slots: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     files: Option<Generation>,
 }

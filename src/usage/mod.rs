@@ -17,7 +17,7 @@ mod scan;
 pub mod summary;
 mod tally;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
@@ -309,7 +309,7 @@ const CLAUDE_SWAP: &str = ".claude-swap-backup";
 /// Pairs each claude-swap slot not paired yet with the account of its copy
 /// of `.claude.json`. Once paired a slot stays so: its days keep their
 /// account after claude-swap is gone.
-fn pair_swap_slots(home: &Path, slots: &mut BTreeMap<String, String>) {
+fn pair_swap_slots(home: &Path, slots: &mut HashMap<String, String>) {
     let Ok(copies) = fs::read_dir(home.join(CLAUDE_SWAP).join("configs")) else {
         return;
     };
