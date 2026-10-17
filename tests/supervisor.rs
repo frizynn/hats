@@ -708,9 +708,9 @@ fn a_close_waits_for_a_background_shell_to_end() {
     close_idle(&sb, "3s");
     // Without it the session would close at 3 s, with the task running.
     let fake = IDLE.replace(
-        "stop\necho \"turn ended\"",
+        "stop\necho \"turn ended\" >> \"$FAKE_LOG\"",
         &format!(
-            "{}\nstop\necho \"turn ended\"\nwait $bg\necho \"background done\" >> \"$FAKE_LOG\"",
+            "{}\nstop\necho \"turn ended\" >> \"$FAKE_LOG\"\nwait $bg\necho \"background done\" >> \"$FAKE_LOG\"",
             background("sleep 4")
         ),
     );
