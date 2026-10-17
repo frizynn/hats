@@ -191,12 +191,33 @@ pub fn move_running(store: &Store, config: &HarnessConfig, to: &Account) -> usiz
         .filter(|(pid, dir)| {
             // SIGUSR1 ends a process that does not handle it: never send it
             // to a program that took the pid of a parent that is gone.
-            process::info(*pid).is_some_and(|p| p.name == me.name)
-                && fs::read(dir.join("account")).is_ok_and(|on| on != to.label.as_bytes())
-                && write_request(dir, &request).is_ok()
+            if !process::info(*pid).is_some_and(|p| p.name == me.name) {
+                return false;
+            }
+            // A parent from before `hats use` moved sessions writes none.
+            let Ok(on) = fs::read(dir.join("account")) else {
+                return false;
+            };
+            if on == to.label.as_bytes() {
+                drop_choice(dir);
+                return false;
+            }
+            write_request(dir, &request).is_ok()
         })
         .inspect(|(pid, _)| wake(*pid))
         .count()
+}
+
+/// The user chose the account the agent of `dir` already runs on: an
+/// earlier choice still waiting for its turn to end would move it away.
+fn drop_choice(dir: &Path) {
+    let path = dir.join("move.json");
+    let earlier = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<MoveRequest>(&bytes).ok());
+    if earlier.is_some_and(|r| r.reason == Reason::Manual) {
+        let _ = fs::remove_file(path);
+    }
 }
 
 /// The run directories of the `hats run` parents still running, with their
