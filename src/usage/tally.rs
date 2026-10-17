@@ -5,6 +5,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
+#[cfg(target_os = "macos")]
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
@@ -362,7 +364,8 @@ impl Tally {
     /// One rename commits a save: the offsets and the seen set go to new
     /// names first, and `totals.json`, which names them, goes last. A scan
     /// stopped anywhere leaves the last save whole, so a log is never counted
-    /// twice or skipped.
+    /// twice or skipped. Each step reaches the disk before the next one, so a
+    /// power cut leaves the last save or this one, never an empty file.
     pub fn save(&mut self, dir: &Path, today_utc: u16) -> io::Result<()> {
         let put = |name: &str,
                    write: &dyn Fn(&mut io::BufWriter<File>) -> io::Result<()>|
@@ -376,7 +379,7 @@ impl Tally {
                 .open(&tmp)?;
             let mut out = io::BufWriter::new(file);
             write(&mut out)?;
-            out.flush()?;
+            sync(&out.into_inner().map_err(io::IntoInnerError::into_error)?)?;
             fs::rename(tmp, dir.join(name))
         };
         let prev = self.files;
@@ -393,6 +396,9 @@ impl Tally {
         put(&format!("scan.{scan}.json"), &|out| {
             serde_json::to_writer(out, &self.state).map_err(io::Error::other)
         })?;
+        // Their names before the one that names them.
+        let folder = File::open(dir)?;
+        sync(&folder)?;
         let t = &self.totals;
         let mut days: BTreeMap<String, HashMap<String, Sum>> = BTreeMap::new();
         for (key, sum) in &t.sums {
@@ -419,6 +425,8 @@ impl Tally {
         put("totals.json", &|out| {
             serde_json::to_writer(out, &file).map_err(io::Error::other)
         })?;
+        // The commit before removing what it replaced.
+        sync(&folder)?;
         self.files = Some(Generation { scan, seen });
         self.seen.added = 0;
         // What this save replaced, and what a stopped one left behind.
@@ -438,4 +446,18 @@ impl Tally {
         }
         Ok(())
     }
+}
+
+/// Writes of `file` reach the disk before any write after this call. On
+/// macOS a barrier does it: plain fsync leaves the drive free to reorder, and
+/// F_FULLFSYNC would also wait for its whole cache. Elsewhere, fsync.
+fn sync(file: &File) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    // SAFETY: fcntl on a descriptor `file` keeps open.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    #[cfg(not(target_os = "macos"))]
+    file.sync_all()?;
+    Ok(())
 }

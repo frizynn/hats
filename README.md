@@ -343,7 +343,9 @@ How it counts:
 - Nothing runs in the background. The first `hats usage` reads every log and
   takes seconds; later ones read only what was appended. Days are cut in
   local time, and what hats counted stays after Claude Code deletes a
-  transcript at 30 days.
+  transcript at 30 days. Each save reaches the disk step by step (a barrier
+  on macOS, `fsync` elsewhere, about 5 ms a scan), so a power cut leaves the
+  last save whole.
 
 ## Commands
 
