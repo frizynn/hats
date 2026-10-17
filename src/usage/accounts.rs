@@ -9,10 +9,14 @@
 
 use std::collections::{HashMap, HashSet};
 
+use serde::Deserialize;
+
+use super::bytes::iso_ms_at;
 use crate::account::Harness;
 
 pub const CLAUDE_UNASSIGNED: &str = "claude:unassigned";
 pub const CODEX_UNASSIGNED: &str = "codex:unassigned";
+const SWAP_PREFIX: &str = "claude:swap-";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SwitchLine {
@@ -25,47 +29,201 @@ pub struct SwitchLine {
     pub session: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct RawLine {
+    v: u32,
+    at: String,
+    harness: Harness,
+    account: String,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(rename = "configDir")]
+    config_dir: String,
+    #[serde(default)]
+    session: Option<String>,
+}
+
 /// Lines of a v1 switch log (`registry.rs` defines the format). A line that
 /// does not parse or misses a field is skipped.
-pub fn parse_switch_log(_text: &str) -> Vec<SwitchLine> {
-    Vec::new()
+pub fn parse_switch_log(text: &str) -> Vec<SwitchLine> {
+    text.lines()
+        .filter_map(|line| {
+            let r: RawLine = serde_json::from_str(line).ok()?;
+            let at = iso_ms_at(r.at.as_bytes(), 0)?;
+            let hex = r.account.len() == 16
+                && r.account
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            (r.v == 1 && hex).then(|| SwitchLine {
+                at,
+                harness: r.harness,
+                account: format!("{}:{}", r.harness.name(), r.account),
+                label: r.label.filter(|l| l.len() <= 64),
+                config_dir: r.config_dir,
+                session: r.session.filter(|s| s.len() <= 128),
+            })
+        })
+        .collect()
 }
 
-/// claude-swap's log as switch lines for `config_dir`.
+/// claude-swap's log as switch lines for `config_dir`. Two kinds of line
+/// matter: "Added account N" (it adds whoever is signed in, so N is active
+/// then) and "Switched from account N to M". The slots are claude-swap's own
+/// numbering, and its times are local wall-clock time.
 pub fn parse_claude_swap_log(
-    _text: &str,
-    _config_dir: &str,
-    _local_ms: impl Fn([i64; 7]) -> Option<i64>,
+    text: &str,
+    config_dir: &str,
+    local_ms: impl Fn([i64; 7]) -> Option<i64>,
 ) -> Vec<SwitchLine> {
-    Vec::new()
+    text.lines()
+        .filter_map(|line| {
+            let (time, slot) = swap_event(line)?;
+            Some(SwitchLine {
+                at: local_ms(time)?,
+                harness: Harness::Claude,
+                account: format!("{SWAP_PREFIX}{slot}"),
+                label: Some(format!("Account {slot}")),
+                config_dir: config_dir.to_owned(),
+                session: None,
+            })
+        })
+        .collect()
 }
 
-pub fn codex_account(_creator_account_id: Option<&str>) -> String {
-    CODEX_UNASSIGNED.to_owned()
+/// `2026-01-02 10:00:00,123 - INFO - Added account 1` to its wall-clock time
+/// (year, month, day, hour, minute, second, millisecond) and slot.
+fn swap_event(line: &str) -> Option<([i64; 7], &str)> {
+    let b = line.as_bytes();
+    let num = |from: usize, n: usize| -> Option<i64> {
+        b.get(from..from + n)?.iter().try_fold(0i64, |v, &c| {
+            c.is_ascii_digit().then(|| v * 10 + i64::from(c - b'0'))
+        })
+    };
+    if b.len() < 19 || [b[4], b[7], b[10], b[13], b[16]] != *b"-- ::" {
+        return None;
+    }
+    let mut time = [
+        num(0, 4)?,
+        num(5, 2)?,
+        num(8, 2)?,
+        num(11, 2)?,
+        num(14, 2)?,
+        num(17, 2)?,
+        0,
+    ];
+    let mut rest = &line[19..];
+    if let Some(frac) = rest.strip_prefix(',') {
+        let digits = frac.bytes().take_while(u8::is_ascii_digit).count();
+        if !(1..=3).contains(&digits) {
+            return None;
+        }
+        time[6] = frac[..digits].parse::<i64>().ok()? * 10i64.pow(3 - digits as u32);
+        rest = &frac[digits..];
+    }
+    let event = rest.strip_prefix(" - INFO - ")?;
+    let slot = match event.strip_prefix("Added account ") {
+        Some(slot) => slot,
+        None => {
+            let (from, to) = event
+                .strip_prefix("Switched from account ")?
+                .split_once(" to ")?;
+            if from.is_empty() || !from.bytes().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            to
+        }
+    };
+    let digits = slot.bytes().take_while(u8::is_ascii_digit).count();
+    (digits > 0).then(|| (time, &slot[..digits]))
 }
 
-/// Message to account: the session's line, else the config dir's, else the
-/// dir's only account, else nobody.
+pub fn codex_account(creator_account_id: Option<&str>) -> String {
+    match creator_account_id {
+        Some(id) if !id.is_empty() => format!("codex:{}", crate::account::short_hash(id)),
+        _ => CODEX_UNASSIGNED.to_owned(),
+    }
+}
+
+/// Times and accounts, oldest first.
+#[derive(Default)]
+struct Timeline(Vec<(i64, String)>);
+
+impl Timeline {
+    /// The account of the last line at or before `at`.
+    fn at(&self, at: i64) -> Option<&str> {
+        let i = self.0.partition_point(|(t, _)| *t <= at);
+        i.checked_sub(1).map(|i| self.0[i].1.as_str())
+    }
+}
+
+/// Message to account. A message of session S at time t belongs to the last
+/// line naming S at or before t; else to the last line of its config dir
+/// without a session; else, when the dir only ever showed one account, to
+/// that one; else to nobody. Where claude-swap's log exists, its slots stand
+/// for that dir: sessionless sightings there would name the same people
+/// twice.
 #[derive(Default)]
 pub struct Book {
+    sessions: HashMap<String, Timeline>,
+    dirs: HashMap<String, Timeline>,
+    only: HashMap<String, String>,
     /// The first label a line gave each account.
     pub labels: HashMap<String, String>,
 }
 
 impl Book {
-    pub fn new(_lines: &[SwitchLine], _swap_dirs: &HashSet<String>) -> Self {
-        Book::default()
+    pub fn new(lines: &[SwitchLine], swap_dirs: &HashSet<String>) -> Self {
+        let mut book = Book::default();
+        let mut seen: HashMap<&str, HashSet<&str>> = HashMap::new();
+        let mut sorted: Vec<&SwitchLine> = lines.iter().collect();
+        sorted.sort_by_key(|l| l.at);
+        for line in lines {
+            if let Some(label) = &line.label {
+                book.labels
+                    .entry(line.account.clone())
+                    .or_insert_with(|| label.clone());
+            }
+        }
+        for line in sorted {
+            if line.harness != Harness::Claude {
+                continue;
+            }
+            seen.entry(&line.config_dir)
+                .or_default()
+                .insert(&line.account);
+            let timeline = match &line.session {
+                Some(session) => book.sessions.entry(session.clone()).or_default(),
+                None if !swap_dirs.contains(&line.config_dir)
+                    || line.account.starts_with(SWAP_PREFIX) =>
+                {
+                    book.dirs.entry(line.config_dir.clone()).or_default()
+                }
+                None => continue,
+            };
+            timeline.0.push((line.at, line.account.clone()));
+        }
+        for (dir, accounts) in seen {
+            if accounts.len() == 1 && !swap_dirs.contains(dir) {
+                let only = accounts.into_iter().next().expect("one account");
+                book.only.insert(dir.to_owned(), only.to_owned());
+            }
+        }
+        book
     }
 
-    pub fn claude(&self, _config_dir: &str, _session: Option<&str>, _at: i64) -> &str {
-        CLAUDE_UNASSIGNED
+    pub fn claude(&self, config_dir: &str, session: Option<&str>, at: i64) -> &str {
+        session
+            .and_then(|s| self.sessions.get(s))
+            .and_then(|t| t.at(at))
+            .or_else(|| self.dirs.get(config_dir).and_then(|t| t.at(at)))
+            .or_else(|| self.only.get(config_dir).map(String::as_str))
+            .unwrap_or(CLAUDE_UNASSIGNED)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::usage::bytes::iso_ms_at;
 
     // hats' own lines, in the format its registry writes (fake ids).
     const HATS: &str = r#"{"v":1,"at":"2026-01-02T03:04:05.678Z","harness":"claude","account":"9ae25bfbd05c9e76","label":"work","configDir":"/home/user/.local/share/hats/claude/work","reason":"manual"}
