@@ -60,6 +60,10 @@ impl Store {
         self.state.join(crate::registry::FILE_NAME)
     }
 
+    pub fn closes(&self) -> PathBuf {
+        self.state.join(crate::registry::CLOSES_FILE)
+    }
+
     pub fn ensure_state(&self) -> io::Result<()> {
         create_private_dir(&self.state)
     }

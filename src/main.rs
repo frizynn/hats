@@ -1,11 +1,13 @@
 mod account;
 mod auto;
+mod background;
 mod config;
 mod hook;
 mod import;
 mod limits;
 mod policy;
 mod registry;
+mod relaunch;
 mod setup;
 mod statusline;
 mod store;

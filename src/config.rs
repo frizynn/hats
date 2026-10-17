@@ -70,12 +70,15 @@ pub struct Config {
     pub close_idle: Option<Duration>,
 }
 
+/// `claude.close_idle` when `config.toml` does not set it.
+pub const CLOSE_IDLE: Duration = Duration::from_secs(32 * 3600);
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             claude: HarnessConfig::default(),
             codex: HarnessConfig::default(),
-            close_idle: Some(Duration::from_secs(32 * 3600)),
+            close_idle: Some(CLOSE_IDLE),
         }
     }
 }
