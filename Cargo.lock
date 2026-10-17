@@ -388,6 +388,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "libc",
+ "memchr",
  "ratatui",
  "serde",
  "serde_json",

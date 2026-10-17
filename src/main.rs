@@ -13,6 +13,7 @@ mod statusline;
 mod store;
 mod supervisor;
 mod tui;
+mod usage;
 mod view;
 mod watch;
 
@@ -140,6 +141,15 @@ enum Cmd {
     },
     /// Print shell completions: `hats completions zsh > ~/.zfunc/_hats`.
     Completions { shell: clap_complete::Shell },
+    /// Tokens used per day, account, model and project, from the agents' own
+    /// logs, and what they would cost at API list price (not what a plan
+    /// charges).
+    Usage {
+        /// Print JSON (schema `v: 1`) with one row per day, account, model
+        /// and project.
+        #[arg(long)]
+        json: bool,
+    },
     /// Open the interactive view (also `hats` with no command).
     Tui,
     /// Claude Code status line wrapper; `hats setup` installs it.
@@ -294,6 +304,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Cmd::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "hats", &mut io::stdout());
         }
+        Cmd::Usage { json } => usage_command(&store, json)?,
         Cmd::Tui => tui::run(&store)?,
         Cmd::Statusline { command } => statusline_command(&store, &config, command)?,
         Cmd::Hook { .. } => unreachable!("handled above"),
@@ -493,6 +504,33 @@ fn list(store: &Store, json: bool) -> Result<(), Failure> {
         writeln!(out)?;
     } else if !any {
         writeln!(out, "No accounts yet. Add one with `hats add <label>`.")?;
+    }
+    Ok(())
+}
+
+fn usage_command(store: &Store, json: bool) -> Result<(), Failure> {
+    if !usage::scanned_before(store) && io::stderr().is_terminal() {
+        eprintln!("Reading the agents' logs for the first time; later runs read only what is new.");
+    }
+    let report = usage::report(store, SystemTime::now())?;
+    let mut out = io::BufWriter::new(io::stdout().lock());
+    if json {
+        #[derive(serde::Serialize)]
+        struct Doc<'a> {
+            v: u32,
+            #[serde(flatten)]
+            report: &'a usage::Report,
+        }
+        let doc = Doc {
+            v: 1,
+            report: &report,
+        };
+        serde_json::to_writer(&mut out, &doc).map_err(io::Error::other)?;
+        writeln!(out)?;
+    } else {
+        for line in usage::summary::render(&report, width()) {
+            writeln!(out, "{line}")?;
+        }
     }
     Ok(())
 }
