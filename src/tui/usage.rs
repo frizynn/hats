@@ -310,10 +310,7 @@ impl App<'_> {
         let shown = account.map_or("all accounts", String::as_str);
         let mut filter = vec![
             Span::styled("Account ", self.dim()),
-            Span::styled(
-                format!("‹ {shown} ›"),
-                self.theme.selected().patch(self.theme.accent()),
-            ),
+            Span::styled(format!("‹ {shown} ›"), self.theme.selected()),
         ];
         let state = match (&self.usage.scanning, &self.usage.error) {
             (Some(_), _) => "  scanning…".to_owned(),

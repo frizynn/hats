@@ -409,7 +409,7 @@ impl App<'_> {
                 group.statuses.len()
             );
             spans.push(if i == self.accounts.focus {
-                Span::styled(label, self.theme.selected().patch(self.theme.accent()))
+                Span::styled(label, self.theme.selected())
             } else {
                 Span::styled(label, self.dim())
             });

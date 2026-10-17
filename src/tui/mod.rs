@@ -400,7 +400,7 @@ impl<'a> App<'a> {
         for tab in Tab::ALL {
             let label = format!(" {} {} ", tab.index() + 1, tab.title());
             spans.push(if tab == self.tab {
-                Span::styled(label, self.theme.selected().patch(self.theme.accent()))
+                Span::styled(label, self.theme.selected())
             } else {
                 Span::styled(label, self.dim())
             });
