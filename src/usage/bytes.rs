@@ -82,14 +82,19 @@ pub fn string_end(b: &[u8], from: usize, to: usize) -> Option<usize> {
 }
 
 /// The non-negative integer starting at `at`, or 0 when there is none (JSON
-/// `null`, a string...).
+/// `null`, a string...) or it is past 2^53, which no token count reaches:
+/// garbage in a log must not add up past `u64`.
 pub fn uint_at(b: &[u8], at: usize) -> u64 {
+    const MAX: u64 = (1 << 53) - 1;
     let mut n = 0u64;
     for &c in b.get(at..).unwrap_or_default() {
         if !c.is_ascii_digit() {
             break;
         }
-        n = n.saturating_mul(10).saturating_add(u64::from(c - b'0'));
+        n = n * 10 + u64::from(c - b'0');
+        if n > MAX {
+            return 0;
+        }
     }
     n
 }

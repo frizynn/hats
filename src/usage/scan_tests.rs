@@ -539,3 +539,21 @@ fn a_seen_set_whose_size_does_not_match_its_count_is_not_trusted() {
     assert_eq!(tally.seen.count, 0);
     assert_eq!(named(&tally.totals), named(&f.tally.totals));
 }
+
+#[test]
+fn a_token_count_no_request_could_have_counts_zero() {
+    let mut f = Fixture::new();
+    let garbage = |id: &str, req: &str| {
+        line(&assistant(id, req, "2026-01-10T12:00:00.000Z")).replace(
+            r#""input_tokens":10"#,
+            r#""input_tokens":99999999999999999999"#,
+        )
+    };
+    f.write(
+        &f.project.join("s1.jsonl"),
+        &(garbage("msg_1", "a") + &garbage("msg_2", "b")),
+    );
+    let r = f.run();
+    assert_eq!((r.rows, r.fallback), (2, 0));
+    assert_eq!(f.sum(Harness::Claude), [2, 0, 100, 400, 200, 2000, 0]);
+}
