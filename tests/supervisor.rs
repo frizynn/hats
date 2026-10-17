@@ -10,6 +10,7 @@ use std::io::Read;
 use std::os::fd::FromRawFd;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::Sandbox;
@@ -49,6 +50,8 @@ struct Run {
     status: std::process::ExitStatus,
     elapsed: Duration,
     log: String,
+    /// What the agent and hats wrote to the terminal.
+    output: String,
     /// The terminal the agent ran in, to read its settings after the run.
     tty: fs::File,
 }
@@ -82,15 +85,20 @@ fn run_in_pty(sb: &Sandbox, fake: &str, during: impl FnOnce(u32)) -> Run {
 
     let (mut master, slave) = pty();
     let tty = slave.try_clone().unwrap();
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let written = Arc::clone(&output);
     std::thread::spawn(move || {
-        let mut sink = [0u8; 4096];
-        while master.read(&mut sink).is_ok_and(|n| n > 0) {}
+        let mut buf = [0u8; 4096];
+        while let Ok(n @ 1..) = master.read(&mut buf) {
+            written.lock().unwrap().extend_from_slice(&buf[..n]);
+        }
     });
     let mut child = sb
         .cmd(&["run", "--", "--dangerously-skip-permissions"])
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
         .env("HATS", env!("CARGO_BIN_EXE_hats"))
         .env("FAKE_LOG", &log)
+        .current_dir(&sb.home)
         .stdin(Stdio::from(slave.try_clone().unwrap()))
         .stdout(Stdio::from(slave.try_clone().unwrap()))
         .stderr(Stdio::from(slave))
@@ -124,10 +132,14 @@ fn run_in_pty(sb: &Sandbox, fake: &str, during: impl FnOnce(u32)) -> Run {
     };
     let elapsed = started.elapsed();
     let log = fs::read_to_string(&log).unwrap();
+    // The reader thread may not have drained the terminal yet.
+    std::thread::sleep(Duration::from_millis(150));
+    let output = String::from_utf8_lossy(&output.lock().unwrap()).into_owned();
     Run {
         status,
         elapsed,
         log,
+        output,
         tty,
     }
 }
@@ -378,6 +390,386 @@ while :; do sleep 0.05; done
     assert_eq!(
         &lines[1..5],
         ["turn ended", "late repaint", "second turn", "term"],
+        "{}",
+        run.log
+    );
+    assert!(run.log.ends_with("resumed\n"), "{}", run.log);
+}
+
+/// One turn that ends, then an idle agent until SIGTERM. `$T` is the
+/// session's transcript; `# later` marks where a test adds what happens after.
+const IDLE: &str = r#"#!/bin/sh
+echo "start args=$* parent=${HATS_SUPERVISOR:-none}" >> "$FAKE_LOG"
+trap 'echo term >> "$FAKE_LOG"; exit 143' TERM
+s=s-1
+T="$HOME/$s.jsonl"
+: > "$T"
+stop() { printf '{"session_id":"%s","transcript_path":"%s","hook_event_name":"Stop"}' $s "$T" | "$HATS" hook stop; }
+printf '{"session_id":"%s","source":"startup"}' $s | "$HATS" hook session-start
+printf '{"session_id":"%s"}' $s | "$HATS" hook prompt
+stop
+echo "turn ended" >> "$FAKE_LOG"
+# later
+while :; do sleep 0.05; done
+"#;
+
+fn later(steps: &str) -> String {
+    IDLE.replace("# later", steps)
+}
+
+fn close_idle(sb: &Sandbox, value: &str) {
+    sb.ok(&["config", "set", "claude.close_idle", value]);
+}
+
+#[test]
+fn closes_a_session_left_idle_and_says_how_to_resume_it() {
+    let sb = two_accounts();
+    close_idle(&sb, "2s");
+    let run = run_in_pty(&sb, IDLE, |_| {});
+    let lines: Vec<&str> = run.log.lines().collect();
+    assert_eq!(&lines[1..], ["turn ended", "term"], "{}", run.log);
+    assert!(
+        run.output.contains(
+            "hats: closed this session after 2s without use. Resume it with: claude --resume s-1"
+        ),
+        "{:?}",
+        run.output
+    );
+    assert!(run.status.success(), "the shell gets its prompt back");
+    assert!(run.elapsed >= Duration::from_secs(2), "{:?}", run.elapsed);
+    assert!(run.elapsed < Duration::from_secs(5), "{:?}", run.elapsed);
+    assert_eq!(sb.current(), "work", "closing is not a move");
+    let run = sb.home.join(".local/state/hats/run");
+    assert!(fs::read_dir(&run).map(|d| d.count() == 0).unwrap_or(true));
+}
+
+#[test]
+fn never_closes_during_a_turn() {
+    let sb = two_accounts();
+    close_idle(&sb, "1s");
+    // A turn, or a wait for approval inside one, longer than the limit:
+    // after UserPromptSubmit and before Stop the agent is busy, also when it
+    // compacts the conversation.
+    let fake = later(
+        r#"printf '{"session_id":"%s"}' $s | "$HATS" hook prompt
+echo "long turn" >> "$FAKE_LOG"
+printf '{"session_id":"%s","transcript_path":"%s","source":"compact"}' $s "$T" | "$HATS" hook session-start
+sleep 3
+echo "long turn ended" >> "$FAKE_LOG"
+stop"#,
+    );
+    let run = run_in_pty(&sb, &fake, |_| {});
+    let lines: Vec<&str> = run.log.lines().collect();
+    assert_eq!(
+        &lines[1..],
+        ["turn ended", "long turn", "long turn ended", "term"],
+        "{}",
+        run.log
+    );
+    assert!(run.elapsed >= Duration::from_secs(4), "{:?}", run.elapsed);
+}
+
+#[test]
+fn a_prompt_restarts_the_clock() {
+    let sb = two_accounts();
+    close_idle(&sb, "2s");
+    // Without the second turn the session would close at 2 s; the turn ends
+    // at about 2.5 s, so it closes at about 4.5 s.
+    let fake = later(
+        r#"sleep 1.5
+printf '{"session_id":"%s"}' $s | "$HATS" hook prompt
+sleep 1
+stop
+echo "second turn ended" >> "$FAKE_LOG""#,
+    );
+    let run = run_in_pty(&sb, &fake, |_| {});
+    let lines: Vec<&str> = run.log.lines().collect();
+    assert_eq!(
+        &lines[1..],
+        ["turn ended", "second turn ended", "term"],
+        "{}",
+        run.log
+    );
+    assert!(
+        run.elapsed >= Duration::from_millis(4300),
+        "{:?}",
+        run.elapsed
+    );
+}
+
+#[test]
+fn a_transcript_write_restarts_the_clock() {
+    let sb = two_accounts();
+    close_idle(&sb, "2s");
+    // Something wakes the agent without UserPromptSubmit; the transcript
+    // still grows. Without that write it would close at 2 s.
+    let fake = later(
+        r#"sleep 1.5
+echo '{"type":"user"}' >> "$T"
+sleep 1.5
+echo "after the write" >> "$FAKE_LOG""#,
+    );
+    let run = run_in_pty(&sb, &fake, |_| {});
+    let lines: Vec<&str> = run.log.lines().collect();
+    assert_eq!(
+        &lines[1..],
+        ["turn ended", "after the write", "term"],
+        "{}",
+        run.log
+    );
+    assert!(
+        run.elapsed >= Duration::from_millis(3300),
+        "{:?}",
+        run.elapsed
+    );
+}
+
+#[test]
+fn off_never_closes() {
+    let sb = two_accounts();
+    for off in ["0", "off"] {
+        close_idle(&sb, off);
+        assert_eq!(sb.ok(&["config", "get", "claude.close_idle"]).trim(), "off");
+    }
+    let fake = later(
+        r#"sleep 2.5
+echo "still open" >> "$FAKE_LOG"
+exit 0"#,
+    );
+    // Short only for the test: with it off, nothing would end the agent.
+    let run = run_in_pty(&sb, &fake, |_| {});
+    let lines: Vec<&str> = run.log.lines().collect();
+    assert_eq!(&lines[1..], ["turn ended", "still open"], "{}", run.log);
+    assert!(
+        !run.output.contains("closed this session"),
+        "{:?}",
+        run.output
+    );
+}
+
+#[test]
+fn closes_without_moving_when_moves_are_off() {
+    for (key, value) in [("claude.mode", "manual"), ("claude.relaunch", "off")] {
+        let sb = two_accounts();
+        sb.ok(&["config", "set", key, value]);
+        close_idle(&sb, "2s");
+        // The account is full: in auto mode with relaunch on this would move.
+        let fake = IDLE.replace(
+            "stop\necho \"turn ended\"",
+            r#"printf '{"session_id":"%s","rate_limits":{"five_hour":{"used_percentage":95,"resets_at":4102444800}}}' $s | "$HATS" statusline > /dev/null
+printf '{"session_id":"%s","transcript_path":"%s","hook_event_name":"StopFailure","error":"rate_limit"}' $s "$T" | "$HATS" hook stop
+echo "turn ended""#,
+        );
+        let run = run_in_pty(&sb, &fake, |_| {});
+        let lines: Vec<&str> = run.log.lines().collect();
+        assert!(!lines[0].ends_with("parent=none"), "{key}: {}", run.log);
+        assert_eq!(&lines[1..], ["turn ended", "term"], "{key}: {}", run.log);
+        assert!(!run.log.contains("--resume"), "{key}: moved: {}", run.log);
+        assert!(
+            run.output.contains("claude --resume s-1"),
+            "{key}: {:?}",
+            run.output
+        );
+        let moved = sb
+            .registry_lines()
+            .into_iter()
+            .any(|l| l["session"] == "s-1" && l["label"] == "side");
+        assert!(!moved, "{key}: {:?}", sb.registry_lines());
+    }
+}
+
+#[test]
+fn a_moved_session_left_idle_closes_too() {
+    let sb = two_accounts();
+    close_idle(&sb, "3s");
+    // The resumed agent waits like the first one; the clock goes on from the
+    // turn that ended before the move.
+    let fake = FAKE.replace(
+        "echo resumed >> \"$FAKE_LOG\"; exit 0 ;;",
+        "echo resumed >> \"$FAKE_LOG\"; trap 'echo term >> \"$FAKE_LOG\"; exit 143' TERM; while :; do sleep 0.05; done ;;",
+    );
+    let run = run_in_pty(&sb, &fake, |_| {});
+    assert!(run.log.ends_with("resumed\nterm\n"), "{}", run.log);
+    assert!(
+        run.output.contains("claude --resume s-1"),
+        "{:?}",
+        run.output
+    );
+    assert!(run.elapsed < Duration::from_secs(6), "{:?}", run.elapsed);
+}
+
+#[test]
+fn a_session_opened_and_never_used_closes_too() {
+    let sb = two_accounts();
+    close_idle(&sb, "2s");
+    // SessionStart, then nothing: no prompt, no turn.
+    let fake = r#"#!/bin/sh
+echo "start args=$*" >> "$FAKE_LOG"
+trap 'echo term >> "$FAKE_LOG"; exit 143' TERM
+printf '{"session_id":"s-1","transcript_path":"%s","source":"startup"}' "$HOME/s-1.jsonl" | "$HATS" hook session-start
+i=0
+while [ $i -lt 100 ]; do sleep 0.05; i=$((i + 1)); done
+echo "still open" >> "$FAKE_LOG"
+"#;
+    let run = run_in_pty(&sb, fake, |_| {});
+    let lines: Vec<&str> = run.log.lines().collect();
+    assert_eq!(&lines[1..], ["term"], "{}", run.log);
+    assert!(
+        run.output.contains("Resume it with: claude --resume s-1"),
+        "{:?}",
+        run.output
+    );
+    assert!(run.elapsed >= Duration::from_secs(2), "{:?}", run.elapsed);
+}
+
+#[test]
+fn each_close_is_recorded_for_the_interactive_view() {
+    let sb = two_accounts();
+    close_idle(&sb, "2s");
+    let run = run_in_pty(&sb, IDLE, |_| {});
+    assert!(run.status.success());
+    let closes = fs::read_to_string(sb.home.join(".local/state/hats/closes.jsonl")).unwrap();
+    let lines: Vec<serde_json::Value> = closes
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 1, "{closes}");
+    let line = lines[0].as_object().unwrap();
+    let keys: Vec<&str> = line.keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        ["v", "at", "harness", "session", "label", "idle", "cwd"],
+        "{closes}"
+    );
+    assert_eq!(line["v"], 1);
+    let at = line["at"].as_str().unwrap();
+    assert!(
+        at.len() == 24 && at.ends_with('Z') && at.as_bytes()[10] == b'T',
+        "UTC ISO time: {at}"
+    );
+    assert_eq!(line["harness"], "claude");
+    assert_eq!(line["session"], "s-1");
+    assert_eq!(line["label"], "work");
+    assert_eq!(line["idle"], "2s");
+    assert_eq!(
+        line["cwd"].as_str().unwrap(),
+        sb.home.canonicalize().unwrap().to_str().unwrap()
+    );
+}
+
+/// Starts a command the way Claude Code 2.1.302 starts a background task:
+/// a shell child that sources the session's shell snapshot first.
+fn background(command: &str) -> String {
+    format!(
+        r#"snapshot="$CLAUDE_CONFIG_DIR/shell-snapshots/snapshot-sh-1.sh"
+mkdir -p "${{snapshot%/*}}" && : > "$snapshot"
+/bin/sh -c "source $snapshot 2>/dev/null || true && eval '{command}' < /dev/null && pwd -P >| /dev/null" &
+bg=$!"#
+    )
+}
+
+#[test]
+fn a_move_waits_for_a_background_shell_to_end() {
+    let sb = two_accounts();
+    // The turn that passes the threshold leaves a background task running.
+    // When it ends, Claude Code wakes the agent: a prompt and a turn end.
+    let fake = FAKE
+        .replace(
+            "echo \"turn ended\" >> \"$FAKE_LOG\"\n",
+            &format!(
+                "{}\necho \"turn ended\" >> \"$FAKE_LOG\"\n",
+                background("sleep 2.5")
+            ),
+        )
+        .replace(
+            "trap 'echo term >> \"$FAKE_LOG\"; exit 143' TERM\n",
+            r#"trap 'echo term >> "$FAKE_LOG"; exit 143' TERM
+wait $bg
+echo "background done" >> "$FAKE_LOG"
+printf '{"session_id":"%s"}' $s | "$HATS" hook prompt
+printf '{"session_id":"%s","hook_event_name":"Stop"}' $s | "$HATS" hook stop
+"#,
+        );
+    let run = run_in_pty(&sb, &fake, |_| {});
+    let lines: Vec<&str> = run.log.lines().collect();
+    assert_eq!(
+        &lines[1..4],
+        ["turn ended", "background done", "term"],
+        "{}",
+        run.log
+    );
+    assert!(run.log.ends_with("resumed\n"), "{}", run.log);
+    assert!(run.status.success());
+}
+
+#[test]
+fn a_close_waits_for_a_background_shell_to_end() {
+    let sb = two_accounts();
+    close_idle(&sb, "3s");
+    // Without it the session would close at 3 s, with the task running.
+    let fake = IDLE.replace(
+        "stop\necho \"turn ended\" >> \"$FAKE_LOG\"",
+        &format!(
+            "{}\nstop\necho \"turn ended\" >> \"$FAKE_LOG\"\nwait $bg\necho \"background done\" >> \"$FAKE_LOG\"",
+            background("sleep 4")
+        ),
+    );
+    let run = run_in_pty(&sb, &fake, |_| {});
+    let lines: Vec<&str> = run.log.lines().collect();
+    assert_eq!(
+        &lines[1..],
+        ["turn ended", "background done", "term"],
+        "{}",
+        run.log
+    );
+    assert!(
+        run.output.contains("claude --resume s-1"),
+        "{:?}",
+        run.output
+    );
+}
+
+#[test]
+fn a_background_shell_holds_a_close_for_one_more_close_idle_at_most() {
+    let sb = two_accounts();
+    close_idle(&sb, "2s");
+    // A task that never ends counts as use for 2 s of its run time; the
+    // session then closes 2 s later, with the task still running.
+    let fake = IDLE.replace(
+        "stop\necho \"turn ended\"",
+        &format!("{}\nstop\necho \"turn ended\"", background("sleep 8")),
+    );
+    let run = run_in_pty(&sb, &fake, |_| {});
+    let lines: Vec<&str> = run.log.lines().collect();
+    assert_eq!(&lines[1..], ["turn ended", "term"], "{}", run.log);
+    assert!(
+        run.elapsed >= Duration::from_secs(4) && run.elapsed < Duration::from_secs(7),
+        "{:?}",
+        run.elapsed
+    );
+}
+
+#[test]
+fn a_session_started_inside_another_does_not_speak_for_it() {
+    let sb = two_accounts();
+    // In its turn the agent runs `claude -p`, through hats as the `claude`
+    // function does. That session's turn end must not look like the outer
+    // agent's: the move waits for the outer turn to end.
+    let fake = FAKE
+        .replace(
+            "case \" $* \" in",
+            r#"case " $* " in *" -p "*) printf '{"session_id":"nested","hook_event_name":"Stop"}' | "$HATS" hook stop; echo nested >> "$FAKE_LOG"; exit 0 ;; esac
+case " $* " in"#,
+        )
+        .replace(
+            "echo \"turn ended\" >> \"$FAKE_LOG\"\n",
+            "\"$HATS\" run -- -p hi < /dev/null > /dev/null\nsleep 1.5\necho \"turn ended\" >> \"$FAKE_LOG\"\n",
+        );
+    let run = run_in_pty(&sb, &fake, |_| {});
+    let lines: Vec<&str> = run.log.lines().filter(|l| !l.contains("args=-p")).collect();
+    assert_eq!(
+        &lines[1..4],
+        ["nested", "turn ended", "term"],
         "{}",
         run.log
     );

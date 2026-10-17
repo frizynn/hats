@@ -1,11 +1,13 @@
 mod account;
 mod auto;
+mod background;
 mod config;
 mod hook;
 mod import;
 mod limits;
 mod policy;
 mod registry;
+mod relaunch;
 mod setup;
 mod statusline;
 mod store;
@@ -83,9 +85,10 @@ enum Cmd {
     },
     /// Start the harness with an account (default: the current one).
     ///
-    /// In auto mode, an interactive Claude Code session stays under a small
-    /// hats parent that moves it to the next account when it passes the
-    /// threshold, once the agent is idle.
+    /// An interactive Claude Code session stays under a small hats parent
+    /// that, in auto mode, moves it to the next account when it passes the
+    /// threshold, once the agent is idle, and closes it when unused for
+    /// `claude.close_idle` (32h by default).
     Run {
         /// Account label, as `hats list` shows it (default: the current one).
         label: Option<String>,
@@ -377,12 +380,14 @@ fn launch(
     let account = chosen(store, harness, label)?;
     // Picks up shared files the user created since the account was added.
     account.create(store)?;
-    if supervisor::should_supervise(&account, settings, &args) {
-        let code = supervisor::supervise(store, settings, account, args)?;
+    if supervisor::should_supervise(&account, config, &args) {
+        let code = supervisor::supervise(store, config, account, args)?;
         return Err(Failure::Exit(code.clamp(0, 255) as u8));
     }
     let mut cmd = Command::new(harness.program());
-    cmd.args(args);
+    // Started from inside a supervised session (`claude -p` in the agent's
+    // turn), its hooks must not tell that session's parent it is idle.
+    cmd.args(args).env_remove(supervisor::PID_ENV);
     Err(exec(cmd, &account).into())
 }
 
@@ -544,11 +549,7 @@ fn config_command(
         ConfigCmd::List { json: false } => {
             for (key, value) in config.entries() {
                 let short = key.split_once('.').map_or(key.as_str(), |(_, k)| k);
-                let help = config::KEYS
-                    .iter()
-                    .find(|(k, _)| *k == short)
-                    .map_or("", |(_, h)| h);
-                println!("{key:<17} {value:<10} {help}");
+                println!("{key:<17} {value:<10} {}", config::help(short));
             }
             println!(
                 "\nChange one with `hats config set <key> <value>`; file: {}",

@@ -68,24 +68,54 @@ impl<'a> Switch<'a> {
             reason,
         }
     }
+}
 
-    pub fn to_line(&self) -> String {
-        let mut line = serde_json::to_string(self).expect("plain struct always serializes");
-        line.push('\n');
-        line
+pub const CLOSES_FILE: &str = "closes.jsonl";
+
+/// A session `hats run` closed because it went unused: one line of
+/// `closes.jsonl`, read by the interactive view.
+///
+/// ```json
+/// {"v":1,"at":"2026-01-02T03:04:05.678Z","harness":"claude","session":"<id>","label":"work","idle":"32h","cwd":"/home/user/project"}
+/// ```
+#[derive(Serialize)]
+pub struct Close<'a> {
+    v: u32,
+    at: String,
+    harness: Harness,
+    session: &'a str,
+    label: &'a str,
+    /// `claude.close_idle` when it closed, as `hats config` shows it.
+    idle: String,
+    cwd: String,
+}
+
+impl<'a> Close<'a> {
+    pub fn new(at: SystemTime, session: &'a str, label: &'a str, idle: String, cwd: &Path) -> Self {
+        Self {
+            v: VERSION,
+            at: utc_millis(at),
+            harness: Harness::Claude,
+            session,
+            label,
+            idle,
+            cwd: cwd.to_string_lossy().into_owned(),
+        }
     }
 }
 
 /// Appends one line with a single `write(2)` on an `O_APPEND` descriptor.
 /// POSIX moves the offset to the end and writes with no intervening
 /// modification, so concurrent hooks never interleave their lines.
-pub fn append(path: &Path, switch: &Switch) -> io::Result<()> {
+pub fn append(path: &Path, line: &impl Serialize) -> io::Result<()> {
+    let mut bytes = serde_json::to_vec(line).expect("plain struct always serializes");
+    bytes.push(b'\n');
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
         .open(path)?;
-    file.write_all(switch.to_line().as_bytes())
+    file.write_all(&bytes)
 }
 
 /// A change of account read back from the registry.
