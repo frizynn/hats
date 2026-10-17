@@ -177,13 +177,20 @@ mod tests {
     use std::process::Command;
     use std::time::Duration;
 
-    /// Each child with its arguments and start, for a failure message.
+    /// Each child with its arguments, start, liveness and the errno of each
+    /// read, for a failure message.
     fn describe(agent: u32) -> String {
+        let errno = || std::io::Error::last_os_error().raw_os_error();
         let children = children(agent);
         let each = children.iter().map(|&pid| {
             let args = args(pid)
                 .map(|a| String::from_utf8_lossy(&a[..a.len().min(300)]).replace('\0', " "));
-            format!("{pid} {args:?} {:?}", started(pid))
+            let args_errno = errno();
+            let start = started(pid);
+            let start_errno = errno();
+            // SAFETY: signal 0 only checks that the process exists.
+            let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+            format!("{pid} alive={alive} args={args:?} ({args_errno:?}) start={start:?} ({start_errno:?})")
         });
         format!(
             "{} [{}]",
@@ -229,7 +236,14 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
                 newest(me)
             })
-            .unwrap_or_else(|| panic!("the shell is found; children: {}", describe(me)));
+            .unwrap_or_else(|| {
+                panic!(
+                    "the shell is found; children: {}; shell exited: {:?}; other exited: {:?}",
+                    describe(me),
+                    shell.try_wait(),
+                    other.try_wait()
+                )
+            });
         assert!(
             started >= before && started <= SystemTime::now(),
             "{started:?}"
