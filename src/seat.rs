@@ -105,6 +105,9 @@ pub fn sit(store: &Store, target: &Account) -> Result<(), String> {
             Some(account) => account,
             None => adopt(store, &config_path, occupant)?,
         };
+        // A renewal of the copy it holds (see `poll`) must not land over it.
+        let _parked = Lock::take(account.dir.join(".oauth_refresh.lock"), REFRESH_STALE)?;
+        let _parked_legacy = Lock::take(with_suffix(&account.dir, ".lock"), REFRESH_STALE)?;
         secret::put_login(store, &account, leaving.clone()).map_err(|e| e.to_string())?;
     }
     secret::put_login(store, &seat, incoming).map_err(|e| e.to_string())?;

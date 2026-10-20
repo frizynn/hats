@@ -90,7 +90,12 @@ pub fn read(store: &Store, account: &Account) -> io::Result<Option<Map<String, V
 
 /// The login alone, or `None` when the directory is not signed in.
 pub fn login(store: &Store, account: &Account) -> io::Result<Option<Value>> {
-    Ok(read(store, account)?.and_then(|mut item| item.remove(LOGIN_KEY)))
+    match read(store, account)?.and_then(|mut item| item.remove(LOGIN_KEY)) {
+        Some(login) if !login.is_object() => {
+            Err(io::Error::other("the stored login is not a JSON object"))
+        }
+        login => Ok(login),
+    }
 }
 
 /// Puts `login` in the directory's item, keeping whatever else it holds.
