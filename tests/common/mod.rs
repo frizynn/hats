@@ -19,9 +19,27 @@ dir="${CLAUDE_CONFIG_DIR-}"
 json="${dir:-$HOME}/.claude.json"
 [ -n "$dir" ] || json="$HOME/.claude.json"
 case "$1 $2" in
-  "auth login") printf '{"oauthAccount":{"accountUuid":"%s","organizationUuid":"%s","emailAddress":"user@example.com"}}' "$FAKE_ACCOUNT_UUID" "$FAKE_ORG_UUID" > "$json"; echo "logged in" ;;
-  "auth logout") printf '{}' > "$json"; echo "logged out" ;;
+  "auth login") printf '{"oauthAccount":{"accountUuid":"%s","organizationUuid":"%s","emailAddress":"user@example.com"}}' "$FAKE_ACCOUNT_UUID" "$FAKE_ORG_UUID" > "$json"
+    printf '{"claudeAiOauth":{"accessToken":"token-%s","refreshToken":"refresh-%s","expiresAt":4102444800000}}' "$FAKE_ORG_UUID" "$FAKE_ORG_UUID" > "${dir:-$HOME/.claude}/.credentials.json"; echo "logged in" ;;
+  "auth logout") printf '{}' > "$json"; rm -f "${dir:-$HOME/.claude}/.credentials.json"; echo "logged out" ;;
   *) echo "claude CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR-<unset>} args=$*" ;;
+esac
+"#;
+
+/// The provider, as `curl` sees it: reads the request from its standard
+/// input, as hats sends it. A usage request answers
+/// `$FAKE_USAGE/<token>.json`, or 401 without one; a token renewal answers
+/// `renewed`, valid for an hour, and logs the request in `$FAKE_USAGE/renewals`.
+const FAKE_CURL: &str = r#"#!/bin/sh
+config=$(cat)
+case "$config" in
+  *oauth/token*)
+    echo "$config" | grep '^data-binary' >> "$FAKE_USAGE/renewals"
+    printf '{"access_token":"renewed","refresh_token":"refresh-renewed","expires_in":3600}\n200' ;;
+  *)
+    token=$(echo "$config" | sed -n 's/^header = "Authorization: Bearer \(.*\)"$/\1/p')
+    if [ -f "$FAKE_USAGE/$token.json" ]; then cat "$FAKE_USAGE/$token.json"; printf '\n200'
+    else printf '{}\n401'; fi ;;
 esac
 "#;
 
@@ -42,7 +60,11 @@ impl Sandbox {
         let bin = root.path().join("bin");
         fs::create_dir_all(home.join(".claude")).unwrap();
         fs::create_dir_all(&bin).unwrap();
-        for (name, script) in [("claude", FAKE_CLAUDE), ("codex", FAKE_CODEX)] {
+        for (name, script) in [
+            ("claude", FAKE_CLAUDE),
+            ("codex", FAKE_CODEX),
+            ("curl", FAKE_CURL),
+        ] {
             write_program(&bin.join(name), script);
         }
         Self {
@@ -60,7 +82,8 @@ impl Sandbox {
             .env("HOME", &self.home)
             .env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()))
             .env("FAKE_ACCOUNT_UUID", ACCOUNT_UUID)
-            .env("FAKE_ORG_UUID", ORG_UUID);
+            .env("FAKE_ORG_UUID", ORG_UUID)
+            .env("HATS_OFFLINE", "1");
         cmd
     }
 
@@ -153,6 +176,38 @@ impl Sandbox {
             .write_all(input.as_bytes())
             .unwrap();
         child.wait_with_output().unwrap()
+    }
+
+    /// The token of the login in Claude Code's own directory: `token-<org>`.
+    pub fn seat_token(&self) -> String {
+        let text = fs::read_to_string(self.home.join(".claude/.credentials.json")).unwrap();
+        let item: serde_json::Value = serde_json::from_str(&text).unwrap();
+        item["claudeAiOauth"]["accessToken"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    /// What the fake provider answers for `token`: the 5-hour and weekly use.
+    pub fn provider_says(&self, token: &str, five_hour: f64, seven_day: f64) {
+        let dir = self.home.join("provider");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(format!("{token}.json")),
+            format!(
+                r#"{{"five_hour":{{"utilization":{five_hour},"resets_at":"2100-01-01T00:00:00+00:00"}},"seven_day":{{"utilization":{seven_day},"resets_at":"2100-01-01T00:00:00Z"}}}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// `hats poll` against the fake provider.
+    pub fn poll(&self) -> Output {
+        self.cmd(&["poll"])
+            .env_remove("HATS_OFFLINE")
+            .env("FAKE_USAGE", self.home.join("provider"))
+            .output()
+            .unwrap()
     }
 
     pub fn current(&self) -> String {

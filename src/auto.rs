@@ -8,6 +8,7 @@ use crate::config::{HarnessConfig, Mode};
 use crate::limits::{self, Reading};
 use crate::policy::{self, Candidate, Reason};
 use crate::registry::{self, Switch};
+use crate::seat;
 use crate::store::Store;
 
 /// One account with what is known about it.
@@ -57,6 +58,17 @@ pub fn statuses(
             Some(login) => (Some(login.id), login.identity),
             None => (None, Identity::default()),
         };
+        // Claude Code's own directory is the seat: it shows as the account
+        // whose login sits in it, and as a row of its own only while no
+        // account holds that login.
+        if harness == Harness::Claude
+            && account.is_default
+            && id
+                .as_ref()
+                .is_none_or(|id| seat::holder(store, id).is_some())
+        {
+            continue;
+        }
         let reading = match (harness, &id) {
             (Harness::Claude, Some(id)) => claude.get(id).cloned(),
             (Harness::Codex, Some(_)) => limits::codex_reading(&account.dir.join("sessions"))
@@ -145,14 +157,19 @@ pub fn check_default(
     Ok(Some((next.account.clone(), reason)))
 }
 
-/// The user's choice of default account, recorded as `manual`.
+/// The user's choice of default account, recorded as `manual`. Choosing the
+/// account already in use changes and records nothing.
 pub fn choose(store: &Store, account: &Account, id: &str, now: SystemTime) -> Result<(), String> {
     let _lock = store.lock_current().map_err(|e| e.to_string())?;
+    if store.current(account.harness)?.label == account.label {
+        return Ok(());
+    }
     make_default(store, account, id, Reason::Manual, now)
 }
 
-/// Makes `account` the default for new sessions and records why. The caller
-/// holds `lock_current`.
+/// Makes `account` the one sessions use and records why: for Claude Code its
+/// login takes the seat, so running sessions move too; for Codex new
+/// sessions start with it. The caller holds `lock_current`.
 fn make_default(
     store: &Store,
     account: &Account,
@@ -160,7 +177,12 @@ fn make_default(
     reason: Reason,
     now: SystemTime,
 ) -> Result<(), String> {
-    store.set_current(account).map_err(|e| e.to_string())?;
+    match account.harness {
+        Harness::Claude => {
+            seat::sit(store, account)?;
+        }
+        Harness::Codex => store.set_current(account).map_err(|e| e.to_string())?,
+    }
     let line = Switch::new(
         now,
         account.harness,

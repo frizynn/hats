@@ -200,13 +200,20 @@ pub fn seed(
 }
 
 /// A turn of the account ended with a rate limit error: it counts as full
-/// for `LIMIT_HOLD`, whatever its last numbers said.
+/// until its full window resets, when the last numbers say when, else for
+/// `LIMIT_HOLD`.
 pub fn mark_limited(store: &Store, account: &Account, id: &str, now: SystemTime) -> io::Result<()> {
-    let until = unix_secs(now) + LIMIT_HOLD.as_secs() as i64;
+    let now_secs = unix_secs(now);
     update(store, account.harness, id, |entry| {
         let entry = entry
             .get_or_insert_with(|| AccountLimits::new(account, id, unix_millis(now), Vec::new()));
-        entry.limited_until = Some(until);
+        let full_until = entry
+            .windows
+            .iter()
+            .filter(|w| w.used_percent >= 100.0 && w.resets_at > now_secs)
+            .map(|w| w.resets_at)
+            .max();
+        entry.limited_until = Some(full_until.unwrap_or(now_secs + LIMIT_HOLD.as_secs() as i64));
         true
     })
 }

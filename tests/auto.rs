@@ -117,23 +117,17 @@ fn run_starts_new_sessions_on_an_account_with_room() {
     sb.repaint("spare", 50.0, 0.0);
     sb.ok(&["config", "set", "claude.mode", "auto"]);
 
+    // Every session runs in Claude Code's own directory, with the login of
+    // the account that has room.
     let out = sb.ok(&["run"]);
-    assert!(
-        out.contains(&format!(
-            "CLAUDE_CONFIG_DIR={}",
-            sb.claude_dir("side").display()
-        )),
-        "{out}"
-    );
+    assert!(out.contains("CLAUDE_CONFIG_DIR=<unset>"), "{out}");
+    assert_eq!(sb.current(), "side");
+    assert_eq!(sb.seat_token(), "token-org-side");
     // An explicit label is the user's choice and is respected.
     let out = sb.ok(&["run", "work"]);
-    assert!(
-        out.contains(&format!(
-            "CLAUDE_CONFIG_DIR={}",
-            sb.claude_dir("work").display()
-        )),
-        "{out}"
-    );
+    assert!(out.contains("CLAUDE_CONFIG_DIR=<unset>"), "{out}");
+    assert_eq!(sb.current(), "work");
+    assert_eq!(sb.seat_token(), "token-org-work");
 }
 
 #[test]
@@ -348,8 +342,8 @@ fn auto_says_what_it_does_and_turns_it_on_and_off() {
     let out = auto(&["auto"]);
     for line in [
         "Claude Code: automatic switching is on.",
-        "When the account in use reaches 90 % of its 5-hour or weekly limit, new sessions start in the account with the most room, and sessions started with `hats run` move there once their turn ends.",
-        "New sessions start in 'work'.",
+        "When the account in use reaches 90 % of its 5-hour or weekly limit, Claude Code switches to the account with the most room, the sessions already open too.",
+        "In use now: 'work'.",
         ": default → work: you chose it.",
         "Not active yet: run `hats setup` to install the hooks and the status line that switch.",
     ] {

@@ -6,7 +6,7 @@
 //!   writes a new line; the newest line wins.
 //! - `UserPromptSubmit`, `Stop`, `StopFailure`: tell a `hats run` parent when
 //!   the agent is working or idle; a rate limit error marks the account full
-//!   and moves the default off it.
+//!   and moves the seat off it.
 
 use std::ffi::OsString;
 use std::io::Read;
@@ -21,7 +21,7 @@ use crate::limits;
 use crate::policy::Reason;
 use crate::registry::{self, Switch};
 use crate::store::Store;
-use crate::{auto, supervisor};
+use crate::{auto, seat, supervisor};
 
 /// Hook payloads are a few kilobytes; anything larger is not ours.
 const MAX_INPUT: u64 = 1 << 20;
@@ -107,7 +107,13 @@ pub fn stop(
     let input = read_input(stdin)?;
     let rate_limited = input.hook_event_name.as_deref() == Some("StopFailure")
         && input.error.as_deref() == Some("rate_limit");
-    if rate_limited {
+    // Claude Code keeps a login it read for about 30 seconds: an error right
+    // after the seat changed hands may be the account that left.
+    let just_seated = config_dir.as_ref().is_none_or(|d| d.is_empty())
+        && seat::changed_at(store)
+            .and_then(|at| now.duration_since(at).ok())
+            .is_some_and(|since| since < seat::SETTLING);
+    if rate_limited && !just_seated {
         let account = session_account(store, config_dir);
         // Known as full from now on, whether or not it is the default.
         if let Some(id) = account.provider_id(store).map_err(|e| e.to_string())? {
@@ -123,5 +129,5 @@ pub fn stop(
         )?;
     }
     let turn = supervisor::Turn::new(input.session_id, input.transcript_path, now);
-    supervisor::mark_idle(store, config, &turn, rate_limited).map_err(|e| e.to_string())
+    supervisor::mark_idle(store, &turn).map_err(|e| e.to_string())
 }

@@ -3,27 +3,26 @@
 [![ci](https://github.com/frizynn/hats/actions/workflows/ci.yml/badge.svg)](https://github.com/frizynn/hats/actions/workflows/ci.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Switch Claude Code and Codex between accounts. One small binary, no daemon,
-no credentials touched.
+Switch Claude Code and Codex between accounts. One small binary, no daemon.
 
 Each account is a full configuration directory (`CLAUDE_CONFIG_DIR` for Claude
-Code, `CODEX_HOME` for Codex), which is how Anthropic documents running several
-accounts side by side. You sign in to each one with the harness's own login.
-hats creates the directories, shares your settings into them, picks which one a
-session starts with and, if you want, moves to another account when one gets
-close to its plan limit.
+Code, `CODEX_HOME` for Codex) where you sign in with the harness's own login.
+Claude Code sessions all run in `~/.claude`: changing account moves that
+account's login there, and every open session takes it within about 30
+seconds, with no restart, the way claude-swap did. hats reads each account's
+plan limits from the provider and, if you want, changes account when the one
+in use gets close to its limit.
 
 ```
 $ hats list
-CLAUDE CODE · new sessions start in ● work
+CLAUDE CODE · every session runs on ● work
 Auto: at 90 % of either limit, it moves to the account with the most room.
   ACCOUNT   5-HOUR LIMIT               WEEKLY LIMIT               UPDATED
 ● work      ▰▰▰▰▰▰▰▰▱▱  81% 14:20      ▰▰▱▱▱▱▱▱▱▱  23% Thu 09:00  just now
     sam@acme.example · Team · Acme
-  personal  ▰▱▱▱▱▱▱▱▱▱  12% 16:05      ▰▰▰▰▱▱▱▱▱▱  41% Mon 11:00  2 h ago
+  personal  ▰▱▱▱▱▱▱▱▱▱  12% 16:05      ▰▰▰▰▱▱▱▱▱▱  41% Mon 11:00  just now
     sam@example.com · Max
-  default   not signed in: hats login default
-    ~/.claude
+  spare     not signed in: hats login spare
 ```
 
 ## Install
@@ -72,8 +71,10 @@ hats setup             # hooks, status line and shell functions, shown before wr
 hats                   # see your accounts and their limits
 ```
 
-From then on, `claude` in a new terminal starts with the current account. Your
-existing `~/.claude` login keeps working as the account named `default`.
+From then on every Claude Code session, the ones already open included, runs
+on the account in use. A login you made with plain `claude` before hats shows
+as `default` until another account takes its place; then it gets an account of
+its own, named after its mail, so nothing is lost.
 
 `hats setup` shows every change before writing and keeps a backup of each file
 next to it, never over an earlier one. Running it again changes nothing, or
@@ -97,13 +98,13 @@ mark and bold only.
 ```
  1 Accounts  2 Usage  3 Settings  4 Activity                  tab next · q quit
 ────────────────────────────────────────────────────────────────────────────────
- Claude Code 6   Codex 2   new sessions start in ● default
+ Claude Code 5   Codex 2   every session runs on ● default
 Auto: at 90 % of either limit, it moves to the account with the most room.
     ACCOUNT  5-HOUR LIMIT               WEEKLY LIMIT               UPDATED
 ▌ ● default  ▰▰▱▱▱▱▱▱▱▱  21% 17:42      ▰▰▱▱▱▱▱▱▱▱  15% Wed 18:30  2 min ago
     night    hit its limit at 14:30: counted as full until 19:30
-    old off  ▱▱▱▱▱▱▱▱▱▱   0% reset      ▰▰▰▰▰▰▰▱▱▱  71% Mon 15:30  3 days ago
-    side     no data yet: appears once you use this account
+    old off  ▱▱▱▱▱▱▱▱▱▱   0%            ▰▰▰▰▰▰▰▱▱▱  71% Mon 15:30  3 days ago
+    side     no data yet: appears within a minute
     spare    not signed in: press l to sign in
     work     ▰▰▰▰▰▰▰▰▰▰ 100% 17:00      ▰▰▰▰▰▰▱▱▱▱  64% Mon 20:30  10 min ago
 ─ default ──────────────────────────────────────────────────────────────────────
@@ -113,7 +114,7 @@ Auto: at 90 % of either limit, it moves to the account with the most room.
  Folder       ~/.claude
  Resets       5-hour 21 % until 17:42 · weekly 15 % until Wed 18:30
  Updated      2 min ago
- Auto switch  on: may move here when the current account fills
+ Auto switch  on: may move here when the account in use fills
  Last change  14:40  → default: you chose it
 
 ↑↓ move  ←→ codex  enter use  space off  ⇧↑↓ order  a add  l login  d remove
@@ -121,7 +122,7 @@ Auto: at 90 % of either limit, it moves to the account with the most room.
 
 | Tab | What it shows | Keys |
 |---|---|---|
-| Accounts | Claude Code or Codex, one line per account with its limits, and the selected account's mail, organization, plan, folder, resets and last change; how many Claude Code sessions run without hats | `↑↓` move, `←→` the other harness, `enter` use, `space` turn off or on, `shift+↑↓` order, `a` add, `l` sign in, `d` remove (asks first) |
+| Accounts | Claude Code or Codex, one line per account with its limits, and the selected account's mail, organization, plan, folder, resets and last change | `↑↓` move, `←→` the other harness, `enter` use, `space` turn off or on, `shift+↑↓` order, `a` add, `l` sign in, `d` remove (asks first) |
 | Usage | tokens and their cost at API list price today, in 7 and 30 days and in the month, by account, model and project, with a bar per day; the first scan runs on its own thread | `←→` one account or all, `esc` all again, `↑↓` scroll, `r` scan again |
 | Settings | every key of `config.toml` for both harnesses with its help, where hats keeps its files and whether `hats setup` was applied | `↑↓` move, `←→` change, `enter` to type a value and `enter` again to save it, `esc` cancels; a value that is not valid is refused with the reason |
 | Activity | changes of account and sessions closed for going unused, newest first | `↑↓` scroll, `home`/`end` |
@@ -140,118 +141,92 @@ happens.
   things that should be the same everywhere: `settings.json`, `CLAUDE.md`,
   `keybindings.json`, `agents/`, `commands/`, `skills/`, `plugins/`,
   `output-styles/`, and the history (`projects/`, `history.jsonl`,
-  `file-history/`, `todos/`, `plans/`), so `claude --resume` sees every
-  session whichever account ran it. The login and Claude Code's own state
-  (`.claude.json`, caches) stay per account. For Codex, `config.toml`,
-  `AGENTS.md`, `hooks.json`, `history.jsonl`, `rules/`, `skills/`, `prompts/`
-  and `plugins/` are shared; sessions stay per account.
-- **Credentials stay with the harness.** Claude Code keys its macOS Keychain
-  entry (or its `.credentials.json` on Linux) to each directory; Codex keeps
-  `auth.json` or its keyring entry per `CODEX_HOME`. hats never opens them.
-  To know which provider account a directory is signed in to, it reads only
-  `oauthAccount.accountUuid` and `organizationUuid` from that directory's
-  `.claude.json`, or `creator_account_id` from the newest Codex rollout header.
-- **Nothing stays running.** `hats run` replaces itself with the harness
-  (`exec`), except for interactive Claude Code sessions, where a small parent
-  stays to move the session when needed and to close it when unused (see
-  below). Hooks and the status line wrapper are short processes Claude Code
-  already starts.
+  `file-history/`, `todos/`, `plans/`). `hats login work` runs Claude Code's
+  own sign-in inside it. For Codex, `config.toml`, `AGENTS.md`, `hooks.json`,
+  `history.jsonl`, `rules/`, `skills/`, `prompts/` and `plugins/` are shared;
+  sessions stay per account.
+- **Claude Code runs in one seat.** Every Claude Code session runs in
+  `~/.claude`. Changing account puts the chosen account's login in that
+  directory's credential item (the Keychain item `Claude Code-credentials` on
+  macOS, `~/.claude/.credentials.json` elsewhere) and its identity in the
+  `oauthAccount` of `~/.claude.json`; everything else in both stays. The login
+  that leaves goes back to its account's directory first, as Claude Code last
+  renewed it, so nothing is lost. Claude Code reads the stored login again
+  after about 30 seconds (at once when `.credentials.json` changes), so open
+  sessions continue on the new account, mid-conversation, without a restart.
+- **Claude Code's own locks.** The change runs under the locks Claude Code
+  takes to renew a token (`~/.claude/.oauth_refresh.lock`, then
+  `~/.claude.lock`, measured on Claude Code 2.1.304): a renewal in flight
+  either ends before it, and the renewed login is the one put away, or reads
+  the new login after it.
+- **Credentials.** hats reads and writes the logins that Claude Code stored, in
+  the same place Claude Code keeps them, through `/usr/bin/security` on macOS
+  with the secret on standard input, never in a command line. It renews the
+  token of an account that is not in use when it has expired, to read its
+  limits, and saves the new one at once. It never copies a login anywhere
+  else and never prints one.
+- **Codex** keeps the earlier behavior: `hats run --codex` starts a session
+  with the account's `CODEX_HOME`; open Codex sessions keep their account.
 
 ## Automatic switching
 
-On by default for both harnesses; `hats config set claude.mode manual` turns it
-off.
+On by default for both harnesses; `hats auto off` (or
+`hats config set claude.mode manual`) turns it off.
 
-hats knows each account's limits only from what the harness already shows:
+Where the limits come from:
 
-- Claude Code passes `rate_limits.five_hour` and `seven_day` to the status line
-  command. `hats statusline` keeps the last values per account in
-  `limits.json` and then runs your own status line command with the same input.
-- Codex writes `rate_limits` into every `token_count` event of its rollouts;
-  hats reads the newest one of each account.
-- A turn that ends with a rate limit error (`StopFailure` with
-  `error: "rate_limit"`) counts that account as full for five hours, or until
-  its status line reports other numbers: the hook input carries no reset time.
-- `hats import claude-swap` takes claude-swap's last reading of each account,
-  with the time claude-swap took it.
+- **The provider.** At most once a minute, hats asks
+  `api.anthropic.com/api/oauth/usage` for every signed-in Claude Code account,
+  with that account's own token, as Claude Code's `/usage` and claude-swap do.
+  The status line wrapper starts it in the background, `hats list` and the
+  interactive view run it when they open, and the view again every minute.
+  `HATS_OFFLINE=1` turns it off.
+- **Claude Code's status line.** Claude Code passes `rate_limits.five_hour`
+  and `seven_day` to the status line command on every repaint, the numbers of
+  the session's last answer. `hats statusline` runs your own status line
+  command with the same input and starts the poll above when it is due. It
+  keeps the numbers only for a session started in an account's own directory:
+  in `~/.claude` the last answer may have come from the account that sat there
+  before, since Claude Code keeps a login it read for about 30 seconds and an
+  idle session keeps its last numbers.
+- **Rate limit errors.** A turn that ends with a rate limit error
+  (`StopFailure` with `error: "rate_limit"`) counts that account as full until
+  the full window resets, when the last numbers say when, else for five hours.
+  In the first minute after a change of account, an error in `~/.claude` is
+  taken as the account that left.
+- **Codex** writes `rate_limits` into every `token_count` event of its
+  rollouts; hats reads the newest one of each account.
 
-A window whose reset time already passed counts as empty, so an old reading
-still says when an account is usable again.
+A window whose reset time already passed counts as empty.
 
-**New sessions.** When the current account passes `threshold` (default 90 %
-of the 5-hour or weekly limit, whichever is higher), the default moves to
-another signed-in account that is at least 10 points under the threshold:
-the one with the most room (`strategy = "headroom"`) or the next in `order`
+**When it switches.** When the account in use passes `threshold` (default
+90 % of the 5-hour or weekly limit, whichever is higher), hats moves to
+another signed-in account that is at least 10 points under the threshold: the
+one with the most room (`strategy = "headroom"`) or the next in `order`
 (`strategy = "next"`). An account with no numbers yet may be the spent one, so
-it is taken only when no account with numbers has room, the first in `order`. This happens in the status line wrapper, in the
-`StopFailure` hook and when `hats run` starts. If no account has room, nothing
-moves.
+it is taken only when no account with numbers has room. This happens in the
+status line wrapper, the `StopFailure` hook, after each poll and when
+`hats run` starts. If no account has room, nothing moves. For Claude Code the
+switch reaches every open session; for Codex, new sessions.
 
 **Accounts turned off.** `hats disable <label>` (or space in the view) keeps
-auto switching from ever moving to an account, by the threshold or by a rate
-limit; `hats enable <label>` lets it again. `hats use` still takes it, and
-says it is off. With every other account off, nothing moves, and `hats auto`
-and the view say why. The labels go in `disabled = [...]` of `config.toml`.
+auto switching from ever moving to an account; `hats enable <label>` lets it
+again. `hats use` still takes it, and says it is off. The labels go in
+`disabled = [...]` of `config.toml`.
 
-**Running sessions.** Started with `hats run` (or the `claude` function that
-`hats setup` installs), an interactive Claude Code session has hats as its
-parent: one process, about 1 MB, asleep in `sigwait` until something happens,
-plus a forked sentinel asleep on a pipe that ends Claude Code with `SIGHUP` if
-the parent is ever killed outright, so the agent is never left running in the
-background.
-When the session's account passes the threshold or hits the limit, hats moves
-it right after a turn ends: within 2 seconds of the `Stop` hook, with no
-prompt after it. It waits one more second, ends Claude Code with `SIGTERM` and
-starts it again in the next account with `--resume <session>`, in the same
-terminal. A prompt sent in that second postpones the move to the next turn
-end, so a turn is never cut. The status line also repaints while the session
-sits idle (a permission mode change, the prompt cache expiring, another
-session spending the same account). A threshold seen then moves the session
-only once it has gone a minute without use, because you may be typing the
-next prompt: Claude Code 2.1.302 loses a prompt typed and not sent when it is
-ended and resumed. On Claude Code 2.1.301 the status line runs 0.31 to 0.34 s
-after the `Stop` hook, well inside the 2 seconds. Claude Code restores the
-terminal on `SIGTERM`; the conversation continues from its transcript.
-
-**Choosing an account.** `hats use <label>`, or enter in the view, also moves
-every running `hats run` session that is on another account: at once if its
-agent is idle, when its turn ends if not. You chose somewhere else, so hats
-does not wait for a minute without use; a prompt typed and not sent in one of
-those sessions is lost. With `relaunch = "off"` running sessions stay where
-they are. A session started without hats (before `hats setup`, or in a
-terminal opened before it) has no hats parent and never moves: the Accounts
-tab of the view says how many there are, and reopening one in a new terminal
-puts it under hats.
-
-Limits of the running-session move:
-
-- Only Claude Code. Codex sessions keep their account; new Codex sessions
-  start on the account with room.
-- After an interrupted turn (Esc), Claude Code does not run the `Stop` hook,
-  so the move waits for the next completed turn.
-- hats rebuilds the command line with `--resume`, keeping your options. If it
-  finds an option it does not know followed by a value, it does not supervise
-  that session (it starts it with `exec`) rather than guess.
-- The move restarts Claude Code: MCP servers start again, and background
-  shells still running would end with it (Claude Code 2.1.302 then tells the
-  agent the command "didn't finish before the previous session ended"). So
-  while Claude Code has a background shell running, the move waits for the
-  next turn end; Claude Code wakes the agent when the task finishes, and the
-  move happens after that turn. A shell running longer than
-  `claude.close_idle` (32 hours with closing off) no longer holds it. hats
-  tells these shells by how Claude Code 2.1.302 starts them; if a version
-  starts them another way, the move stops waiting for them.
-- If Claude Code dies of a signal it cannot handle (`kill -9`, the OOM
-  killer), hats restores the terminal settings and modes before exiting.
+**Choosing an account.** `hats use <label>`, enter in the view, or
+`hats run <label>` moves to that account at once, every open Claude Code
+session included. Choosing the account already in use changes nothing.
 
 Every change of account is recorded in the registry with its reason
-(`manual`, `threshold` or `limit`).
+(`manual`, `threshold` or `limit`). `hats remove` refuses the account in use:
+choose another first.
 
 ## Closing unused sessions
 
 A Claude Code session started with `hats run` (or the `claude` function) that
 goes unused for `claude.close_idle`, 32 hours by default, is closed: hats ends
-Claude Code with `SIGTERM`, as for a move, does not start it again, and
+Claude Code with `SIGTERM`, does not start it again, and
 prints how to resume it before the shell prompt comes back:
 
 ```
@@ -260,8 +235,7 @@ hats: closed this session after 32h without use. Resume it with: claude --resume
 
 `hats config set claude.close_idle 8` makes it 8 hours; `90m` and `30s` are
 minutes and seconds, handy to try it; `0` or `off` turns it off. It works in
-manual mode and with `relaunch = "off"` too; moving still needs both on. A
-change reaches running sessions at their next check.
+manual mode too. A change reaches running sessions at their next check.
 
 What counts as use:
 
@@ -367,11 +341,11 @@ How it counts:
 | `hats list [--json]` | accounts with their limits; `●` marks the one new sessions start with |
 | `hats add <label>` | create an account directory that shares your settings |
 | `hats login <label> [-- args]` | `claude auth login` (or `codex login`) inside that account |
-| `hats use <label>` | make it the default for new sessions, and move running `hats run` sessions to it |
+| `hats use <label>` | use it: every Claude Code session, the open ones too; new Codex sessions |
 | `hats disable <label>`, `hats enable <label>` | keep auto switching from moving to an account, or let it again |
 | `hats auto [on\|off]` | say whether accounts switch by themselves and the last change, or turn it on or off; nothing has to stay open |
-| `hats run [label] [-- args]` | start the harness with that account (default: the current one) |
-| `hats env [label]` | print `export CLAUDE_CONFIG_DIR=...` for `eval` or a terminal multiplexer pane |
+| `hats run [label] [-- args]` | start the harness; with a label, use that account first |
+| `hats env [label]` | print the shell line for `eval`: `unset CLAUDE_CONFIG_DIR` for Claude Code (with a label, that account is used first), `export CODEX_HOME=...` for Codex |
 | `hats remove <label>` | sign out with the harness, then delete the directory (links only, never the shared files) |
 | `hats config [list\|get\|set\|edit\|path]` | settings; `hats config` lists every key with its meaning |
 | `hats setup [--dry-run\|--undo]` | install or remove the hooks, the status line wrapper and the shell functions; run it again after moving the binary |
@@ -395,7 +369,6 @@ mode = "auto"          # auto | manual
 threshold = 90         # 1-100, percent of the 5-hour or weekly limit
 strategy = "headroom"  # headroom | next
 order = ["work", "personal"]   # preferred order; others follow by name
-relaunch = "idle"      # idle | off: move running `hats run` sessions
 close_idle = "32h"     # close a `hats run` session unused this long; 0 | off: never
 disabled = ["old"]     # accounts auto switching never moves to
 
@@ -404,7 +377,6 @@ mode = "auto"
 threshold = 90
 strategy = "headroom"
 order = []
-relaunch = "idle"
 disabled = []
 ```
 
@@ -419,10 +391,10 @@ The Settings tab of the view changes the same keys in place.
 | Sessions closed for going unused | `$XDG_STATE_HOME/hats/closes.jsonl` | 0600 |
 | Last limits per account | `$XDG_STATE_HOME/hats/limits.json` | 0600 |
 | Current account per harness | `$XDG_STATE_HOME/hats/current-claude`, `current-codex` | |
-| What each `hats run` parent is told by hooks and `hats use` | `$XDG_STATE_HOME/hats/run/<pid>/`, removed when the parent ends; one a killed parent left is removed by the next `hats run`, `hats use` or `hats` | 0700 |
+| What each `hats run` parent is told by the hooks | `$XDG_STATE_HOME/hats/run/<pid>/`, removed when the parent ends; one a killed parent left is removed by the next `hats run`, `hats use` or `hats` | 0700 |
 | Token totals and scan offsets | `$XDG_STATE_HOME/hats/usage/` | 0600 |
 | Settings | `$XDG_CONFIG_HOME/hats/config.toml` | 0600 |
-| Credentials | where the harness keeps them; hats never reads them | |
+| Credentials | where the harness keeps them: per account directory, and the one in use in `~/.claude`'s item | |
 
 Keep `$XDG_DATA_HOME` stable: Claude Code names each account's Keychain entry
 after the exact directory path, so moving it signs the account out.
@@ -488,9 +460,9 @@ tokens are never read or copied. When every account is signed in, stop
 
 | | claude-swap 0.26.0 | hats |
 |---|---|---|
-| How it switches | rewrites the Keychain item and `~/.claude.json` | one config directory per account |
-| Credentials | copies every account's tokens | never reads them |
-| Usage data | polls an undocumented endpoint with each token | what the harness already reports |
+| How it switches | rewrites the Keychain item and `~/.claude.json` | the same, under Claude Code's locks |
+| Credentials | keeps a copy of every account's tokens in its own store | each login stays in its account's directory, where Claude Code put it |
+| Usage data | polls the usage endpoint with each token | the same, at most once a minute, plus the status line |
 | Resident process | `cswap auto`, about 27 MB | none (a ~1 MB parent per supervised session) |
 | Start-up | about 50 ms, 35 MB | see Measurements |
 
@@ -507,7 +479,9 @@ Facts and links, so each operator decides. Read on 2026-10-16.
   tokens", and "sign-in to a Claude account must complete through Anthropic's
   own flow."
   ([Legal and compliance](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use))
-  hats does not.
+  hats reads and writes the logins Claude Code stored, on your own machine,
+  to move them in and out of `~/.claude`, as claude-swap did; it sends them
+  only to Anthropic. Decide whether that fits your terms.
 - Anthropic on usage limits: "Advertised usage limits for Pro and Max plans
   assume ordinary, individual usage of Claude Code and the Agent SDK."
   (same page, [acceptable use](https://code.claude.com/docs/en/legal-and-compliance#acceptable-use))

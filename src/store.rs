@@ -72,8 +72,12 @@ impl Store {
         self.state.join(format!("current-{}", harness.name()))
     }
 
-    /// The account new launches use when no label is given.
+    /// The account sessions use: for Claude Code the one whose login sits in
+    /// `~/.claude`, for Codex the one new launches take.
     pub fn current(&self, harness: Harness) -> Result<Account, String> {
+        if harness == Harness::Claude {
+            return Ok(crate::seat::current(self));
+        }
         let label = match fs::read_to_string(self.current_file(harness)) {
             Ok(label) => label.trim().to_owned(),
             Err(e) if e.kind() == io::ErrorKind::NotFound => DEFAULT_LABEL.to_owned(),

@@ -76,7 +76,7 @@ fn add_rejects_bad_and_duplicate_labels() {
 #[test]
 fn run_links_shared_entries_created_after_add() {
     let sb = Sandbox::new();
-    sb.ok(&["add", "work"]);
+    sb.signed_in("work", "org-work");
     let claude = sb.home.join(".claude");
     fs::write(claude.join("CLAUDE.md"), "# rules\n").unwrap();
 
@@ -90,24 +90,21 @@ fn run_links_shared_entries_created_after_add() {
 }
 
 #[test]
-fn run_execs_the_harness_with_the_account_directory() {
+fn run_puts_the_accounts_login_in_claude_codes_own_directory() {
     let sb = Sandbox::new();
-    sb.ok(&["add", "work"]);
-    let dir = sb.data().join("claude/work");
+    sb.signed_in("work", "org-work");
+    sb.signed_in("side", "org-side");
 
     let out = sb.ok(&["run", "work", "--", "--resume", "abc"]);
     assert_eq!(
         out.trim(),
-        format!(
-            "claude CLAUDE_CONFIG_DIR={} args=--resume abc",
-            dir.display()
-        )
+        "claude CLAUDE_CONFIG_DIR=<unset> args=--resume abc"
     );
+    assert_eq!(sb.seat_token(), "token-org-work");
 
-    // The default account starts with the variable unset, even if the
-    // caller's shell had one exported.
+    // Even if the caller's shell had the variable exported.
     let out = sb
-        .cmd(&["run", "default"])
+        .cmd(&["run", "side"])
         .env("CLAUDE_CONFIG_DIR", "/elsewhere")
         .output()
         .unwrap();
@@ -115,6 +112,10 @@ fn run_execs_the_harness_with_the_account_directory() {
         String::from_utf8_lossy(&out.stdout).trim(),
         "claude CLAUDE_CONFIG_DIR=<unset> args="
     );
+    assert_eq!(sb.seat_token(), "token-org-side");
+    // `work`'s login went back to its account, untouched.
+    let parked = fs::read_to_string(sb.claude_dir("work").join(".credentials.json")).unwrap();
+    assert!(parked.contains("token-org-work"), "{parked}");
 }
 
 #[test]
@@ -122,18 +123,11 @@ fn run_without_label_uses_the_current_account() {
     let sb = Sandbox::new();
     assert!(sb.ok(&["run"]).contains("CLAUDE_CONFIG_DIR=<unset>"));
 
-    sb.ok(&["add", "work"]);
-    sb.ok(&["login", "work"]);
+    sb.signed_in("work", "org-work");
     sb.ok(&["use", "work"]);
-    let dir = sb.data().join("claude/work");
-    assert!(
-        sb.ok(&["run"])
-            .contains(&format!("CLAUDE_CONFIG_DIR={}", dir.display()))
-    );
-    assert_eq!(
-        sb.ok(&["env"]).trim(),
-        format!("export CLAUDE_CONFIG_DIR='{}'", dir.display())
-    );
+    assert!(sb.ok(&["run"]).contains("CLAUDE_CONFIG_DIR=<unset>"));
+    assert_eq!(sb.seat_token(), "token-org-work");
+    assert_eq!(sb.ok(&["env"]).trim(), "unset CLAUDE_CONFIG_DIR");
 }
 
 #[test]
@@ -182,14 +176,14 @@ fn list_marks_the_current_account() {
         .iter()
         .map(|a| a["label"].as_str().unwrap())
         .collect();
-    assert_eq!(labels, ["default", "personal", "work"], "{list}");
-    assert_eq!(account(&list, "default")["current"], true);
+    // Claude Code's own directory holds no login yet: not an account.
+    assert_eq!(labels, ["personal", "work"], "{list}");
+    assert_eq!(account(&list, "work")["current"], false);
     assert_eq!(account(&list, "personal")["signedIn"], false);
 
     sb.ok(&["use", "work"]);
     let list = sb.ok(&["list", "--json"]);
     assert_eq!(account(&list, "work")["current"], true);
-    assert_eq!(account(&list, "default")["current"], false);
     let text = sb.ok(&["list"]);
     assert!(text.lines().any(|l| l.starts_with("● work")), "{text}");
     assert!(
@@ -205,9 +199,14 @@ fn remove_signs_out_and_keeps_shared_data() {
     fs::write(claude.join("settings.json"), "{\"keep\":true}").unwrap();
     fs::create_dir_all(claude.join("projects/repo")).unwrap();
     fs::write(claude.join("projects/repo/s.jsonl"), "{}\n").unwrap();
-    sb.ok(&["add", "work"]);
-    sb.ok(&["login", "work"]);
+    sb.signed_in("work", "org-work");
+    sb.signed_in("side", "org-side");
     sb.ok(&["use", "work"]);
+    // Its login sits in ~/.claude: it would have nowhere to go back to.
+    let out = sb.cmd(&["remove", "work"]).output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("'work' is in use"));
+    sb.ok(&["use", "side"]);
 
     let out = sb.ok(&["remove", "work"]);
     assert!(out.contains("logged out"), "harness sign-out ran: {out}");
@@ -217,8 +216,8 @@ fn remove_signs_out_and_keeps_shared_data() {
         "{\"keep\":true}"
     );
     assert!(claude.join("projects/repo/s.jsonl").exists());
-    // The current account falls back to the default one.
     assert!(sb.ok(&["run"]).contains("CLAUDE_CONFIG_DIR=<unset>"));
+    assert_eq!(sb.seat_token(), "token-org-side");
     assert!(
         !sb.cmd(&["remove", "default"])
             .output()
@@ -494,7 +493,7 @@ fn help_describes_the_label_argument() {
 #[test]
 fn concurrent_runs_link_a_new_shared_entry_once() {
     let sb = Sandbox::new();
-    sb.ok(&["add", "work"]);
+    sb.signed_in("work", "org-work");
     // A shared entry that appeared after `add`: every run tries to link it.
     fs::write(sb.home.join(".claude/CLAUDE.md"), "# rules\n").unwrap();
     let children: Vec<_> = (0..16)

@@ -12,7 +12,7 @@ use ratatui::widgets::{HighlightSpacing, List, ListState, Paragraph, Wrap};
 use super::accounts::MARK;
 use super::{App, Step, Tab};
 use crate::account::Harness;
-use crate::config::{self, Mode, Relaunch, Strategy};
+use crate::config::{self, Mode, Strategy};
 use crate::view;
 
 /// Name column: the longest key, `close_idle`, and a gap.
@@ -51,7 +51,6 @@ fn choices(key: &str) -> Option<&'static [&'static str]> {
     Some(match key {
         "mode" => Mode::NAMES,
         "strategy" => Strategy::NAMES,
-        "relaunch" => Relaunch::NAMES,
         _ => return None,
     })
 }

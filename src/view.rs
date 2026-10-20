@@ -6,12 +6,12 @@ use std::time::SystemTime;
 
 use crate::account::Harness;
 use crate::auto::Status;
-use crate::config::{HarnessConfig, Mode, Relaunch, Strategy};
+use crate::config::{HarnessConfig, Mode, Strategy};
 use crate::limits::{LIMIT_HOLD, LimitWindow, Reading, unix_secs};
 use crate::policy::{self, Reason};
 use crate::registry::Change;
 
-/// Marks the account new sessions start with.
+/// Marks the account in use.
 pub const MARK: &str = "●";
 /// A reading older than this is drawn dim: no session of that account has
 /// repainted its status line since, so the numbers may have moved.
@@ -183,6 +183,14 @@ pub fn mode_sentence(c: &HarnessConfig) -> String {
     }
 }
 
+/// What the marked account is to the harness.
+pub fn in_use(harness: Harness) -> &'static str {
+    match harness {
+        Harness::Claude => "every session runs on",
+        Harness::Codex => "new sessions start in",
+    }
+}
+
 pub fn block(
     harness: Harness,
     config: &HarnessConfig,
@@ -195,7 +203,7 @@ pub fn block(
     let width = layout.width;
     let mut header = vec![vec![
         cell(title(harness), Tone::Title),
-        cell(" · new sessions start in ", Tone::Plain),
+        cell(format!(" · {} ", in_use(harness)), Tone::Plain),
         cell(MARK, Tone::Title),
         cell(format!(" {}", current.unwrap_or("default")), Tone::Strong),
     ]];
@@ -278,10 +286,7 @@ fn state(
         return vec![cell(format!("not signed in: {how}"), Tone::Warn)];
     };
     let Some(r) = s.reading.as_ref().filter(|_| s.used(now).is_some()) else {
-        return vec![cell(
-            "no data yet: appears once you use this account",
-            Tone::Dim,
-        )];
+        return vec![cell("no data yet: appears within a minute", Tone::Dim)];
     };
     if r.limited(now) {
         let until = r.limited_until.expect("limited");
@@ -363,10 +368,10 @@ pub fn used_now(w: &LimitWindow, now: SystemTime) -> f64 {
 }
 
 /// When the window resets, in local time: `14:20` today, `Thu 09:00` within
-/// a week, `reset` once it passed.
+/// a week; nothing once it passed or before it started, when it is empty.
 pub fn reset_label(resets_at: i64, now: SystemTime) -> String {
     if resets_at <= unix_secs(now) {
-        return "reset".to_owned();
+        return String::new();
     }
     clock(resets_at, now)
 }
@@ -447,13 +452,8 @@ pub fn auto_report(
             lines.push(format!("{name}: automatic switching is on."));
             lines.push(match harness {
                 Harness::Claude => format!(
-                    "When the account in use reaches {} % of its 5-hour or weekly limit, new sessions start in {to}{}.",
+                    "When the account in use reaches {} % of its 5-hour or weekly limit, Claude Code switches to {to}, the sessions already open too.",
                     c.threshold,
-                    if c.relaunch == Relaunch::Idle {
-                        ", and sessions started with `hats run` move there once their turn ends"
-                    } else {
-                        ""
-                    }
                 ),
                 Harness::Codex => format!(
                     "When the account in use reaches {} % of its 5-hour or weekly limit, new sessions started with `hats run --codex` start in {to}. Running Codex sessions keep their account.",
@@ -464,14 +464,21 @@ pub fn auto_report(
         Mode::Manual => {
             lines.push(format!("{name}: automatic switching is off."));
             lines.push(format!(
-                "New sessions stay in '{current}' until you choose another with `hats{} use <label>`. `hats{} auto on` turns it on.",
+                "{} stay in '{current}' until you choose another with `hats{} use <label>`. `hats{} auto on` turns it on.",
+                match harness {
+                    Harness::Claude => "All sessions",
+                    Harness::Codex => "New sessions",
+                },
                 flag(harness),
                 flag(harness)
             ));
         }
     }
     if c.mode == Mode::Auto {
-        lines.push(format!("New sessions start in '{current}'."));
+        lines.push(match harness {
+            Harness::Claude => format!("In use now: '{current}'."),
+            Harness::Codex => format!("New sessions start in '{current}'."),
+        });
         if !can_move {
             lines.push(stuck(current));
         }
@@ -486,7 +493,7 @@ pub fn auto_report(
                 "Not active yet: run `hats setup` to install the hooks and the status line that switch.".to_owned()
             }
             (Harness::Claude, true) => {
-                "Nothing needs to stay open: Claude Code's hooks and status line switch by themselves. To watch it, leave `hats` open.".to_owned()
+                "Nothing needs to stay open: Claude Code's status line and hooks switch by themselves, and read every account's limits from the provider at most once a minute. To watch it, leave `hats` open.".to_owned()
             }
             (Harness::Codex, _) => {
                 "Nothing needs to stay open: each new session checks when it starts. To watch it, leave `hats` open.".to_owned()
@@ -496,25 +503,14 @@ pub fn auto_report(
     lines
 }
 
-/// What choosing `label` changes: new sessions, and `moving` running ones.
-pub fn chosen(harness: Harness, label: &str, moving: usize) -> String {
-    let new = format!("New {} sessions use '{label}'.", harness.name());
-    match moving {
-        0 => new,
-        1 => format!("{new} 1 running session moves to it."),
-        n => format!("{new} {n} running sessions move to it."),
+/// What choosing `label` changes.
+pub fn chosen(harness: Harness, label: &str) -> String {
+    match harness {
+        Harness::Claude => format!(
+            "Claude Code now runs on '{label}', open sessions too: they take it within 30 seconds."
+        ),
+        Harness::Codex => format!("New codex sessions use '{label}'."),
     }
-}
-
-/// Claude Code sessions started without hats, which no switch reaches.
-pub fn unsupervised(count: usize) -> String {
-    let (sessions, them) = match count {
-        1 => ("session runs", "it"),
-        _ => ("sessions run", "them"),
-    };
-    format!(
-        "{count} Claude Code {sessions} without hats and never move: reopen {them} in a new terminal."
-    )
 }
 
 /// Why auto mode cannot move off `current`.
