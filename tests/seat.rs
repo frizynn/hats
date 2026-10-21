@@ -272,3 +272,27 @@ fn a_rate_limit_counts_as_full_until_the_window_the_status_line_named_resets() {
     let limits = read_json(&sb.home.join(".local/state/hats/limits.json"));
     assert_eq!(limits["accounts"][0]["limitedUntil"], 4102444800_i64);
 }
+
+#[test]
+fn signing_in_again_to_the_account_in_use_survives_the_next_change() {
+    let sb = Sandbox::new();
+    sb.signed_in("work", "org-work");
+    sb.signed_in("side", "org-side");
+    sb.ok(&["use", "work"]);
+    // The provider rejected the login in the seat, so the user signs in again.
+    let item = sb.home.join(".claude/.credentials.json");
+    let mut stale = read_json(&item);
+    stale["claudeAiOauth"]["accessToken"] = "rejected".into();
+    fs::write(&item, stale.to_string()).unwrap();
+    let out = sb
+        .cmd(&["login", "work"])
+        .env("FAKE_ORG_UUID", "org-work")
+        .output()
+        .unwrap();
+    common::assert_success(&out, &["login", "work"]);
+    assert_eq!(sb.seat_token(), "token-org-work");
+
+    sb.ok(&["use", "side"]);
+    let parked = read_json(&sb.claude_dir("work").join(".credentials.json"));
+    assert_eq!(parked["claudeAiOauth"]["accessToken"], "token-org-work");
+}

@@ -289,8 +289,13 @@ fn run(cli: Cli) -> Result<(), Failure> {
             );
         }
         Cmd::Login { label, args } => {
-            let account = find(&store, harness, &label)?;
+            let mut account = find(&store, harness, &label)?;
             account.create(&store)?;
+            // The seat's copy is the one in use; a new login only in the
+            // account's directory would be overwritten when the seat parks it.
+            if harness == Harness::Claude && seat::current(&store).label == account.label {
+                account = seat::seat(&store);
+            }
             let mut cmd = Command::new(harness.program());
             cmd.args(harness.login_args()).args(args);
             return Err(exec(cmd, &account).into());

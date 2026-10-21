@@ -180,6 +180,11 @@ fn renew(store: &Store, account: &Account, now: SystemTime) -> Result<Value, Str
         seat::with_suffix(&account.dir, ".lock"),
         seat::REFRESH_STALE,
     )?;
+    // It may have taken the seat while this waited: a renewal now would
+    // rotate the refresh token the seat's copy holds.
+    if seat::current(store).label == account.label {
+        return Err("its token expired; Claude Code renews it on its next request".to_owned());
+    }
     let mut login = secret::login(store, account)
         .map_err(|e| e.to_string())?
         .ok_or("no stored login")?;

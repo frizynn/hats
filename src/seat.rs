@@ -83,6 +83,10 @@ pub fn sit(store: &Store, target: &Account) -> Result<(), String> {
     if occupant.as_ref().is_some_and(|o| o.id == target_id) {
         return Ok(());
     }
+    // A renewal of the target's login (see `poll`) ends before it is read,
+    // so the seat never gets a refresh token the provider already rotated.
+    let _target = Lock::take(target.dir.join(".oauth_refresh.lock"), REFRESH_STALE)?;
+    let _target_legacy = Lock::take(with_suffix(&target.dir, ".lock"), REFRESH_STALE)?;
     let incoming = secret::login(store, target)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| {
