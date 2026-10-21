@@ -292,6 +292,23 @@ fn space_disables_and_enables_an_account_and_enter_still_uses_it() {
 }
 
 #[test]
+fn space_on_the_account_in_use_moves_to_another() {
+    let (_dir, store) = sandbox();
+    let work = account(&store, "work", Some(10.0));
+    account(&store, "side", Some(20.0));
+    let id = work.provider_id(&store).unwrap().unwrap();
+    auto::choose(&store, &work, &id, SystemTime::now()).unwrap();
+    // Auto mode is the default.
+    let mut app = App::new(&store, DARK);
+    app.select_label(Some("work"));
+
+    app.on_key(key(KeyCode::Char(' ')));
+    assert_eq!(store.current(Harness::Claude).unwrap().label, "side");
+    let message = app.message.as_ref().unwrap();
+    assert!(message.text.contains("moved to 'side'"), "{}", message.text);
+}
+
+#[test]
 fn shift_arrows_reorder_and_save_the_order() {
     let (_dir, store) = sandbox();
     for label in ["a", "x", "y"] {

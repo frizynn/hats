@@ -453,3 +453,35 @@ fn an_account_turned_off_is_never_switched_to_but_can_be_chosen() {
             != Some(0)
     );
 }
+
+#[test]
+fn disabling_the_account_in_use_moves_to_the_one_with_most_room() {
+    let sb = three_accounts();
+    sb.repaint("work", 20.0, 10.0);
+    sb.repaint("side", 60.0, 10.0);
+    sb.repaint("spare", 5.0, 20.0);
+    let out = sb.ok(&["disable", "work"]);
+    assert!(out.contains("Moved from 'work' to 'spare'"), "{out}");
+    assert_eq!(sb.current(), "spare");
+    assert_eq!(sb.seat_token(), "token-org-spare");
+    let reasons = reasons(&sb);
+    assert_eq!(
+        reasons.last().unwrap(),
+        &("spare".to_owned(), "disabled".to_owned())
+    );
+
+    // Chosen again by hand, it stays: only disabling it moves away.
+    sb.ok(&["use", "work"]);
+    sb.repaint("work", 21.0, 10.0);
+    assert_eq!(sb.current(), "work");
+}
+
+#[test]
+fn disabling_the_account_in_use_in_manual_mode_stays() {
+    let sb = three_accounts();
+    sb.repaint("spare", 5.0, 20.0);
+    sb.ok(&["auto", "off"]);
+    let out = sb.ok(&["disable", "work"]);
+    assert!(!out.contains("Moved"), "{out}");
+    assert_eq!(sb.current(), "work");
+}

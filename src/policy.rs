@@ -14,6 +14,8 @@ pub enum Reason {
     Threshold,
     /// The account reached its limit.
     Limit,
+    /// The user disabled the account in use.
+    Disabled,
 }
 
 /// A candidate must sit this many points under the threshold, so two accounts
