@@ -117,23 +117,17 @@ fn run_starts_new_sessions_on_an_account_with_room() {
     sb.repaint("spare", 50.0, 0.0);
     sb.ok(&["config", "set", "claude.mode", "auto"]);
 
+    // Every session runs in Claude Code's own directory, with the login of
+    // the account that has room.
     let out = sb.ok(&["run"]);
-    assert!(
-        out.contains(&format!(
-            "CLAUDE_CONFIG_DIR={}",
-            sb.claude_dir("side").display()
-        )),
-        "{out}"
-    );
+    assert!(out.contains("CLAUDE_CONFIG_DIR=<unset>"), "{out}");
+    assert_eq!(sb.current(), "side");
+    assert_eq!(sb.seat_token(), "token-org-side");
     // An explicit label is the user's choice and is respected.
     let out = sb.ok(&["run", "work"]);
-    assert!(
-        out.contains(&format!(
-            "CLAUDE_CONFIG_DIR={}",
-            sb.claude_dir("work").display()
-        )),
-        "{out}"
-    );
+    assert!(out.contains("CLAUDE_CONFIG_DIR=<unset>"), "{out}");
+    assert_eq!(sb.current(), "work");
+    assert_eq!(sb.seat_token(), "token-org-work");
 }
 
 #[test]
@@ -348,8 +342,8 @@ fn auto_says_what_it_does_and_turns_it_on_and_off() {
     let out = auto(&["auto"]);
     for line in [
         "Claude Code: automatic switching is on.",
-        "When the account in use reaches 90 % of its 5-hour or weekly limit, new sessions start in the account with the most room, and sessions started with `hats run` move there once their turn ends.",
-        "New sessions start in 'work'.",
+        "When the account in use reaches 90 % of its 5-hour or weekly limit, Claude Code switches to the account with the most room, the sessions already open too.",
+        "In use now: 'work'.",
         ": default → work: you chose it.",
         "Not active yet: run `hats setup` to install the hooks and the status line that switch.",
     ] {
@@ -419,7 +413,7 @@ fn an_account_turned_off_is_never_switched_to_but_can_be_chosen() {
     let sb = three_accounts();
     sb.repaint("side", 40.0, 10.0);
     sb.repaint("spare", 5.0, 20.0);
-    assert!(sb.ok(&["disable", "spare"]).contains("'spare' is off"));
+    assert!(sb.ok(&["disable", "spare"]).contains("'spare' is disabled"));
     let enabled = |label: &str| listed(&sb, label)["enabled"].clone();
     assert_eq!(enabled("spare"), false);
     assert_eq!(enabled("side"), true);
@@ -436,14 +430,14 @@ fn an_account_turned_off_is_never_switched_to_but_can_be_chosen() {
     rate_limited(&sb, "work").wait().unwrap();
     assert_eq!(sb.current(), "work");
     let auto = sb.ok(&["auto"]);
-    assert!(auto.contains("every other account is off"), "{auto}");
+    assert!(auto.contains("every other account is disabled"), "{auto}");
 
     // Chosen by hand it is used, with a warning.
     let out = sb.cmd(&["use", "spare"]).output().unwrap();
     common::assert_success(&out, &["use", "spare"]);
     assert_eq!(sb.current(), "spare");
     let warning = String::from_utf8_lossy(&out.stderr);
-    assert!(warning.contains("'spare' is off"), "{warning}");
+    assert!(warning.contains("'spare' is disabled"), "{warning}");
 
     sb.ok(&["enable", "spare"]);
     sb.ok(&["enable", "side"]);

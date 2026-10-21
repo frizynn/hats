@@ -6,9 +6,12 @@ mod hook;
 mod import;
 mod limits;
 mod policy;
+mod poll;
 mod process;
 mod registry;
 mod relaunch;
+mod seat;
+mod secret;
 mod setup;
 mod statusline;
 mod store;
@@ -35,8 +38,8 @@ const EXAMPLES: &str = "\
 Examples:
   hats add work && hats login work      add an account and sign in with Claude Code's own login
   hats run                              start Claude Code with the current account
-  hats run personal -- --resume <id>    start it with another account and pass arguments on
-  hats use work                         make 'work' the default for new sessions
+  hats run personal -- --resume <id>    switch to another account and pass arguments on
+  hats use work                         every Claude Code session, open ones too, uses 'work'
   hats --codex add personal             the same commands manage Codex accounts
   hats config set claude.threshold 85   switch at 85 % of the 5-hour or weekly limit
   hats setup                            install the hooks, status line and shell functions
@@ -45,8 +48,9 @@ Examples:
 /// Switch Claude Code and Codex between accounts, one config directory each.
 ///
 /// Each account is a full CLAUDE_CONFIG_DIR or CODEX_HOME where the harness logs
-/// in by itself. hats never reads, stores or moves credentials and never calls
-/// the providers: limits come from what the harness already shows.
+/// in by itself. Claude Code sessions all run in ~/.claude, and a change of
+/// account moves that account's login there, so open sessions follow; limits
+/// come from the provider's usage endpoint and what Claude Code shows.
 #[derive(Parser)]
 #[command(name = "hats", version, after_help = EXAMPLES, propagate_version = true)]
 struct Cli {
@@ -60,7 +64,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// List accounts with their limits; `●` marks the one new sessions start with.
+    /// List accounts with their limits; `●` marks the one in use.
     #[command(visible_alias = "ls")]
     List {
         /// Print JSON (schema `v: 1`) for scripts.
@@ -80,7 +84,8 @@ enum Cmd {
         #[arg(last = true)]
         args: Vec<OsString>,
     },
-    /// Make an account the default for new sessions.
+    /// Use an account: every Claude Code session, the open ones too; new
+    /// Codex sessions.
     Use {
         /// Account label, as `hats list` shows it.
         label: String,
@@ -97,9 +102,9 @@ enum Cmd {
     },
     /// Start the harness with an account (default: the current one).
     ///
-    /// An interactive Claude Code session stays under a small hats parent
-    /// that, in auto mode, moves it to the next account when it passes the
-    /// threshold, once the agent is idle, and closes it when unused for
+    /// Claude Code always starts in ~/.claude; a label first moves that
+    /// account's login there, for the open sessions too. An interactive
+    /// session stays under a small hats parent that closes it when unused for
     /// `claude.close_idle` (32h by default).
     Run {
         /// Account label, as `hats list` shows it (default: the current one).
@@ -172,6 +177,10 @@ enum Cmd {
     /// Claude Code hooks; `hats setup` installs them.
     #[command(hide = true)]
     Hook { event: HookEvent },
+    /// Ask the provider for every Claude Code account's limits now; the
+    /// status line runs it at most once a minute.
+    #[command(hide = true)]
+    Poll,
 }
 
 #[derive(Subcommand)]
@@ -280,8 +289,13 @@ fn run(cli: Cli) -> Result<(), Failure> {
             );
         }
         Cmd::Login { label, args } => {
-            let account = find(&store, harness, &label)?;
+            let mut account = find(&store, harness, &label)?;
             account.create(&store)?;
+            // The seat's copy is the one in use; a new login only in the
+            // account's directory would be overwritten when the seat parks it.
+            if harness == Harness::Claude && seat::current(&store).label == account.label {
+                account = seat::seat(&store);
+            }
             let mut cmd = Command::new(harness.program());
             cmd.args(harness.login_args()).args(args);
             return Err(exec(cmd, &account).into());
@@ -292,8 +306,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 .provider_id(&store)?
                 .ok_or_else(|| not_logged_in(&account))?;
             auto::choose(&store, &account, &id, SystemTime::now())?;
-            let moving = supervisor::move_running(&store, config.for_harness(harness), &account);
-            println!("{}", view::chosen(harness, &label, moving));
+            println!("{}", view::chosen(harness, &label));
             if config.for_harness(harness).disabled.contains(&label) {
                 eprintln!("hats: {}", off_warning(harness, &label));
             }
@@ -324,6 +337,11 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Cmd::Usage { json } => usage_command(&store, json)?,
         Cmd::Tui => tui::run(&store)?,
         Cmd::Statusline { command } => statusline_command(&store, &config, command)?,
+        Cmd::Poll => {
+            for (label, why) in poll::poll(&store, &config.claude, SystemTime::now()) {
+                eprintln!("hats: {label}: {why}");
+            }
+        }
         Cmd::Hook { .. } => unreachable!("handled above"),
     }
     Ok(())
@@ -370,17 +388,33 @@ fn find(store: &Store, harness: Harness, label: &str) -> Result<Account, String>
     })
 }
 
+/// The account a session starts with. Every Claude Code session runs in
+/// Claude Code's own directory: a label puts that account's login there,
+/// for the sessions already open too.
 fn chosen(store: &Store, harness: Harness, label: Option<&str>) -> Result<Account, String> {
-    match label {
-        Some(label) => find(store, harness, label),
-        None => store.current(harness),
+    let account = match label {
+        Some(label) => find(store, harness, label)?,
+        None => store.current(harness)?,
+    };
+    if harness == Harness::Codex {
+        return Ok(account);
     }
+    if label.is_some() {
+        let id = account
+            .provider_id(store)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| not_logged_in(&account))?;
+        auto::choose(store, &account, &id, SystemTime::now())?;
+        // Picks up shared files the user created since the account was added.
+        account.create(store).map_err(|e| e.to_string())?;
+    }
+    Ok(seat::seat(store))
 }
 
 /// What `hats use` and the view say when the chosen account is off.
 pub fn off_warning(harness: Harness, label: &str) -> String {
     format!(
-        "'{label}' is off: auto switching never moves to it, but you chose it. Turn it on with `hats{} enable {label}`.",
+        "'{label}' is disabled: auto switching never moves to it, but you chose it. Enable it with `hats{} enable {label}`.",
         flag(harness)
     )
 }
@@ -391,18 +425,18 @@ fn enable(store: &Store, harness: Harness, label: &str, enabled: bool) -> Result
     let config = Config::load(&store.config)?;
     let settings = config.for_harness(harness);
     if enabled {
-        println!("'{label}' is on: auto switching may move to it.");
+        println!("'{label}' is enabled: auto switching may move to it.");
         return Ok(());
     }
     println!(
-        "'{label}' is off: auto switching never moves to it; `hats{} use {label}` still can.",
+        "'{label}' is disabled: auto switching never moves to it; `hats{} use {label}` still can.",
         flag(harness)
     );
     let current = store.current(harness)?;
     let statuses = auto::statuses(store, harness, settings)?;
     if !auto::has_destination(&statuses, &current.label, settings, SystemTime::now()) {
         println!(
-            "Every other {} account is off or not signed in: auto switching has nowhere to move from '{}'.",
+            "Every other {} account is disabled or not signed in: auto switching has nowhere to move from '{}'.",
             harness.name(),
             current.label
         );
@@ -488,6 +522,9 @@ fn width() -> usize {
 
 fn list(store: &Store, json: bool) -> Result<(), Failure> {
     let config = Config::load(&store.config)?;
+    if poll::due(store, SystemTime::now()) {
+        poll::poll(store, &config.claude, SystemTime::now());
+    }
     let now = SystemTime::now();
     let width = width();
     let mut out = io::stdout().lock();
@@ -688,6 +725,15 @@ fn remove(store: &Store, account: Account) -> Result<(), Failure> {
         )
         .into());
     }
+    // Its login sits in ~/.claude: removing the account would leave it there
+    // with nowhere to go back to.
+    if account.harness == Harness::Claude && store.current(Harness::Claude)?.dir == account.dir {
+        return Err(format!(
+            "'{}' is in use; choose another first with `hats use <label>`",
+            account.label
+        )
+        .into());
+    }
     if account.provider_id(store)?.is_some() {
         // The harness deletes its own credential; hats never touches it.
         let mut cmd = Command::new(account.harness.program());
@@ -714,6 +760,27 @@ fn remove(store: &Store, account: Account) -> Result<(), Failure> {
     Ok(())
 }
 
+/// `hats poll` on its own, so the status line never waits for the network.
+fn poll_in_background() {
+    let Ok(me) = std::env::current_exe() else {
+        return;
+    };
+    let mut cmd = Command::new(me);
+    cmd.arg("poll")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: setsid(2) between fork and exec: out of the session's process
+    // group, so it outlives a status line that Claude Code cancels.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let _ = cmd.spawn();
+}
+
 fn statusline_command(
     store: &Store,
     config: &Config,
@@ -722,10 +789,13 @@ fn statusline_command(
     let mut input = Vec::new();
     io::stdin().lock().take(1 << 20).read_to_end(&mut input)?;
     let config_dir = std::env::var_os(Harness::Claude.env_var());
-    let (summary, saved) =
-        statusline::record(store, &config.claude, config_dir, &input, SystemTime::now());
+    let now = SystemTime::now();
+    let (summary, saved) = statusline::record(store, &config.claude, config_dir, &input, now);
     if let Err(e) = saved {
         eprintln!("hats statusline: {e}");
+    }
+    if poll::due(store, now) {
+        poll_in_background();
     }
     let Some((program, args)) = command.split_first() else {
         println!("{summary}");

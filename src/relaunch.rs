@@ -1,5 +1,7 @@
-//! The command line for `claude --resume <session>` after a move: the user's
-//! options kept, the old session and the initial prompt dropped.
+//! The command line for `claude --resume <session>`: the user's options kept,
+//! the old session and the initial prompt dropped. `None` tells a command
+//! line that is not an interactive session, which `hats run` does not keep a
+//! parent for.
 
 use std::ffi::OsString;
 

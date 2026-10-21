@@ -1,5 +1,5 @@
-//! Processes read straight from the kernel, without `ps`: `proc_listallpids`,
-//! `proc_pidinfo` and `KERN_PROCARGS2` on macOS, `/proc` on Linux. Arguments
+//! Processes read straight from the kernel, without `ps`: `proc_pidinfo`,
+//! `proc_listchildpids` and `KERN_PROCARGS2` on macOS, `/proc` on Linux. Arguments
 //! are cut before the environment that follows them, which is never kept.
 
 use std::time::SystemTime;
@@ -7,44 +7,11 @@ use std::time::SystemTime;
 /// The start of a command line is enough to tell; longer ones are cut.
 #[cfg(target_os = "linux")]
 const ARGS_MAX: usize = 4096;
-/// `PROC_FLAG_CONTROLT` in `<sys/proc_info.h>`: it has a controlling terminal.
-#[cfg(target_os = "macos")]
-const CONTROLT: u32 = 0x80;
-/// `PROC_UID_ONLY` in `<sys/proc_info.h>`: list the processes of one user.
-#[cfg(target_os = "macos")]
-const UID_ONLY: u32 = 4;
-
-/// What the kernel says about a process of any user it lets us see.
-pub struct Info {
-    pub ppid: u32,
-    pub uid: u32,
-    /// Whether it has a controlling terminal.
-    pub tty: bool,
-    /// The executable's file name as the kernel keeps it, cut to 15 bytes.
-    pub name: Vec<u8>,
-}
 
 /// Whether `pid` is a process this user may signal.
 pub fn alive(pid: u32) -> bool {
     // SAFETY: kill(2) with signal 0 only checks.
     libc::pid_t::try_from(pid).is_ok_and(|pid| pid > 0 && unsafe { libc::kill(pid, 0) } == 0)
-}
-
-/// The processes of `uid`. The kernel filters them: asking about every
-/// process, root's included, takes twice as long (measured with 715).
-#[cfg(target_os = "macos")]
-pub fn of_user(uid: u32) -> Vec<u32> {
-    let pid_size = std::mem::size_of::<libc::pid_t>();
-    // SAFETY: with no buffer it returns about how many bytes they take; then
-    // the kernel writes at most the buffer's size and returns what it wrote.
-    unsafe {
-        let bytes = libc::proc_listpids(UID_ONLY, uid, std::ptr::null_mut(), 0);
-        let mut pids = vec![0 as libc::pid_t; usize::try_from(bytes).unwrap_or(0) / pid_size + 64];
-        let size = libc::c_int::try_from(std::mem::size_of_val(pids.as_slice())).unwrap_or(0);
-        let bytes = libc::proc_listpids(UID_ONLY, uid, pids.as_mut_ptr().cast(), size);
-        pids.truncate(usize::try_from(bytes).unwrap_or(0) / pid_size);
-        pids.into_iter().map(|p| p as u32).collect()
-    }
 }
 
 #[cfg(target_os = "macos")]
@@ -62,23 +29,6 @@ fn bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
         );
         (n == size).then(|| info.assume_init())
     }
-}
-
-#[cfg(target_os = "macos")]
-pub fn info(pid: u32) -> Option<Info> {
-    let info = bsd_info(pid)?;
-    let name = info
-        .pbi_comm
-        .iter()
-        .take_while(|c| **c != 0)
-        .map(|c| *c as u8)
-        .collect();
-    Some(Info {
-        ppid: info.pbi_ppid,
-        uid: info.pbi_uid,
-        tty: info.pbi_flags & CONTROLT != 0,
-        name,
-    })
 }
 
 #[cfg(target_os = "macos")]
@@ -167,40 +117,6 @@ pub fn started(pid: u32) -> Option<SystemTime> {
     std::time::UNIX_EPOCH.checked_add(since)
 }
 
-/// Every process: `info` tells whose it is.
-#[cfg(target_os = "linux")]
-pub fn of_user(_uid: u32) -> Vec<u32> {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|e| e.file_name().to_str()?.parse().ok())
-        .collect()
-}
-
-/// `/proc/<pid>/stat`: the name, in parentheses and maybe with spaces, then
-/// the state, the parent, the group, the session and the terminal.
-#[cfg(target_os = "linux")]
-pub fn info(pid: u32) -> Option<Info> {
-    use std::os::unix::fs::MetadataExt;
-    let dir = format!("/proc/{pid}");
-    let uid = std::fs::metadata(&dir).ok()?.uid();
-    let stat = std::fs::read(format!("{dir}/stat")).ok()?;
-    let open = stat.iter().position(|b| *b == b'(')?;
-    let close = stat.iter().rposition(|b| *b == b')')?;
-    let fields = std::str::from_utf8(stat.get(close + 1..)?).ok()?;
-    let mut fields = fields.split_whitespace().skip(1);
-    let ppid = fields.next()?.parse().ok()?;
-    let tty: i64 = fields.nth(2)?.parse().ok()?;
-    Some(Info {
-        ppid,
-        uid,
-        tty: tty != 0,
-        name: stat.get(open + 1..close)?.to_vec(),
-    })
-}
-
 /// Each thread lists the children it started.
 #[cfg(target_os = "linux")]
 pub fn children(pid: u32) -> Vec<u32> {
@@ -283,27 +199,18 @@ mod tests {
             found.as_deref(),
             Some(&b"/bin/sh\0-c\0sleep 5; exit 0\0named"[..])
         );
-        // SAFETY: getuid(2) takes no arguments.
-        let mine = of_user(unsafe { libc::getuid() });
-        assert!(mine.contains(&pid) && mine.contains(&me));
         assert!(children(me).contains(&pid));
-        let info = info(pid).unwrap();
-        assert_eq!(info.ppid, me);
-        // SAFETY: getuid(2) takes no arguments.
-        assert_eq!(info.uid, unsafe { libc::getuid() });
-        // macOS's `/bin/sh` runs the shell `/private/var/select/sh` names.
-        assert!(!info.name.is_empty());
         assert!(started(pid).is_some_and(|t| t <= SystemTime::now()));
         assert!(alive(pid));
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(!alive(pid), "reaped");
-        assert!(info_of_nobody());
+        assert!(nothing_of_nobody());
     }
 
     /// A pid no process has: nothing to read.
-    fn info_of_nobody() -> bool {
+    fn nothing_of_nobody() -> bool {
         let unused = u32::try_from(libc::pid_t::MAX).unwrap();
-        info(unused).is_none() && args(unused).is_none() && !alive(unused) && !alive(0)
+        args(unused).is_none() && !alive(unused) && !alive(0)
     }
 }

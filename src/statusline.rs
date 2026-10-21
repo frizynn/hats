@@ -1,7 +1,13 @@
 //! Claude Code status line wrapper. Claude Code hands the status line command
 //! the session's plan limits (`rate_limits`) on every repaint; the wrapper
-//! keeps them per account, applies the auto policy, and runs the user's own
-//! status line command with the same input.
+//! keeps them for a session in an account's own directory, applies the auto
+//! policy, and runs the user's own status line command with the same input.
+//!
+//! A session in `~/.claude` shows the limits of its last answer, which may
+//! have come from the account that sat there before (Claude Code keeps a
+//! login it read for about 30 seconds, and an idle session keeps its last
+//! numbers for good). So for those sessions the provider is asked instead
+//! (see `poll`), which the wrapper starts at most once a minute.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -10,14 +16,13 @@ use std::time::SystemTime;
 use serde::Deserialize;
 
 use crate::account::{Account, Harness};
+use crate::auto;
 use crate::config::HarnessConfig;
 use crate::limits::{self, LimitWindow};
 use crate::store::Store;
-use crate::{auto, supervisor};
 
 #[derive(Deserialize)]
 struct StatusInput {
-    session_id: Option<String>,
     rate_limits: Option<RateLimits>,
 }
 
@@ -52,11 +57,10 @@ pub fn record(
         let short = if w.name == "five_hour" { "5h" } else { "7d" };
         summary.push_str(&format!(" {short} {:.0}%", w.used_percent));
     }
-    let session = input.and_then(|i| i.session_id);
-    let result = if windows.is_empty() {
+    let result = if windows.is_empty() || config_dir.is_none() {
         Ok(())
     } else {
-        apply(store, config, &account, session.as_deref(), windows, now)
+        apply(store, config, &account, windows, now)
     };
     (summary, result)
 }
@@ -84,7 +88,6 @@ fn apply(
     store: &Store,
     config: &HarnessConfig,
     account: &Account,
-    session: Option<&str>,
     windows: Vec<LimitWindow>,
     now: SystemTime,
 ) -> Result<(), String> {
@@ -100,8 +103,5 @@ fn apply(
         None,
         Some(&account.label),
     )?;
-    if let Some(session) = session {
-        supervisor::request_move(store, config, account, session, now)?;
-    }
     Ok(())
 }

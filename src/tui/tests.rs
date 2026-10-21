@@ -35,6 +35,9 @@ fn account(store: &Store, label: &str, used: Option<f64>) -> Account {
             r#"{{"oauthAccount":{{"accountUuid":"{label}","organizationUuid":"o","emailAddress":"{label}@example.com","organizationType":"claude_team","organizationName":"Acme"}}}}"#
         );
         fs::write(account.dir.join(".claude.json"), identity).unwrap();
+        // Tests keep logins in files: their HOME is not the user's.
+        let login = format!(r#"{{"claudeAiOauth":{{"accessToken":"t-{label}"}}}}"#);
+        fs::write(account.dir.join(".credentials.json"), login).unwrap();
         let id = account.provider_id(store).unwrap().unwrap();
         let now = SystemTime::now();
         let window = |name: &str, used_percent| LimitWindow {
@@ -103,7 +106,7 @@ fn tabs_change_with_tab_and_digits_and_the_foot_shows_their_keys() {
     let mut app = App::new(&store, DARK);
     let screen = text(&mut app);
     assert!(screen.starts_with(" 1 Accounts  2 Usage  3 Settings  4 Activity"));
-    assert!(screen.lines().last().unwrap().contains("space off"));
+    assert!(screen.lines().last().unwrap().contains("space disable"));
 
     app.on_key(key(KeyCode::Tab));
     assert_eq!(app.tab, Tab::Usage);
@@ -168,7 +171,7 @@ fn accounts_show_one_line_each_and_the_selected_ones_details() {
     let mut app = App::new(&store, DARK);
     let screen = text(&mut app);
     assert!(
-        line_with(&screen, "Claude Code 3").contains("new sessions start in ● work"),
+        line_with(&screen, "Claude Code 2").contains("every session runs on ● work"),
         "{screen}"
     );
     assert!(screen.contains("Auto: at 90 % of either limit"));
@@ -248,7 +251,7 @@ fn the_selected_row_keeps_its_colors_on_a_background() {
 }
 
 #[test]
-fn space_turns_an_account_off_and_on_and_enter_still_uses_it() {
+fn space_disables_and_enables_an_account_and_enter_still_uses_it() {
     let (_dir, store) = sandbox();
     account(&store, "work", Some(10.0));
     account(&store, "side", Some(10.0));
@@ -259,16 +262,15 @@ fn space_turns_an_account_off_and_on_and_enter_still_uses_it() {
     assert_eq!(config(&store).claude.disabled, ["side"]);
     let screen = text(&mut app);
     assert!(
-        line_with(&screen, "▌   side").contains("side off"),
+        line_with(&screen, "▌   side").contains("side disabled"),
         "{screen}"
     );
-    assert!(line_with(&screen, "Auto switch").contains("off: never moves here"));
-    assert!(screen.lines().last().unwrap().contains("space on"));
+    assert!(line_with(&screen, "Auto switch").contains("disabled: never moves here"));
+    assert!(screen.lines().last().unwrap().contains("space enable"));
 
-    // Every other account off: auto mode says it cannot move.
+    // Every other account disabled: auto mode says it cannot move.
     app.select_label(Some("work"));
     app.on_key(key(KeyCode::Char(' ')));
-    app.select_label(Some("default"));
     assert!(
         text(&mut app).contains("Nothing to move to"),
         "{}",
@@ -280,7 +282,7 @@ fn space_turns_an_account_off_and_on_and_enter_still_uses_it() {
     assert_eq!(store.current(Harness::Claude).unwrap().label, "side");
     let message = app.message.as_ref().unwrap();
     assert!(
-        message.error && message.text.contains("'side' is off"),
+        message.error && message.text.contains("'side' is disabled"),
         "{}",
         message.text
     );
@@ -303,23 +305,19 @@ fn shift_arrows_reorder_and_save_the_order() {
             .map(|s| s.account.label.clone())
             .collect()
     };
-    // The harness's own directory exists, so `default` is listed by name.
-    assert_eq!(labels(&app), ["a", "default", "x", "y"]);
+    // Claude Code's own directory holds no login of its own: not listed.
+    assert_eq!(labels(&app), ["a", "x", "y"]);
     app.select_label(Some("x"));
     app.on_key(shift(KeyCode::Up));
-    assert_eq!(config(&store).claude.order, ["a", "x", "default", "y"]);
-    assert_eq!(labels(&app), ["a", "x", "default", "y"]);
+    assert_eq!(config(&store).claude.order, ["x", "a", "y"]);
+    assert_eq!(labels(&app), ["x", "a", "y"]);
     assert_eq!(app.selected_status().unwrap().account.label, "x");
     app.on_key(key(KeyCode::Char('J')));
-    assert_eq!(config(&store).claude.order, ["a", "default", "x", "y"]);
+    assert_eq!(config(&store).claude.order, ["a", "x", "y"]);
     app.on_key(shift(KeyCode::Down));
-    assert_eq!(config(&store).claude.order, ["a", "default", "y", "x"]);
+    assert_eq!(config(&store).claude.order, ["a", "y", "x"]);
     app.on_key(shift(KeyCode::Down));
-    assert_eq!(
-        config(&store).claude.order,
-        ["a", "default", "y", "x"],
-        "already last"
-    );
+    assert_eq!(config(&store).claude.order, ["a", "y", "x"], "already last");
 }
 
 #[test]
@@ -352,10 +350,6 @@ fn the_cli_actions_and_their_prompts() {
         app.on_key(key(KeyCode::Char('y'))),
         child(Action::Remove, "work")
     );
-    app.select_label(Some("default"));
-    app.on_key(key(KeyCode::Char('d')));
-    assert_eq!(app.accounts.prompt, None, "default is never removed");
-
     app.on_key(key(KeyCode::Char('a')));
     // A prompt takes every key: digits and q do not change tab or quit.
     keys(&mut app, "q2x");
@@ -648,44 +642,4 @@ fn no_color_draws_without_colors() {
     };
     assert!(colors(DARK) > 0);
     assert_eq!(colors(Theme::PLAIN), 0);
-}
-
-#[test]
-fn says_how_many_claude_code_sessions_run_without_hats() {
-    let (_dir, store) = sandbox();
-    account(&store, "work", Some(42.0));
-    account(&store, "side", Some(10.0));
-    let mut app = App::new(&store, DARK);
-    assert!(
-        !app.count_sessions,
-        "tests never read the computer's processes"
-    );
-    assert!(!text(&mut app).contains("without hats"));
-
-    app.unsupervised = 2;
-    let screen = text(&mut app);
-    let line =
-        "2 Claude Code sessions run without hats and never move: reopen them in a new terminal.";
-    assert!(screen.contains(line), "{screen}");
-    let below = screen
-        .lines()
-        .skip_while(|l| !l.contains(line))
-        .nth(1)
-        .unwrap();
-    assert!(
-        below.contains("5-HOUR LIMIT"),
-        "above the column titles: {screen}"
-    );
-    app.unsupervised = 1;
-    assert!(text(&mut app).contains("1 Claude Code session runs without hats"));
-    app.on_key(key(KeyCode::Right));
-    assert!(!text(&mut app).contains("without hats"), "not under Codex");
-    app.on_key(key(KeyCode::Left));
-
-    app.select_label(Some("side"));
-    app.on_key(key(KeyCode::Enter));
-    assert_eq!(
-        app.message.as_ref().unwrap().text,
-        "New claude sessions use 'side'."
-    );
 }

@@ -15,8 +15,8 @@ use crate::account::Harness;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
-    /// Switch the default account by itself when the current one passes the
-    /// threshold, and move running `hats run` sessions when they are idle.
+    /// Switch account by itself when the one in use passes the threshold;
+    /// for Claude Code, running sessions switch too.
     Auto,
     /// Only `hats use` changes the account.
     Manual,
@@ -30,22 +30,12 @@ pub enum Strategy {
     Next,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Relaunch {
-    /// Relaunch a running `hats run` session on the new account when the
-    /// agent is idle, resuming the same conversation.
-    Idle,
-    /// Leave running sessions on their account.
-    Off,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HarnessConfig {
     pub mode: Mode,
     pub threshold: u8,
     pub strategy: Strategy,
     pub order: Vec<String>,
-    pub relaunch: Relaunch,
     /// Labels auto switching never moves to; the user can still choose them.
     pub disabled: Vec<String>,
 }
@@ -57,7 +47,6 @@ impl Default for HarnessConfig {
             threshold: 90,
             strategy: Strategy::Headroom,
             order: Vec::new(),
-            relaunch: Relaunch::Idle,
             disabled: Vec::new(),
         }
     }
@@ -106,10 +95,6 @@ pub const KEYS: &[(&str, &str)] = &[
         "account labels in preferred order, comma separated (others follow by name)",
     ),
     (
-        "relaunch",
-        "idle | off: move running `hats run` sessions when the agent is idle",
-    ),
-    (
         "disabled",
         "account labels auto switching never moves to, comma separated (`hats disable`)",
     ),
@@ -142,8 +127,8 @@ pub const TEMPLATE: &str = r#"# hats configuration. Edit it here or with `hats c
 # for example `hats config set claude.threshold 85`. `hats config` lists every key.
 
 [claude]
-# auto: when the current account passes `threshold`, new sessions start on another
-#       account, and sessions started with `hats run` move when the agent is idle.
+# auto: when the account in use passes `threshold`, Claude Code switches to another
+#       account, running sessions too.
 # manual: only `hats use` changes the account.
 mode = "auto"
 # Percent of the 5-hour or weekly limit that triggers a switch (1-100).
@@ -153,9 +138,6 @@ threshold = 90
 strategy = "headroom"
 # Preferred order of account labels; accounts not listed follow by name.
 order = []
-# Running `hats run` sessions: idle = relaunch them on the new account when the
-# agent is idle, resuming the same conversation; off = leave them where they are.
-relaunch = "idle"
 # Accounts auto switching never moves to; you can still choose them with
 # `hats use`. `hats disable <label>` and `hats enable <label>` change it.
 disabled = []
@@ -170,7 +152,6 @@ mode = "auto"
 threshold = 90
 strategy = "headroom"
 order = []
-relaunch = "idle"
 disabled = []
 "#;
 
@@ -257,7 +238,6 @@ impl HarnessConfig {
             "threshold" => self.threshold.to_string(),
             "strategy" => self.strategy.as_str().to_owned(),
             "order" => self.order.join(","),
-            "relaunch" => self.relaunch.as_str().to_owned(),
             "disabled" => self.disabled.join(","),
             _ => unreachable!("keys come from KEYS"),
         }
@@ -272,7 +252,6 @@ impl HarnessConfig {
         match key {
             "mode" => self.mode = text(item)?.parse()?,
             "strategy" => self.strategy = text(item)?.parse()?,
-            "relaunch" => self.relaunch = text(item)?.parse()?,
             "threshold" => {
                 let n = item.as_integer().ok_or("expected a number from 1 to 100")?;
                 self.threshold = parse_threshold(&n.to_string())?;
@@ -306,7 +285,6 @@ pub fn set(path: &Path, full_key: &str, raw: &str) -> Result<(), String> {
     let item = match key {
         "mode" => value(raw.parse::<Mode>()?.as_str()),
         "strategy" => value(raw.parse::<Strategy>()?.as_str()),
-        "relaunch" => value(raw.parse::<Relaunch>()?.as_str()),
         "threshold" => value(i64::from(parse_threshold(raw)?)),
         "close_idle" => value(show_close_idle(parse_close_idle(raw)?)),
         "order" | "disabled" => {
@@ -478,7 +456,6 @@ macro_rules! choice {
 
 choice!(Mode { Auto => "auto", Manual => "manual" });
 choice!(Strategy { Headroom => "headroom", Next => "next" });
-choice!(Relaunch { Idle => "idle", Off => "off" });
 
 #[cfg(test)]
 mod tests {

@@ -43,8 +43,7 @@ pub fn run(store: &Store) -> Result<(), String> {
         Screen::enter().map_err(|e| format!("could not open the interactive view: {e}"))?;
     supervisor::remove_stale(store);
     let mut app = App::new(store, Theme::detect(color));
-    app.count_sessions = true;
-    app.unsupervised = supervisor::unsupervised(store);
+    poll_while_open();
     let result = event_loop(&mut app, &mut screen);
     drop(screen);
     // Back on the normal screen, say what closed the view: a terminal that
@@ -53,6 +52,25 @@ pub fn run(store: &Store) -> Result<(), String> {
         println!("hats: closed with {key}.");
     }
     result.map_err(|e| e.to_string())
+}
+
+/// Asks for the accounts' limits now and every minute while the view is
+/// open; the view redraws when they land in `limits.json`.
+fn poll_while_open() {
+    let Ok(me) = std::env::current_exe() else {
+        return;
+    };
+    std::thread::spawn(move || {
+        loop {
+            let _ = Command::new(&me)
+                .arg("poll")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            std::thread::sleep(crate::poll::EVERY);
+        }
+    });
 }
 
 fn event_loop(app: &mut App, screen: &mut Screen) -> io::Result<()> {
@@ -218,11 +236,6 @@ struct App<'a> {
     /// The key that closed the view.
     closed_by: Option<&'static str>,
     theme: Theme,
-    /// Whether to count the Claude Code sessions running without hats. Tests
-    /// leave it off: the count comes from every process of the user.
-    count_sessions: bool,
-    /// Claude Code sessions running without hats, as of the last reload.
-    unsupervised: usize,
 }
 
 impl<'a> App<'a> {
@@ -244,8 +257,6 @@ impl<'a> App<'a> {
             message: None,
             closed_by: None,
             theme,
-            count_sessions: false,
-            unsupervised: 0,
         };
         app.reload();
         if app.groups[0].statuses.is_empty() && !app.groups[1].statuses.is_empty() {
@@ -292,9 +303,6 @@ impl<'a> App<'a> {
         }
         self.changes = registry::recent(&self.store.registry(), CHANGES);
         self.activity.reload(self.store, &self.changes);
-        if self.count_sessions {
-            self.unsupervised = supervisor::unsupervised(self.store);
-        }
         if let Some(e) = error {
             self.fail(e);
         }

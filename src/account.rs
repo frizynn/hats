@@ -1,7 +1,8 @@
 //! Accounts are configuration directories. Each one is a full `CLAUDE_CONFIG_DIR`
 //! or `CODEX_HOME` where the harness itself logs in and keeps its own
-//! credentials; this tool only creates the directory, shares the user's
-//! settings into it and picks which one a harness starts with.
+//! credentials; this tool creates the directory and shares the user's
+//! settings into it. A Claude Code account's login moves into `~/.claude`
+//! while it is in use (see `seat`); a Codex account is picked at launch.
 
 use std::fs;
 use std::io::{self, BufRead, BufReader};
@@ -159,10 +160,15 @@ impl Account {
         Ok(account)
     }
 
-    /// Maps the directory a harness is running with back to its account.
+    /// Maps the directory a harness is running with back to its account. A
+    /// Claude Code session in its own directory runs on the account in the
+    /// seat.
     pub fn from_config_dir(harness: Harness, dir: Option<&Path>, store: &Store) -> Self {
         let Some(dir) = dir else {
-            return Self::default_for(harness, store);
+            return match harness {
+                Harness::Claude => crate::seat::current(store),
+                Harness::Codex => Self::default_for(harness, store),
+            };
         };
         let label = match dir.parent() {
             Some(parent) if parent == store.accounts_dir(harness) => dir.file_name(),
@@ -341,7 +347,7 @@ struct ClaudeGlobalConfig {
 }
 
 /// `oauthAccount` holds who is signed in, not how: the tokens live in the
-/// Keychain or `.credentials.json`, which hats never opens.
+/// Keychain or `.credentials.json` (see `secret`).
 #[derive(Deserialize)]
 struct ClaudeOauthAccount {
     #[serde(rename = "accountUuid")]

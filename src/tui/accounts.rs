@@ -15,7 +15,6 @@ use crate::account::{DEFAULT_LABEL, Harness};
 use crate::auto::{self, Status};
 use crate::config;
 use crate::limits::LimitWindow;
-use crate::supervisor;
 use crate::view::{self, Tone};
 
 /// Marks the selected row, before the text.
@@ -189,12 +188,10 @@ impl App<'_> {
         };
         match auto::choose(self.store, &account, &id, SystemTime::now()) {
             Ok(()) => {
-                let settings = self.config.for_harness(account.harness);
-                let moving = supervisor::move_running(self.store, settings, &account);
                 if self.is_off(&account.label) {
                     self.fail(crate::off_warning(account.harness, &account.label));
                 } else {
-                    self.info(view::chosen(account.harness, &account.label, moving));
+                    self.info(view::chosen(account.harness, &account.label));
                 }
             }
             Err(e) => self.fail(e),
@@ -212,9 +209,11 @@ impl App<'_> {
         let harness = self.harness();
         let on = self.is_off(&label);
         match config::set_enabled(&self.store.config, harness, &label, on) {
-            Ok(()) if on => self.info(format!("'{label}' is on: auto switching may move to it.")),
+            Ok(()) if on => self.info(format!(
+                "'{label}' is enabled: auto switching may move to it."
+            )),
             Ok(()) => self.info(format!(
-                "'{label}' is off: auto switching never moves to it; enter still uses it."
+                "'{label}' is disabled: auto switching never moves to it; enter still uses it."
             )),
             Err(e) => self.fail(e),
         }
@@ -334,15 +333,6 @@ impl App<'_> {
                 Line::styled(view::stuck(current), self.theme.fg(Color::Yellow)),
             );
         }
-        if group.harness == Harness::Claude && self.unsupervised > 0 {
-            header.insert(
-                header.len() - 1,
-                Line::styled(
-                    view::unsupervised(self.unsupervised),
-                    self.theme.fg(Color::Yellow),
-                ),
-            );
-        }
         let rows = group.statuses.len().max(1) as u16;
         let [top, list, details] = Layout::vertical([
             Constraint::Length(header.len() as u16),
@@ -388,8 +378,8 @@ impl App<'_> {
                     Harness::Codex => "claude",
                 };
                 let toggle = match self.selected_status() {
-                    Some(s) if self.is_off(&s.account.label) => "on",
-                    _ => "off",
+                    Some(s) if self.is_off(&s.account.label) => "enable",
+                    _ => "disable",
                 };
                 vec![
                     ("↑↓", "move"),
@@ -405,8 +395,8 @@ impl App<'_> {
         }
     }
 
-    /// `Claude Code 6  Codex 2`, the shown one selected, and where new
-    /// sessions start.
+    /// `Claude Code 6  Codex 2`, the shown one selected, and the account in
+    /// use.
     fn harnesses(&self) -> Line<'static> {
         let mut spans = Vec::new();
         for (i, group) in self.groups.iter().enumerate() {
@@ -426,7 +416,7 @@ impl App<'_> {
             spans.push(Span::raw(" "));
         }
         let group = &self.groups[self.accounts.focus];
-        spans.push(Span::raw(" new sessions start in "));
+        spans.push(Span::raw(format!(" {} ", view::in_use(group.harness))));
         spans.push(Span::styled(view::MARK, self.theme.fg(Color::Cyan)));
         spans.push(Span::styled(
             format!(" {}", group.current.as_deref().unwrap_or(DEFAULT_LABEL)),
@@ -486,11 +476,13 @@ impl App<'_> {
             "Auto switch",
             if off {
                 Line::styled(
-                    "off: never moves here; space turns it on",
+                    "disabled: never moves here · space enables it",
                     self.theme.fg(Color::Yellow),
                 )
             } else {
-                Line::raw("on: may move here when the current account fills")
+                Line::raw(
+                    "enabled: may move here when the account in use fills · space disables it",
+                )
             },
         ));
         let last = self.changes.iter().rev().find(|c| {
@@ -562,11 +554,11 @@ impl App<'_> {
     }
 }
 
-/// `21 % until 17:24`, or `reset` once the window passed.
+/// `21 % until 17:24`, or `0 %` while the window is empty.
 fn resets(w: &LimitWindow, now: SystemTime) -> String {
     let label = view::reset_label(w.resets_at, now);
-    if label == "reset" {
-        return "reset".to_owned();
+    if label.is_empty() {
+        return "0 %".to_owned();
     }
     format!("{:.0} % until {label}", view::used_now(w, now))
 }
