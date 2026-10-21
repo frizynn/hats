@@ -413,7 +413,7 @@ fn an_account_turned_off_is_never_switched_to_but_can_be_chosen() {
     let sb = three_accounts();
     sb.repaint("side", 40.0, 10.0);
     sb.repaint("spare", 5.0, 20.0);
-    assert!(sb.ok(&["disable", "spare"]).contains("'spare' is off"));
+    assert!(sb.ok(&["disable", "spare"]).contains("'spare' is disabled"));
     let enabled = |label: &str| listed(&sb, label)["enabled"].clone();
     assert_eq!(enabled("spare"), false);
     assert_eq!(enabled("side"), true);
@@ -430,14 +430,14 @@ fn an_account_turned_off_is_never_switched_to_but_can_be_chosen() {
     rate_limited(&sb, "work").wait().unwrap();
     assert_eq!(sb.current(), "work");
     let auto = sb.ok(&["auto"]);
-    assert!(auto.contains("every other account is off"), "{auto}");
+    assert!(auto.contains("every other account is disabled"), "{auto}");
 
     // Chosen by hand it is used, with a warning.
     let out = sb.cmd(&["use", "spare"]).output().unwrap();
     common::assert_success(&out, &["use", "spare"]);
     assert_eq!(sb.current(), "spare");
     let warning = String::from_utf8_lossy(&out.stderr);
-    assert!(warning.contains("'spare' is off"), "{warning}");
+    assert!(warning.contains("'spare' is disabled"), "{warning}");
 
     sb.ok(&["enable", "spare"]);
     sb.ok(&["enable", "side"]);
