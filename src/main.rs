@@ -432,6 +432,11 @@ fn enable(store: &Store, harness: Harness, label: &str, enabled: bool) -> Result
         "'{label}' is disabled: auto switching never moves to it; `hats{} use {label}` still can.",
         flag(harness)
     );
+    if let Some((to, _)) = auto::leave_disabled(store, harness, settings, &account.label)? {
+        println!("Moved from '{label}' to '{}'.", to.label);
+        println!("{}", view::chosen(harness, &to.label));
+        return Ok(());
+    }
     let current = store.current(harness)?;
     let statuses = auto::statuses(store, harness, settings)?;
     if !auto::has_destination(&statuses, &current.label, settings, SystemTime::now()) {

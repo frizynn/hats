@@ -422,6 +422,7 @@ pub fn what_changed(c: &Change) -> String {
         Reason::Manual => "you chose it".to_owned(),
         Reason::Threshold => format!("{who} passed the threshold"),
         Reason::Limit => format!("{who} hit its limit"),
+        Reason::Disabled => format!("{who} was disabled"),
     };
     let what = if c.session { "a running session, " } else { "" };
     format!("{what}{route}: {why}")

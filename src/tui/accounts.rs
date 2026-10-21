@@ -212,9 +212,24 @@ impl App<'_> {
             Ok(()) if on => self.info(format!(
                 "'{label}' is enabled: auto switching may move to it."
             )),
-            Ok(()) => self.info(format!(
-                "'{label}' is disabled: auto switching never moves to it; enter still uses it."
-            )),
+            Ok(()) => {
+                let moved = config::Config::load(&self.store.config)
+                    .map_err(|e| e.to_string())
+                    .and_then(|c| {
+                        auto::leave_disabled(self.store, harness, c.for_harness(harness), &label)
+                    });
+                match moved {
+                    Ok(Some((to, _))) => self.info(format!(
+                        "'{label}' is disabled; moved to '{}'. {}",
+                        to.label,
+                        view::chosen(harness, &to.label)
+                    )),
+                    Ok(None) => self.info(format!(
+                        "'{label}' is disabled: auto switching never moves to it; enter still uses it."
+                    )),
+                    Err(e) => self.fail(e),
+                }
+            }
             Err(e) => self.fail(e),
         }
         self.reload();

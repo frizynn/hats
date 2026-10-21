@@ -211,7 +211,8 @@ switch reaches every open session; for Codex, new sessions.
 
 **Disabled accounts.** `hats disable <label>` (or space in the view) keeps
 auto switching from ever moving to an account; `hats enable <label>` lets it
-again. `hats use` still takes it, and says it is disabled. The labels go in
+again. Disabling the account in use, with auto switching on, moves at once to
+the account with the most room. `hats use` still takes it, and says it is disabled. The labels go in
 `disabled = [...]` of `config.toml`.
 
 **Choosing an account.** `hats use <label>`, enter in the view, or

@@ -157,6 +157,24 @@ pub fn check_default(
     Ok(Some((next.account.clone(), reason)))
 }
 
+/// In auto mode, moves the default account off `label` right after the user
+/// disabled it. Only then: an account chosen by hand later stays.
+pub fn leave_disabled(
+    store: &Store,
+    harness: Harness,
+    config: &HarnessConfig,
+    label: &str,
+) -> Result<Option<(Account, Reason)>, String> {
+    check_default(
+        store,
+        harness,
+        config,
+        SystemTime::now(),
+        Some(Reason::Disabled),
+        Some(label),
+    )
+}
+
 /// The user's choice of default account, recorded as `manual`. Choosing the
 /// account already in use changes and records nothing.
 pub fn choose(store: &Store, account: &Account, id: &str, now: SystemTime) -> Result<(), String> {
