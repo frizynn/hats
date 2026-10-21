@@ -414,7 +414,7 @@ fn chosen(store: &Store, harness: Harness, label: Option<&str>) -> Result<Accoun
 /// What `hats use` and the view say when the chosen account is off.
 pub fn off_warning(harness: Harness, label: &str) -> String {
     format!(
-        "'{label}' is off: auto switching never moves to it, but you chose it. Turn it on with `hats{} enable {label}`.",
+        "'{label}' is disabled: auto switching never moves to it, but you chose it. Enable it with `hats{} enable {label}`.",
         flag(harness)
     )
 }
@@ -425,18 +425,18 @@ fn enable(store: &Store, harness: Harness, label: &str, enabled: bool) -> Result
     let config = Config::load(&store.config)?;
     let settings = config.for_harness(harness);
     if enabled {
-        println!("'{label}' is on: auto switching may move to it.");
+        println!("'{label}' is enabled: auto switching may move to it.");
         return Ok(());
     }
     println!(
-        "'{label}' is off: auto switching never moves to it; `hats{} use {label}` still can.",
+        "'{label}' is disabled: auto switching never moves to it; `hats{} use {label}` still can.",
         flag(harness)
     );
     let current = store.current(harness)?;
     let statuses = auto::statuses(store, harness, settings)?;
     if !auto::has_destination(&statuses, &current.label, settings, SystemTime::now()) {
         println!(
-            "Every other {} account is off or not signed in: auto switching has nowhere to move from '{}'.",
+            "Every other {} account is disabled or not signed in: auto switching has nowhere to move from '{}'.",
             harness.name(),
             current.label
         );

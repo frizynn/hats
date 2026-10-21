@@ -106,7 +106,7 @@ fn tabs_change_with_tab_and_digits_and_the_foot_shows_their_keys() {
     let mut app = App::new(&store, DARK);
     let screen = text(&mut app);
     assert!(screen.starts_with(" 1 Accounts  2 Usage  3 Settings  4 Activity"));
-    assert!(screen.lines().last().unwrap().contains("space off"));
+    assert!(screen.lines().last().unwrap().contains("space disable"));
 
     app.on_key(key(KeyCode::Tab));
     assert_eq!(app.tab, Tab::Usage);
@@ -251,7 +251,7 @@ fn the_selected_row_keeps_its_colors_on_a_background() {
 }
 
 #[test]
-fn space_turns_an_account_off_and_on_and_enter_still_uses_it() {
+fn space_disables_and_enables_an_account_and_enter_still_uses_it() {
     let (_dir, store) = sandbox();
     account(&store, "work", Some(10.0));
     account(&store, "side", Some(10.0));
@@ -262,13 +262,13 @@ fn space_turns_an_account_off_and_on_and_enter_still_uses_it() {
     assert_eq!(config(&store).claude.disabled, ["side"]);
     let screen = text(&mut app);
     assert!(
-        line_with(&screen, "▌   side").contains("side off"),
+        line_with(&screen, "▌   side").contains("side disabled"),
         "{screen}"
     );
-    assert!(line_with(&screen, "Auto switch").contains("off: never moves here"));
-    assert!(screen.lines().last().unwrap().contains("space on"));
+    assert!(line_with(&screen, "Auto switch").contains("disabled: never moves here"));
+    assert!(screen.lines().last().unwrap().contains("space enable"));
 
-    // Every other account off: auto mode says it cannot move.
+    // Every other account disabled: auto mode says it cannot move.
     app.select_label(Some("work"));
     app.on_key(key(KeyCode::Char(' ')));
     assert!(
@@ -282,7 +282,7 @@ fn space_turns_an_account_off_and_on_and_enter_still_uses_it() {
     assert_eq!(store.current(Harness::Claude).unwrap().label, "side");
     let message = app.message.as_ref().unwrap();
     assert!(
-        message.error && message.text.contains("'side' is off"),
+        message.error && message.text.contains("'side' is disabled"),
         "{}",
         message.text
     );

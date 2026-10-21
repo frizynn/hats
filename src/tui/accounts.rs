@@ -209,9 +209,11 @@ impl App<'_> {
         let harness = self.harness();
         let on = self.is_off(&label);
         match config::set_enabled(&self.store.config, harness, &label, on) {
-            Ok(()) if on => self.info(format!("'{label}' is on: auto switching may move to it.")),
+            Ok(()) if on => self.info(format!(
+                "'{label}' is enabled: auto switching may move to it."
+            )),
             Ok(()) => self.info(format!(
-                "'{label}' is off: auto switching never moves to it; enter still uses it."
+                "'{label}' is disabled: auto switching never moves to it; enter still uses it."
             )),
             Err(e) => self.fail(e),
         }
@@ -376,8 +378,8 @@ impl App<'_> {
                     Harness::Codex => "claude",
                 };
                 let toggle = match self.selected_status() {
-                    Some(s) if self.is_off(&s.account.label) => "on",
-                    _ => "off",
+                    Some(s) if self.is_off(&s.account.label) => "enable",
+                    _ => "disable",
                 };
                 vec![
                     ("↑↓", "move"),
@@ -474,11 +476,13 @@ impl App<'_> {
             "Auto switch",
             if off {
                 Line::styled(
-                    "off: never moves here; space turns it on",
+                    "disabled: never moves here · space enables it",
                     self.theme.fg(Color::Yellow),
                 )
             } else {
-                Line::raw("on: may move here when the account in use fills")
+                Line::raw(
+                    "enabled: may move here when the account in use fills · space disables it",
+                )
             },
         ));
         let last = self.changes.iter().rev().find(|c| {

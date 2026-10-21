@@ -130,7 +130,7 @@ impl Layout {
 }
 
 /// Follows the label of an account auto switching never moves to.
-const OFF: &str = " off";
+const OFF: &str = " disabled";
 
 /// Whether `s` is turned off for auto switching.
 pub fn is_off(config: &HarnessConfig, s: &Status) -> bool {
@@ -516,7 +516,7 @@ pub fn chosen(harness: Harness, label: &str) -> String {
 /// Why auto mode cannot move off `current`.
 pub fn stuck(current: &str) -> String {
     format!(
-        "Nothing to move to: every other account is off or not signed in, so it stays in '{current}'."
+        "Nothing to move to: every other account is disabled or not signed in, so it stays in '{current}'."
     )
 }
 

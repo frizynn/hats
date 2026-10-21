@@ -117,7 +117,7 @@ Auto: at 90 % of either limit, it moves to the account with the most room.
  Auto switch  on: may move here when the account in use fills
  Last change  14:40  → default: you chose it
 
-↑↓ move  ←→ codex  enter use  space off  ⇧↑↓ order  a add  l login  d remove
+↑↓ move  ←→ codex  enter use  space disable  ⇧↑↓ order  a add  l login  d remove
 ```
 
 | Tab | What it shows | Keys |
@@ -209,9 +209,9 @@ status line wrapper, the `StopFailure` hook, after each poll and when
 `hats run` starts. If no account has room, nothing moves. For Claude Code the
 switch reaches every open session; for Codex, new sessions.
 
-**Accounts turned off.** `hats disable <label>` (or space in the view) keeps
+**Disabled accounts.** `hats disable <label>` (or space in the view) keeps
 auto switching from ever moving to an account; `hats enable <label>` lets it
-again. `hats use` still takes it, and says it is off. The labels go in
+again. `hats use` still takes it, and says it is disabled. The labels go in
 `disabled = [...]` of `config.toml`.
 
 **Choosing an account.** `hats use <label>`, enter in the view, or
