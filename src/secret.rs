@@ -39,8 +39,13 @@ enum Backend {
     File(PathBuf),
 }
 
+/// Logins live in the Keychain on macOS, for the user's own HOME only.
+fn uses_keychain(store: &Store) -> bool {
+    cfg!(target_os = "macos") && is_users_home(&store.home)
+}
+
 fn backend(store: &Store, account: &Account) -> Backend {
-    if cfg!(target_os = "macos") && is_users_home(&store.home) {
+    if uses_keychain(store) {
         let service = if account.is_default {
             "Claude Code-credentials".to_owned()
         } else {
@@ -60,22 +65,10 @@ fn backend(store: &Store, account: &Account) -> Backend {
 /// The whole stored item, or `None` when the directory is not signed in.
 pub fn read(store: &Store, account: &Account) -> io::Result<Option<Map<String, Value>>> {
     let text = match backend(store, account) {
-        Backend::Keychain { service, user } => {
-            let out = Command::new(SECURITY)
-                .args(["find-generic-password", "-a", &user, "-w", "-s", &service])
-                .stdin(Stdio::null())
-                .stderr(Stdio::null())
-                .output()?;
-            match out.status.code() {
-                Some(0) => String::from_utf8(out.stdout).map_err(io::Error::other)?,
-                Some(NOT_FOUND) => return Ok(None),
-                code => {
-                    return Err(io::Error::other(format!(
-                        "the Keychain did not answer for {service} (security exited {code:?})"
-                    )));
-                }
-            }
-        }
+        Backend::Keychain { service, user } => match keychain_find(&service, &user)? {
+            Some(text) => text,
+            None => return Ok(None),
+        },
         Backend::File(path) => match fs::read_to_string(path) {
             Ok(text) => text,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -119,6 +112,37 @@ fn write(store: &Store, account: &Account, text: &str) -> io::Result<()> {
             Ok(())
         }
         Backend::File(path) => write_file(&path, text),
+    }
+}
+
+/// Another program's item in the user's Keychain, or `None` when it is
+/// absent or when this store keeps logins in files.
+pub fn keychain_password(store: &Store, service: &str, user: &str) -> io::Result<Option<String>> {
+    if uses_keychain(store) {
+        keychain_find(service, user)
+    } else {
+        Ok(None)
+    }
+}
+
+fn keychain_find(service: &str, user: &str) -> io::Result<Option<String>> {
+    let out = Command::new(SECURITY)
+        .args(["find-generic-password", "-a", user, "-w", "-s", service])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()?;
+    match out.status.code() {
+        Some(0) => {
+            let mut text = String::from_utf8(out.stdout).map_err(io::Error::other)?;
+            if text.ends_with('\n') {
+                text.pop();
+            }
+            Ok(Some(text))
+        }
+        Some(NOT_FOUND) => Ok(None),
+        code => Err(io::Error::other(format!(
+            "the Keychain did not answer for {service} (security exited {code:?})"
+        ))),
     }
 }
 

@@ -175,7 +175,7 @@ fn adopt(
     Ok(account)
 }
 
-fn oauth_account(config: &Path) -> Result<Value, String> {
+pub fn oauth_account(config: &Path) -> Result<Value, String> {
     let text = fs::read_to_string(config).map_err(|e| format!("{}: {e}", config.display()))?;
     let mut config: Map<String, Value> =
         serde_json::from_str(&text).map_err(|e| format!("{}: {e}", config.display()))?;
@@ -186,7 +186,7 @@ fn oauth_account(config: &Path) -> Result<Value, String> {
 
 /// Replaces `oauthAccount` and keeps every other key of Claude Code's config
 /// in its place.
-fn set_oauth_account(path: &Path, oauth_account: Value) -> io::Result<()> {
+pub fn set_oauth_account(path: &Path, oauth_account: Value) -> io::Result<()> {
     let mut config: Map<String, Value> = match fs::read_to_string(path) {
         Ok(text) => serde_json::from_str(&text).map_err(io::Error::other)?,
         Err(e) if e.kind() == io::ErrorKind::NotFound => Map::new(),

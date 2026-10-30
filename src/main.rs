@@ -147,13 +147,16 @@ enum Cmd {
         #[arg(long)]
         undo: bool,
     },
-    /// Import account order and switching settings from another tool.
+    /// Import accounts, their logins and switching settings from another tool.
     Import {
         #[arg(value_enum)]
         source: ImportSource,
         /// Where that tool keeps its data.
         #[arg(long)]
         from: Option<PathBuf>,
+        /// Take its login even for an account already signed in here.
+        #[arg(long)]
+        replace_logins: bool,
     },
     /// Print shell completions: `hats completions zsh > ~/.zfunc/_hats`.
     Completions { shell: clap_complete::Shell },
@@ -327,9 +330,10 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Cmd::Import {
             source: ImportSource::ClaudeSwap,
             from,
+            replace_logins,
         } => {
-            let from = from.unwrap_or_else(|| store.home.join(".claude-swap-backup"));
-            import::claude_swap(&store, &from)?;
+            let from = from.unwrap_or_else(|| import::claude_swap_dir(&store));
+            import::claude_swap(&store, &from, replace_logins)?;
         }
         Cmd::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "hats", &mut io::stdout());

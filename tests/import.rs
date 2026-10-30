@@ -1,4 +1,5 @@
-//! `hats import claude-swap` takes order, aliases and settings, never tokens.
+//! `hats import claude-swap` takes order, aliases, settings and each
+//! account's login.
 
 mod common;
 
@@ -7,13 +8,22 @@ use std::os::unix::fs::PermissionsExt;
 
 use common::Sandbox;
 
+/// claude-swap's data, where it keeps it on each system.
+fn swap_dir(sb: &Sandbox) -> std::path::PathBuf {
+    if cfg!(target_os = "macos") {
+        sb.home.join(".claude-swap-backup")
+    } else {
+        sb.home.join(".local/share/claude-swap")
+    }
+}
+
 #[test]
-fn imports_order_aliases_and_settings_without_reading_tokens() {
+fn imports_order_aliases_and_settings_even_when_logins_cannot_be_read() {
     let sb = Sandbox::new();
-    let swap = sb.home.join(".claude-swap-backup");
+    let swap = swap_dir(&sb);
     fs::create_dir_all(swap.join("credentials")).unwrap();
     fs::write(swap.join("credentials/.creds-1.json"), "fake").unwrap();
-    // Unreadable: any attempt to read stored tokens would fail the import.
+    // Unreadable: the accounts are still created, each left to sign in.
     fs::set_permissions(swap.join("credentials"), fs::Permissions::from_mode(0o000)).unwrap();
     fs::write(
         swap.join("sequence.json"),
@@ -76,7 +86,7 @@ fn the_account_already_signed_in_at_home_stays_default() {
     let sb = Sandbox::new();
     // The login claude-swap last switched into ~/.claude.
     sb.login_claude(&sb.home.join(".claude.json"));
-    let swap = sb.home.join(".claude-swap-backup");
+    let swap = swap_dir(&sb);
     fs::create_dir_all(swap.join("configs")).unwrap();
     fs::create_dir_all(swap.join("credentials")).unwrap();
     fs::set_permissions(swap.join("credentials"), fs::Permissions::from_mode(0o000)).unwrap();
@@ -147,7 +157,7 @@ fn takes_claude_swaps_last_limits_so_a_move_never_goes_to_a_spent_account() {
     let sb = Sandbox::new();
     // claude-swap's account 1 is the one signed in at ~/.claude.
     sb.login_claude(&sb.home.join(".claude.json"));
-    let swap = sb.home.join(".claude-swap-backup");
+    let swap = swap_dir(&sb);
     fs::create_dir_all(swap.join("configs")).unwrap();
     fs::create_dir_all(swap.join("cache")).unwrap();
     fs::write(
@@ -245,4 +255,150 @@ fn takes_claude_swaps_last_limits_so_a_move_never_goes_to_a_spent_account() {
     fs::write(swap.join("cache/usage.json"), usage(&slots)).unwrap();
     sb.ok(&["import", "claude-swap"]);
     assert_eq!(listed("account-2")["usedPercent"], 40.0);
+}
+
+/// claude-swap's backup of one account: `.credentials.json` as Claude Code
+/// wrote it, in base64, and its copy of `.claude.json`. Fake tokens only.
+fn swap_account(swap: &std::path::Path, n: u32, email: &str, org: &str) {
+    fs::create_dir_all(swap.join("credentials")).unwrap();
+    fs::create_dir_all(swap.join("configs")).unwrap();
+    let creds = format!(
+        r#"{{"claudeAiOauth":{{"accessToken":"fake-access-{n}","refreshToken":"fake-refresh-{n}","expiresAt":4102444800000}},"mcpOAuth":{{"swap":"not-moved"}}}}"#
+    );
+    fs::write(
+        swap.join(format!("credentials/.creds-{n}-{email}.enc")),
+        base64(creds.as_bytes()),
+    )
+    .unwrap();
+    fs::write(
+        swap.join(format!("configs/.claude-config-{n}-{email}.json")),
+        format!(
+            r#"{{"numStartups":4,"oauthAccount":{{"accountUuid":"{}","organizationUuid":"{org}","emailAddress":"{email}"}}}}"#,
+            common::ACCOUNT_UUID
+        ),
+    )
+    .unwrap();
+}
+
+fn org(n: u32) -> String {
+    format!("00000000-0000-4000-8000-00000000000{n}")
+}
+
+#[test]
+fn imports_each_accounts_login_without_printing_it() {
+    let sb = Sandbox::new();
+    let swap = swap_dir(&sb);
+    fs::create_dir_all(&swap).unwrap();
+    fs::write(
+        swap.join("sequence.json"),
+        r#"{"sequence":[1,2,3,4],"accounts":{
+            "1":{"email":"one@example.com"},
+            "2":{"email":"two@example.com","alias":"team"},
+            "3":{"email":"three@example.com"},
+            "4":{"email":"four@example.com","disabled":true}}}"#,
+    )
+    .unwrap();
+    swap_account(&swap, 1, "one@example.com", &org(1));
+    swap_account(&swap, 2, "two@example.com", &org(2));
+    swap_account(&swap, 4, "four@example.com", &org(4));
+    // Account 3: claude-swap has its identity but no login.
+    fs::write(
+        swap.join("configs/.claude-config-3-three@example.com.json"),
+        r#"{"oauthAccount":{"accountUuid":"u","organizationUuid":"o"}}"#,
+    )
+    .unwrap();
+    // `team` already exists with an MCP login of its own.
+    sb.ok(&["add", "team"]);
+    let team = sb.data().join("claude/team");
+    fs::write(
+        team.join(".credentials.json"),
+        r#"{"mcpOAuth":{"team":"kept"}}"#,
+    )
+    .unwrap();
+
+    let out = sb.cmd(&["import", "claude-swap"]).output().unwrap();
+    common::assert_success(&out, &["import", "claude-swap"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains("fake-") && !stderr.contains("fake-"),
+        "no token is printed: {stdout}{stderr}"
+    );
+
+    for (label, n) in [("account-1", 1), ("team", 2)] {
+        let dir = sb.data().join("claude").join(label);
+        let creds: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.join(".credentials.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            creds["claudeAiOauth"]["refreshToken"],
+            format!("fake-refresh-{n}")
+        );
+        assert!(
+            creds
+                .get("mcpOAuth")
+                .is_none_or(|m| m.get("swap").is_none())
+        );
+        assert_eq!(common::mode(&dir.join(".credentials.json")), 0o600);
+        let config: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.join(".claude.json")).unwrap()).unwrap();
+        assert_eq!(config["oauthAccount"]["organizationUuid"], org(n));
+        assert!(!stdout.contains(&format!("hats login {label}")), "{stdout}");
+    }
+    let team_creds = fs::read_to_string(team.join(".credentials.json")).unwrap();
+    assert!(team_creds.contains("kept"), "other keys stay: {team_creds}");
+    assert!(stdout.contains("account-1, team"), "{stdout}");
+    assert!(stdout.contains("hats login account-3"), "{stdout}");
+    assert!(!sb.data().join("claude/account-4").exists());
+    assert!(stdout.contains("disabled in claude-swap"), "{stdout}");
+    assert!(stdout.contains("refresh token"), "{stdout}");
+    assert!(stdout.contains("cswap auto"), "{stdout}");
+}
+
+#[test]
+fn keeps_a_login_already_there_unless_asked_to_replace_it() {
+    let sb = Sandbox::new();
+    let swap = swap_dir(&sb);
+    fs::create_dir_all(&swap).unwrap();
+    fs::write(
+        swap.join("sequence.json"),
+        r#"{"sequence":[1],"accounts":{"1":{"email":"one@example.com"}}}"#,
+    )
+    .unwrap();
+    swap_account(&swap, 1, "one@example.com", &org(1));
+    sb.ok(&["add", "account-1"]);
+    let dir = sb.data().join("claude/account-1");
+    let mine = r#"{"claudeAiOauth":{"accessToken":"mine","refreshToken":"mine-refresh"}}"#;
+    fs::write(dir.join(".credentials.json"), mine).unwrap();
+
+    let kept = sb.ok(&["import", "claude-swap"]);
+    assert_eq!(
+        fs::read_to_string(dir.join(".credentials.json")).unwrap(),
+        mine
+    );
+    assert!(kept.contains("--replace-logins"), "{kept}");
+
+    sb.ok(&["import", "claude-swap", "--replace-logins"]);
+    let creds = fs::read_to_string(dir.join(".credentials.json")).unwrap();
+    assert!(creds.contains("fake-refresh-1"), "{creds}");
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    bytes
+        .chunks(3)
+        .flat_map(|chunk| {
+            let n = chunk
+                .iter()
+                .enumerate()
+                .fold(0u32, |n, (i, &b)| n | u32::from(b) << (16 - 8 * i));
+            (0..4).map(move |i| {
+                if i <= chunk.len() {
+                    ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char
+                } else {
+                    '='
+                }
+            })
+        })
+        .collect()
 }
