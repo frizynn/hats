@@ -1,21 +1,32 @@
 //! `hats import claude-swap`: takes claude-swap's account order, aliases,
-//! switching settings and last limits. It reads `sequence.json`,
-//! `settings.json`, the identity in claude-swap's copies of each account's
-//! `.claude.json` and the percentages in `cache/usage.json`; its stored
-//! tokens stay where they are, and each account signs in again through the
-//! harness's own login, except the one already in `~/.claude`.
+//! switching settings, last limits and each account's login. It reads
+//! `sequence.json`, `settings.json`, the identity in claude-swap's copies of
+//! each account's `.claude.json`, the percentages in `cache/usage.json` and
+//! claude-swap's backup of each login: `credentials/.creds-<n>-<mail>.enc`
+//! (base64), or on macOS, when that file is absent or unreadable as base64,
+//! the Keychain item `claude-swap` / `account-<n>-<mail>` (claude-swap 0.26).
+//! The login goes where Claude Code reads it (see `secret`); a directory that
+//! already holds one keeps it unless asked to replace it.
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use serde::Deserialize;
 
 use crate::account::{self, Account, DEFAULT_LABEL, Harness, validate_label};
 use crate::config;
 use crate::limits::{self, LimitWindow};
 use crate::registry;
+use crate::seat::{self, Lock};
+use crate::secret;
 use crate::store::Store;
+
+/// claude-swap's Keychain service for its backups of each account's login.
+const KEYCHAIN_SERVICE: &str = "claude-swap";
 
 #[derive(Deserialize)]
 struct Sequence {
@@ -100,7 +111,21 @@ impl SwapSlot {
     }
 }
 
-pub fn claude_swap(store: &Store, from: &Path) -> Result<(), String> {
+/// Where claude-swap keeps its data: `$XDG_DATA_HOME/claude-swap` on Linux
+/// (`~/.local/share/claude-swap` when unset or relative),
+/// `~/.claude-swap-backup` elsewhere.
+pub fn claude_swap_dir(store: &Store) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        return store.home.join(".claude-swap-backup");
+    }
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .unwrap_or_else(|| store.home.join(".local/share"))
+        .join("claude-swap")
+}
+
+pub fn claude_swap(store: &Store, from: &Path, replace_logins: bool) -> Result<(), String> {
     let read = |name: &str| {
         fs::read(from.join(name)).map_err(|e| format!("{}: {e}", from.join(name).display()))
     };
@@ -147,6 +172,8 @@ pub fn claude_swap(store: &Store, from: &Path) -> Result<(), String> {
         .ok()
         .flatten();
     let mut order = Vec::new();
+    let mut imported = Vec::new();
+    let mut kept_logins = Vec::new();
     let mut to_sign_in = Vec::new();
     let mut skipped = Vec::new();
     for n in numbers {
@@ -182,12 +209,20 @@ pub fn claude_swap(store: &Store, from: &Path) -> Result<(), String> {
         if let Some(id) = &id {
             seed(&account, id, n)?;
         }
-        if account
-            .provider_id(store)
-            .map_err(|e| e.to_string())?
-            .is_none()
-        {
-            to_sign_in.push((label.clone(), swap.email.clone()));
+        // A login that cannot be read is never replaced unasked.
+        let has_login = !matches!(secret::login(store, &account), Ok(None));
+        if has_login && !replace_logins {
+            kept_logins.push(label.clone());
+        } else {
+            let keychain = |user: &str| secret::keychain_password(store, KEYCHAIN_SERVICE, user);
+            match import_login(store, &account, from, n, &swap.email, &keychain) {
+                Ok(()) => imported.push(label.clone()),
+                Err(why) if has_login => {
+                    println!("Kept    {label}'s login: {why}");
+                    kept_logins.push(label.clone());
+                }
+                Err(why) => to_sign_in.push((label.clone(), swap.email.clone(), why)),
+            }
         }
         println!("{} {label}", if created { "Created" } else { "Kept   " });
         order.push(label);
@@ -221,25 +256,228 @@ pub fn claude_swap(store: &Store, from: &Path) -> Result<(), String> {
     for s in &skipped {
         println!("Skipped {s}: disabled in claude-swap");
     }
+    if !imported.is_empty() {
+        println!("Logins  from claude-swap: {}", imported.join(", "));
+    }
+    if !kept_logins.is_empty() {
+        println!(
+            "Kept    the logins already in {} (`--replace-logins` takes claude-swap's instead)",
+            kept_logins.join(", ")
+        );
+    }
     if !to_sign_in.is_empty() {
         println!(
             "\nSign in to each account with Claude Code's own login (rename first with `hats rm` and `hats add` if you want another label):"
         );
-        for (label, email) in &to_sign_in {
-            println!("  hats login {label}    # {email}");
+        for (label, email, why) in &to_sign_in {
+            println!("  hats login {label}    # {email}: {why}");
         }
     }
+    if !imported.is_empty() {
+        println!(
+            "\nhats and claude-swap now hold the same refresh token for {}: when one renews it, the other's copy stops working. Stop `cswap auto` now, and do not switch with cswap again.",
+            imported.join(", ")
+        );
+    }
     println!(
-        "\nWhen they are all signed in, stop `cswap auto` and run `cswap purge` to delete claude-swap's stored tokens."
+        "\nWhen every account works in hats, stop `cswap auto` and run `cswap purge` to delete claude-swap's stored tokens."
     );
     Ok(())
 }
 
-/// The account id in claude-swap's copy of an account's `.claude.json`. Its
-/// credentials folder is never read.
+/// Copies claude-swap's backup of account `number` into `account`: its
+/// `claudeAiOauth` where Claude Code reads the login, its `oauthAccount` in
+/// the directory's `.claude.json`. Other keys of both stay. The error says
+/// why, never with a token in it.
+fn import_login(
+    store: &Store,
+    account: &Account,
+    from: &Path,
+    number: u32,
+    email: &str,
+    keychain: &dyn Fn(&str) -> io::Result<Option<String>>,
+) -> Result<(), String> {
+    let login = swap_login(from, number, email, keychain)?
+        .ok_or_else(|| "claude-swap has no login stored for it".to_owned())?;
+    let identity = seat::oauth_account(&swap_config(from, number, email))
+        .map_err(|_| "claude-swap has no account details for it".to_owned())?;
+    // A renewal in flight (see `poll`) must not land over it.
+    let _refresh = Lock::take(account.dir.join(".oauth_refresh.lock"), seat::REFRESH_STALE)?;
+    let _legacy = Lock::take(
+        seat::with_suffix(&account.dir, ".lock"),
+        seat::REFRESH_STALE,
+    )?;
+    secret::put_login(store, account, login).map_err(|e| e.to_string())?;
+    seat::set_oauth_account(&account.dir.join(".claude.json"), identity).map_err(|e| e.to_string())
+}
+
+/// The `claudeAiOauth` of claude-swap's backup of one account, read as
+/// claude-swap reads it: the `.enc` file wins, and only when it is absent,
+/// empty or not base64 does the Keychain answer. An API key (no
+/// `claudeAiOauth`) reads as no login.
+fn swap_login(
+    from: &Path,
+    number: u32,
+    email: &str,
+    keychain: &dyn Fn(&str) -> io::Result<Option<String>>,
+) -> Result<Option<serde_json::Value>, String> {
+    let enc = from
+        .join("credentials")
+        .join(format!(".creds-{number}-{email}.enc"));
+    let from_file = match fs::read_to_string(&enc) {
+        Ok(text) => STANDARD
+            .decode(text.trim())
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("could not read claude-swap's backup ({e})")),
+    };
+    let text = match from_file.filter(|t| !t.is_empty()) {
+        Some(text) => text,
+        None => match keychain(&format!("account-{number}-{email}")) {
+            Ok(Some(text)) => text,
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(format!("could not read claude-swap's backup ({e})")),
+        },
+    };
+    let serde_json::Value::Object(mut item) = serde_json::from_str(&text)
+        .map_err(|_| "claude-swap's backup is not a JSON object".to_owned())?
+    else {
+        return Err("claude-swap's backup is not a JSON object".to_owned());
+    };
+    match item.remove(secret::LOGIN_KEY) {
+        Some(login) if login.is_object() => Ok(Some(login)),
+        Some(_) => Err("claude-swap's backup holds no valid login".to_owned()),
+        None => Ok(None),
+    }
+}
+
+/// The account id in claude-swap's copy of an account's `.claude.json`.
 fn swap_account_id(from: &Path, number: u32, email: &str) -> Option<String> {
-    let copy = from
-        .join("configs")
-        .join(format!(".claude-config-{number}-{email}.json"));
-    account::claude_id(&copy).ok().flatten()
+    account::claude_id(&swap_config(from, number, email))
+        .ok()
+        .flatten()
+}
+
+fn swap_config(from: &Path, number: u32, email: &str) -> PathBuf {
+    from.join("configs")
+        .join(format!(".claude-config-{number}-{email}.json"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEYCHAIN_LOGIN: &str = r#"{"claudeAiOauth":{"refreshToken":"fake-keychain"}}"#;
+
+    /// claude-swap's Keychain on macOS, faked: one item per backup user.
+    fn keychain(user: &str) -> io::Result<Option<String>> {
+        Ok((user == "account-1-one@example.com").then(|| KEYCHAIN_LOGIN.to_owned()))
+    }
+
+    fn refresh_token(login: Option<serde_json::Value>) -> String {
+        login.unwrap()["refreshToken"].as_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn reads_the_keychain_when_there_is_no_backup_file() {
+        let from = tempfile::tempdir().unwrap();
+        let login = swap_login(from.path(), 1, "one@example.com", &keychain).unwrap();
+        assert_eq!(refresh_token(login), "fake-keychain");
+        assert_eq!(
+            swap_login(from.path(), 2, "two@example.com", &keychain).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn the_backup_file_wins_over_the_keychain_unless_it_is_not_base64() {
+        let from = tempfile::tempdir().unwrap();
+        let dir = from.path().join("credentials");
+        fs::create_dir_all(&dir).unwrap();
+        let enc = dir.join(".creds-1-one@example.com.enc");
+        // {"claudeAiOauth":{"refreshToken":"fake-file"}}, as b64encode writes it.
+        fs::write(
+            &enc,
+            "eyJjbGF1ZGVBaU9hdXRoIjp7InJlZnJlc2hUb2tlbiI6ImZha2UtZmlsZSJ9fQ==\n",
+        )
+        .unwrap();
+        let login = swap_login(from.path(), 1, "one@example.com", &keychain).unwrap();
+        assert_eq!(refresh_token(login), "fake-file");
+
+        for corrupt in ["!!!!", ""] {
+            fs::write(&enc, corrupt).unwrap();
+            let login = swap_login(from.path(), 1, "one@example.com", &keychain).unwrap();
+            assert_eq!(refresh_token(login), "fake-keychain", "{corrupt:?}");
+        }
+    }
+
+    #[test]
+    fn a_keychain_that_does_not_answer_says_so_without_the_secret() {
+        let from = tempfile::tempdir().unwrap();
+        let locked = |_: &str| -> io::Result<Option<String>> {
+            Err(io::Error::other("security exited Some(36)"))
+        };
+        let why = swap_login(from.path(), 1, "one@example.com", &locked).unwrap_err();
+        assert!(why.contains("could not read"), "{why}");
+    }
+
+    #[test]
+    fn an_api_key_is_no_login() {
+        let from = tempfile::tempdir().unwrap();
+        let api_key = |_: &str| Ok(Some("sk-ant-fake".to_owned()));
+        assert!(swap_login(from.path(), 1, "one@example.com", &api_key).is_err());
+        let other = |_: &str| Ok(Some(r#"{"mcpOAuth":{}}"#.to_owned()));
+        assert_eq!(
+            swap_login(from.path(), 1, "one@example.com", &other).unwrap(),
+            None
+        );
+    }
+
+    /// The backup as `b64encode` writes it, in each padding.
+    const PADDED: [(&str, &str); 3] = [
+        (
+            "eyJjbGF1ZGVBaU9hdXRoIjp7InJlZnJlc2hUb2tlbiI6ImZha2UtZmlsZSJ9fQ==",
+            "fake-file",
+        ),
+        (
+            "eyJjbGF1ZGVBaU9hdXRoIjp7InJlZnJlc2hUb2tlbiI6ImZha2UtZmlsZXgifX0=",
+            "fake-filex",
+        ),
+        (
+            "eyJjbGF1ZGVBaU9hdXRoIjp7InJlZnJlc2hUb2tlbiI6ImZha2UtZmlsZXh5In19",
+            "fake-filexy",
+        ),
+    ];
+
+    fn with_backup(text: &str) -> tempfile::TempDir {
+        let from = tempfile::tempdir().unwrap();
+        let dir = from.path().join("credentials");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(".creds-1-one@example.com.enc"), text).unwrap();
+        from
+    }
+
+    #[test]
+    fn reads_a_backup_with_padding() {
+        for (text, token) in PADDED {
+            let from = with_backup(&format!("{text}\n"));
+            let login = swap_login(from.path(), 1, "one@example.com", &keychain).unwrap();
+            assert_eq!(refresh_token(login), token, "{text}");
+        }
+    }
+
+    #[test]
+    fn an_invalid_backup_falls_back_to_the_keychain() {
+        let unpadded = PADDED[0].0.trim_end_matches('=');
+        let bad_padding = format!("{}=", PADDED[0].0);
+        let mid_padding = format!("Zg=={}", PADDED[2].0);
+        // A login in the URL-safe alphabet, which claude-swap never writes.
+        let url_safe = "eyJjbGF1ZGVBaU9hdXRoIjp7InJlZnJlc2hUb2tlbiI6ImZha2UtdXJsPz4-In19";
+        for text in [unpadded, &bad_padding, &mid_padding, "Zm9v!!!!", url_safe] {
+            let from = with_backup(text);
+            let login = swap_login(from.path(), 1, "one@example.com", &keychain).unwrap();
+            assert_eq!(refresh_token(login), "fake-keychain", "{text}");
+        }
+    }
 }

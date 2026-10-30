@@ -351,7 +351,7 @@ How it counts:
 | `hats config [list\|get\|set\|edit\|path]` | settings; `hats config` lists every key with its meaning |
 | `hats setup [--dry-run\|--undo]` | install or remove the hooks, the status line wrapper and the shell functions; run it again after moving the binary |
 | `hats usage [--json]` | tokens per day, account, model and project from the agents' own logs, and what they would cost at API list price |
-| `hats import claude-swap [--from <dir>]` | take claude-swap's account order, settings and last limits (never its tokens) |
+| `hats import claude-swap [--from <dir>] [--replace-logins]` | take claude-swap's account order, settings, last limits and each account's login |
 | `hats completions <shell>` | shell completions |
 | `hats statusline [-- your command]` | the status line wrapper `setup` installs |
 
@@ -442,22 +442,34 @@ same way. No credentials, no account id.
 ## Migrating from claude-swap
 
 ```sh
-hats import claude-swap     # order, threshold and strategy; prints the sign-ins left
-hats login account-1        # one sign-in per account it lists, with Claude Code's own login
-...
+hats import claude-swap     # order, settings, limits and logins; prints the sign-ins left
+# stop `cswap auto` (Ctrl-C, or its service): both now hold the same refresh tokens
 hats setup
 ```
 
 The import creates one account per enabled claude-swap account (its alias, or
-`account-<n>`), keeps claude-swap's order, threshold and strategy, and prints
-which accounts to sign in to. The account claude-swap last switched into is
-already signed in at `~/.claude`: the import recognizes it by its account id
-(`accountUuid` and `organizationUuid`, hashed as in the registry) in
-claude-swap's copy of that account's `.claude.json`, keeps it as `default` in
-its place in the order and creates nothing for it. It reads
-`sequence.json`, `settings.json` and those copies; claude-swap's stored
-tokens are never read or copied. When every account is signed in, stop
-`cswap auto` and run `cswap purge` to delete them.
+`account-<n>`), keeps claude-swap's order, threshold and strategy, and copies
+each account's login from claude-swap's backup: `claudeAiOauth` goes where
+Claude Code reads it (the Keychain, or `.credentials.json`, keeping whatever
+else is there) and `oauthAccount` into the account's `.claude.json`. The
+backup is `credentials/.creds-<n>-<mail>.enc` in claude-swap's folder
+(`~/.local/share/claude-swap` on Linux, `~/.claude-swap-backup` on macOS) or,
+on macOS without that file, the Keychain item `claude-swap` /
+`account-<n>-<mail>`. An account that already has a login keeps it unless
+you pass `--replace-logins`; disabled accounts are skipped, and the import
+prints which accounts took a login and which still need `hats login`. No
+token is ever printed.
+
+hats and claude-swap then hold the same refresh tokens, and a renewal by one
+leaves the other's copy useless, so stop `cswap auto` right after importing.
+When every account works in hats, run `cswap purge` to delete claude-swap's
+copies.
+
+The account claude-swap last switched into is already signed in at
+`~/.claude`: the import recognizes it by its account id (`accountUuid` and
+`organizationUuid`, hashed as in the registry) in claude-swap's copy of that
+account's `.claude.json`, keeps it as `default` in its place in the order
+and creates nothing for it.
 
 | | claude-swap 0.26.0 | hats |
 |---|---|---|
