@@ -13,6 +13,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use serde::Deserialize;
 
 use crate::account::{self, Account, DEFAULT_LABEL, Harness, validate_label};
@@ -323,7 +325,10 @@ fn swap_login(
         .join("credentials")
         .join(format!(".creds-{number}-{email}.enc"));
     let from_file = match fs::read_to_string(&enc) {
-        Ok(text) => decode_base64(text.trim()).and_then(|b| String::from_utf8(b).ok()),
+        Ok(text) => STANDARD
+            .decode(text.trim())
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
         Err(e) => return Err(format!("could not read claude-swap's backup ({e})")),
     };
@@ -345,38 +350,6 @@ fn swap_login(
         Some(_) => Err("claude-swap's backup holds no valid login".to_owned()),
         None => Ok(None),
     }
-}
-
-/// Standard base64 with padding, as Python's `b64encode` writes it; `None`
-/// for anything else.
-fn decode_base64(text: &str) -> Option<Vec<u8>> {
-    let text = text.as_bytes();
-    if !text.len().is_multiple_of(4) {
-        return None;
-    }
-    let value = |c: u8| match c {
-        b'A'..=b'Z' => Some(c - b'A'),
-        b'a'..=b'z' => Some(c - b'a' + 26),
-        b'0'..=b'9' => Some(c - b'0' + 52),
-        b'+' => Some(62),
-        b'/' => Some(63),
-        _ => None,
-    };
-    let mut out = Vec::with_capacity(text.len() / 4 * 3);
-    for (i, chunk) in text.chunks(4).enumerate() {
-        let last = i == text.len() / 4 - 1;
-        let pad = chunk.iter().rev().take_while(|&&c| c == b'=').count();
-        if pad > 2 || (pad > 0 && !last) {
-            return None;
-        }
-        let mut n = 0u32;
-        for &c in &chunk[..4 - pad] {
-            n = n << 6 | u32::from(value(c)?);
-        }
-        n <<= 6 * pad;
-        out.extend_from_slice(&n.to_be_bytes()[1..4 - pad]);
-    }
-    Some(out)
 }
 
 /// The account id in claude-swap's copy of an account's `.claude.json`.
@@ -461,19 +434,50 @@ mod tests {
         );
     }
 
+    /// The backup as `b64encode` writes it, in each padding.
+    const PADDED: [(&str, &str); 3] = [
+        (
+            "eyJjbGF1ZGVBaU9hdXRoIjp7InJlZnJlc2hUb2tlbiI6ImZha2UtZmlsZSJ9fQ==",
+            "fake-file",
+        ),
+        (
+            "eyJjbGF1ZGVBaU9hdXRoIjp7InJlZnJlc2hUb2tlbiI6ImZha2UtZmlsZXgifX0=",
+            "fake-filex",
+        ),
+        (
+            "eyJjbGF1ZGVBaU9hdXRoIjp7InJlZnJlc2hUb2tlbiI6ImZha2UtZmlsZXh5In19",
+            "fake-filexy",
+        ),
+    ];
+
+    fn with_backup(text: &str) -> tempfile::TempDir {
+        let from = tempfile::tempdir().unwrap();
+        let dir = from.path().join("credentials");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(".creds-1-one@example.com.enc"), text).unwrap();
+        from
+    }
+
     #[test]
-    fn decodes_base64_as_python_writes_it() {
-        for (text, plain) in [
-            ("", ""),
-            ("Zg==", "f"),
-            ("Zm8=", "fo"),
-            ("Zm9v", "foo"),
-            ("Zm9vYmFy", "foobar"),
-        ] {
-            assert_eq!(decode_base64(text).unwrap(), plain.as_bytes(), "{text}");
+    fn reads_a_backup_with_padding() {
+        for (text, token) in PADDED {
+            let from = with_backup(&format!("{text}\n"));
+            let login = swap_login(from.path(), 1, "one@example.com", &keychain).unwrap();
+            assert_eq!(refresh_token(login), token, "{text}");
         }
-        for bad in ["Zg=", "Zg==Zm9v", "Z===", "Zm9!"] {
-            assert_eq!(decode_base64(bad), None, "{bad}");
+    }
+
+    #[test]
+    fn an_invalid_backup_falls_back_to_the_keychain() {
+        let unpadded = PADDED[0].0.trim_end_matches('=');
+        let bad_padding = format!("{}=", PADDED[0].0);
+        let mid_padding = format!("Zg=={}", PADDED[2].0);
+        // A login in the URL-safe alphabet, which claude-swap never writes.
+        let url_safe = "eyJjbGF1ZGVBaU9hdXRoIjp7InJlZnJlc2hUb2tlbiI6ImZha2UtdXJsPz4-In19";
+        for text in [unpadded, &bad_padding, &mid_padding, "Zm9v!!!!", url_safe] {
+            let from = with_backup(text);
+            let login = swap_login(from.path(), 1, "one@example.com", &keychain).unwrap();
+            assert_eq!(refresh_token(login), "fake-keychain", "{text}");
         }
     }
 }

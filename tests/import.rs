@@ -260,6 +260,7 @@ fn takes_claude_swaps_last_limits_so_a_move_never_goes_to_a_spent_account() {
 /// claude-swap's backup of one account: `.credentials.json` as Claude Code
 /// wrote it, in base64, and its copy of `.claude.json`. Fake tokens only.
 fn swap_account(swap: &std::path::Path, n: u32, email: &str, org: &str) {
+    use base64::Engine;
     fs::create_dir_all(swap.join("credentials")).unwrap();
     fs::create_dir_all(swap.join("configs")).unwrap();
     let creds = format!(
@@ -267,7 +268,7 @@ fn swap_account(swap: &std::path::Path, n: u32, email: &str, org: &str) {
     );
     fs::write(
         swap.join(format!("credentials/.creds-{n}-{email}.enc")),
-        base64(creds.as_bytes()),
+        base64::engine::general_purpose::STANDARD.encode(creds),
     )
     .unwrap();
     fs::write(
@@ -381,24 +382,4 @@ fn keeps_a_login_already_there_unless_asked_to_replace_it() {
     sb.ok(&["import", "claude-swap", "--replace-logins"]);
     let creds = fs::read_to_string(dir.join(".credentials.json")).unwrap();
     assert!(creds.contains("fake-refresh-1"), "{creds}");
-}
-
-fn base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    bytes
-        .chunks(3)
-        .flat_map(|chunk| {
-            let n = chunk
-                .iter()
-                .enumerate()
-                .fold(0u32, |n, (i, &b)| n | u32::from(b) << (16 - 8 * i));
-            (0..4).map(move |i| {
-                if i <= chunk.len() {
-                    ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char
-                } else {
-                    '='
-                }
-            })
-        })
-        .collect()
 }
