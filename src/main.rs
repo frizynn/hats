@@ -269,22 +269,15 @@ fn run(cli: Cli) -> Result<(), Failure> {
     // Hooks run inside the agent's session: they must not fail it, so they
     // report and exit 0.
     if let Cmd::Hook { event } = command {
-        if let HookEvent::Revive = event {
-            // Exit code 2 is what wakes the session (`asyncRewake`); the words
-            // on stderr are what the agent reads.
-            let config_dir = std::env::var_os(Harness::Claude.env_var());
-            match hook::revive(&store, config_dir, io::stdin().lock()) {
-                Ok(Some(words)) => {
-                    eprintln!("{words}");
-                    return Err(Failure::Exit(2));
-                }
-                Ok(None) => {}
-                Err(e) => eprintln!("hats hook: {e}"),
+        match run_hook(&store, event) {
+            // Exit code 2 wakes the session (`asyncRewake`); the words on
+            // stderr are what the agent reads.
+            Ok(Some(words)) => {
+                eprintln!("{words}");
+                return Err(Failure::Exit(2));
             }
-            return Ok(());
-        }
-        if let Err(e) = run_hook(&store, event) {
-            eprintln!("hats hook: {e}");
+            Ok(None) => {}
+            Err(e) => eprintln!("hats hook: {e}"),
         }
         return Ok(());
     }
@@ -370,19 +363,21 @@ fn run(cli: Cli) -> Result<(), Failure> {
     Ok(())
 }
 
-fn run_hook(store: &Store, event: HookEvent) -> Result<(), String> {
+/// The words that wake the session, when the hook wakes it.
+fn run_hook(store: &Store, event: HookEvent) -> Result<Option<String>, String> {
     let config_dir = std::env::var_os(Harness::Claude.env_var());
     let stdin = io::stdin().lock();
     let now = SystemTime::now();
     match event {
-        HookEvent::SessionStart => hook::session_start(store, config_dir, stdin, now),
-        HookEvent::Prompt => hook::prompt(store, stdin),
+        HookEvent::SessionStart => hook::session_start(store, config_dir, stdin, now)?,
+        HookEvent::Prompt => hook::prompt(store, stdin)?,
         HookEvent::Stop => {
             let config = Config::load(&store.config)?;
-            hook::stop(store, &config.claude, config_dir, stdin, now)
+            hook::stop(store, &config.claude, config_dir, stdin, now)?;
         }
-        HookEvent::Revive => unreachable!("handled in run"),
+        HookEvent::Revive => return hook::revive(store, config_dir, stdin),
     }
+    Ok(None)
 }
 
 fn flag(harness: Harness) -> &'static str {
