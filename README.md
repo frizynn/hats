@@ -193,8 +193,11 @@ Where the limits come from:
 - **Rate limit errors.** A turn that ends with a rate limit error
   (`StopFailure` with `error: "rate_limit"`) counts that account as full until
   the full window resets, when the last numbers say when, else for five hours.
-  In the first minute after a change of account, an error in `~/.claude` is
-  taken as the account that left.
+  A turn that ends because the provider refused the login (`error:
+  "authentication_failed"`, what Claude Code 2.1.316 sends on a 401) marks the
+  account's login as expired, as a poll does. In the first minute after a
+  change of account, an error in `~/.claude` is taken as the account that
+  left.
 - **Codex** writes `rate_limits` into every `token_count` event of its
   rollouts; hats reads the newest one of each account.
 
@@ -207,8 +210,22 @@ one with the most room (`strategy = "headroom"`) or the next in `order`
 (`strategy = "next"`). An account with no numbers yet may be the spent one, so
 it is taken only when no account with numbers has room. This happens in the
 status line wrapper, the `StopFailure` hook, after each poll and when
-`hats run` starts. If no account has room, nothing moves. For Claude Code the
-switch reaches every open session; for Codex, new sessions.
+`hats run` starts. An account in use whose login the provider refused is left
+the same way, whatever its numbers. If no account has room, nothing moves, and
+a session cut by a rate limit or a refused login shows a desktop notification
+saying so. For Claude Code the switch reaches every open session; for Codex,
+new sessions.
+
+**Cut sessions go on by themselves.** A Claude Code turn cut by a rate limit
+or a refused login stops and waits for you. `hats setup` also installs a
+`StopFailure` hook that Claude Code runs in the background
+(`asyncRewake`): it waits until the session has an account that works, and a
+minute after the change, when Claude Code reads the new login, it wakes the
+session, which goes on where it stopped with a note from hats. Each cut wakes
+a session once. A prompt you type meanwhile cancels it, a turn you stop with
+Esc runs no hook, and a session you close takes its waiter with it. With no
+account to move to it waits, without retrying, until one has room again, for
+a day at most. Run `hats setup` again after upgrading to install it.
 
 **Disabled accounts.** `hats disable <label>` (or space in the view) keeps
 auto switching from ever moving to an account; `hats enable <label>` lets it
