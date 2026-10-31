@@ -223,6 +223,36 @@ fn waiter(path: &Path) -> Option<u32> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
+/// The account the session runs on, once it can take the session back: it
+/// has a login the provider takes and room, and Claude Code has had time to
+/// read it. Asks for the limits when due, which also moves the seat off a
+/// spent account once another has room: nothing else may run while every
+/// session is stopped.
+fn ready(store: &Store, config_dir: Option<OsString>) -> Result<Option<Account>, String> {
+    let now = SystemTime::now();
+    let config = Config::load(&store.config)?;
+    if poll::due(store, now) {
+        poll::poll(store, &config.claude, now);
+    } else {
+        auto::check_default(store, Harness::Claude, &config.claude, now, None, None)?;
+    }
+    let account = if config_dir.as_ref().is_none_or(|d| d.is_empty()) {
+        seat::current(store)
+    } else {
+        session_account(store, config_dir)
+    };
+    let usable = auto::statuses(store, Harness::Claude, &config.claude)?
+        .iter()
+        .find(|s| s.account.label == account.label)
+        .is_some_and(|s| {
+            s.id.is_some() && !s.login_refused() && s.used(now).is_none_or(|u| u < 100.0)
+        });
+    let settled = seat::changed_at(store)
+        .and_then(|at| now.duration_since(at).ok())
+        .is_none_or(|since| since >= seat::SETTLING);
+    Ok((usable && settled).then_some(account))
+}
+
 /// `StopFailure` with `asyncRewake`: once the session cut by a rate limit or
 /// a refused login has a working account, the words that wake it (Claude Code
 /// shows them to the agent); `None` when it is not to be woken.
@@ -235,6 +265,8 @@ pub fn revive(
     let Some(reason) = cut_by(&input) else {
         return Ok(None);
     };
+    // Also done by `stop`, which runs at the same time: until the account is
+    // marked, it would look ready and the session would wake on it again.
     let config = Config::load(&store.config)?;
     handle_cut(
         store,
@@ -256,7 +288,6 @@ pub fn revive(
         (parent, process::parent(parent))
     };
     let claude = ancestors();
-    let in_seat = config_dir.as_ref().is_none_or(|d| d.is_empty());
     loop {
         std::thread::sleep(REVIVE_EVERY);
         if waiter(&path) != Some(std::process::id()) {
@@ -267,39 +298,18 @@ pub fn revive(
             let _ = fs::remove_file(&path);
             return Ok(None);
         }
-        let now = SystemTime::now();
-        let config = Config::load(&store.config)?;
-        // Nothing else may run while every session is stopped: this asks for
-        // the limits, and moves the seat once an account has room.
-        if poll::due(store, now) {
-            poll::poll(store, &config.claude, now);
-        } else {
-            let _ = auto::check_default(store, Harness::Claude, &config.claude, now, None, None);
-        }
-        let account = if in_seat {
-            seat::current(store)
-        } else {
-            session_account(store, config_dir.clone())
+        // A config saved half way or a busy store is no reason to give up.
+        let Ok(Some(account)) = ready(store, config_dir.clone()) else {
+            continue;
         };
-        let usable = auto::statuses(store, Harness::Claude, &config.claude)?
-            .iter()
-            .find(|s| s.account.label == account.label)
-            .is_some_and(|s| {
-                s.id.is_some() && !s.login_refused() && s.used(now).is_none_or(|u| u < 100.0)
-            });
-        let settled = seat::changed_at(store)
-            .and_then(|at| now.duration_since(at).ok())
-            .is_none_or(|since| since >= seat::SETTLING);
-        if usable && settled {
-            let _ = fs::remove_file(&path);
-            let why = match reason {
-                Reason::Login => "the provider refused the login of the account it ran on",
-                _ => "the account it ran on hit its limit",
-            };
-            return Ok(Some(format!(
-                "hats: this session stopped because {why}; it now runs on '{}'. Continue the task where it stopped.",
-                account.label
-            )));
-        }
+        let _ = fs::remove_file(&path);
+        let why = match reason {
+            Reason::Login => "the provider refused the login of the account it ran on",
+            _ => "the account it ran on hit its limit",
+        };
+        return Ok(Some(format!(
+            "hats: this session stopped because {why}; it now runs on '{}'. Continue the task where it stopped.",
+            account.label
+        )));
     }
 }

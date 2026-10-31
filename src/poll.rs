@@ -152,19 +152,7 @@ fn read_one(
     let read = secret::login(store, &source)
         .map_err(|e| e.to_string())?
         .ok_or("no stored login")?;
-    let mut login = read.clone();
-    let result = (|| {
-        if expired(&login, now) {
-            if seated {
-                return Err("its token expired; Claude Code renews it on its next request".into());
-            }
-            login = renew(store, account, now)?;
-        }
-        let token = login["accessToken"].as_str().ok_or("no access token")?;
-        let windows = usage(token)?;
-        limits::save(store, account, id, windows, now).map_err(|e| e.to_string().into())
-    })();
-    match result {
+    match read_with(store, account, id, seated, now, read.clone()) {
         // A new login landed meanwhile (`hats login`): the refusal was the
         // old one's, and the next poll reads the new one.
         Err(Failed::Refused(_))
@@ -174,6 +162,26 @@ fn read_one(
         }
         result => result,
     }
+}
+
+/// Reads the limits with `login`, renewing it first when it expired.
+fn read_with(
+    store: &Store,
+    account: &Account,
+    id: &str,
+    seated: bool,
+    now: SystemTime,
+    mut login: Value,
+) -> Result<(), Failed> {
+    if expired(&login, now) {
+        if seated {
+            return Err("its token expired; Claude Code renews it on its next request".into());
+        }
+        login = renew(store, account, now)?;
+    }
+    let token = login["accessToken"].as_str().ok_or("no access token")?;
+    let windows = usage(token)?;
+    limits::save(store, account, id, windows, now).map_err(|e| e.to_string().into())
 }
 
 fn expired(login: &Value, now: SystemTime) -> bool {

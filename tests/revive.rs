@@ -246,3 +246,25 @@ fn a_waiter_leaves_when_claude_code_is_gone() {
     });
     assert!(!file.exists());
 }
+
+#[test]
+fn a_config_saved_half_way_does_not_end_the_wait() {
+    let sb = Sandbox::new();
+    sb.signed_in("work", "org-work");
+    sb.ok(&["use", "work"]);
+    settle(&sb);
+    let mut revive = spawn_hook(&sb, &["hook", "revive"], &failure("s-1", "rate_limit"));
+    assert_eq!(exited(&mut revive, 2), None);
+
+    let config = sb.home.join(".config/hats/config.toml");
+    let saved = fs::read_to_string(&config).unwrap_or_default();
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(&config, "[claude\n").unwrap();
+    assert_eq!(exited(&mut revive, 3), None, "still waiting");
+    fs::write(&config, saved).unwrap();
+
+    sb.signed_in("side", "org-side");
+    until("moved to side", || sb.current() == "side");
+    settle(&sb);
+    assert_eq!(exited(&mut revive, 10), Some(2));
+}
