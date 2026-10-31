@@ -126,6 +126,8 @@ pub fn next_account<'a>(
     let current = statuses.iter().find(|s| s.account.label == from)?;
     let reason = match forced {
         Some(reason) => reason,
+        // Every session in the seat fails until another login sits there.
+        None if current.login_refused() => Reason::Login,
         None => policy::trigger(current.used(now)?, config.threshold)?,
     };
     let candidates: Vec<Candidate> = statuses.iter().map(|s| s.candidate(now)).collect();

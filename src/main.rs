@@ -219,6 +219,8 @@ enum HookEvent {
     SessionStart,
     Prompt,
     Stop,
+    /// `StopFailure` with `asyncRewake`: wakes a cut session on a new account.
+    Revive,
 }
 
 enum Failure {
@@ -267,6 +269,20 @@ fn run(cli: Cli) -> Result<(), Failure> {
     // Hooks run inside the agent's session: they must not fail it, so they
     // report and exit 0.
     if let Cmd::Hook { event } = command {
+        if let HookEvent::Revive = event {
+            // Exit code 2 is what wakes the session (`asyncRewake`); the words
+            // on stderr are what the agent reads.
+            let config_dir = std::env::var_os(Harness::Claude.env_var());
+            match hook::revive(&store, config_dir, io::stdin().lock()) {
+                Ok(Some(words)) => {
+                    eprintln!("{words}");
+                    return Err(Failure::Exit(2));
+                }
+                Ok(None) => {}
+                Err(e) => eprintln!("hats hook: {e}"),
+            }
+            return Ok(());
+        }
         if let Err(e) = run_hook(&store, event) {
             eprintln!("hats hook: {e}");
         }
@@ -360,11 +376,12 @@ fn run_hook(store: &Store, event: HookEvent) -> Result<(), String> {
     let now = SystemTime::now();
     match event {
         HookEvent::SessionStart => hook::session_start(store, config_dir, stdin, now),
-        HookEvent::Prompt => hook::prompt(store),
+        HookEvent::Prompt => hook::prompt(store, stdin),
         HookEvent::Stop => {
             let config = Config::load(&store.config)?;
             hook::stop(store, &config.claude, config_dir, stdin, now)
         }
+        HookEvent::Revive => unreachable!("handled in run"),
     }
 }
 

@@ -9,8 +9,9 @@
 //!
 //! `session` is present when the line comes from a harness session hook and
 //! binds only that session; without it the line moves the default account.
-//! `reason` (`manual`, `threshold` or `limit`) says why the account changed;
-//! it is absent on session lines that did not change anything.
+//! `reason` (`manual`, `threshold`, `limit`, `disabled` or `login`) says why
+//! the account changed; it is absent on session lines that did not change
+//! anything.
 //! Readers attribute a message of session S at time t to the newest line with
 //! `session == S` and `at <= t`, else to the newest line without `session` and
 //! `at <= t`, else to nobody.
