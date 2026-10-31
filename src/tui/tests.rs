@@ -660,3 +660,67 @@ fn no_color_draws_without_colors() {
     assert!(colors(DARK) > 0);
     assert_eq!(colors(Theme::PLAIN), 0);
 }
+
+#[test]
+fn an_expired_login_shows_on_its_row_and_in_its_details() {
+    let (_dir, store) = sandbox();
+    let work = account(&store, "work", Some(10.0));
+    let side = account(&store, "side", Some(0.0));
+    let id = work.provider_id(&store).unwrap().unwrap();
+    auto::choose(&store, &work, &id, SystemTime::now()).unwrap();
+    let side_id = side.provider_id(&store).unwrap().unwrap();
+    limits::mark_refused(&store, &side, &side_id, SystemTime::now()).unwrap();
+
+    let mut app = App::new(&store, DARK);
+    app.select_label(Some("side"));
+    let screen = text(&mut app);
+    let row = line_with(&screen, "side  ");
+    assert!(
+        row.contains("login expired: press l to sign in again"),
+        "{screen}"
+    );
+    assert!(!row.contains('%'), "{row}");
+    assert!(
+        line_with(&screen, "Login").contains("press l to sign in again"),
+        "{screen}"
+    );
+    // `work` has nowhere else to go.
+    assert!(screen.contains("Nothing to move to"), "{screen}");
+
+    // Red, like a spent account.
+    let term = render(&mut app, 100, 30);
+    let buffer = term.backend().buffer();
+    let y = (0..30)
+        .find(|&y| {
+            (0..100)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .contains("login expired: press l")
+        })
+        .unwrap();
+    assert!((0..100).any(|x| buffer[(x, y)].fg == Color::Red));
+    let y = (0..30)
+        .find(|&y| {
+            (0..100)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .contains(" Login ")
+        })
+        .unwrap();
+    assert!(
+        (0..100).any(|x| buffer[(x, y)].fg == Color::Red),
+        "details too"
+    );
+
+    // Signed in again with l: no longer shown as expired.
+    let login = || Child {
+        action: Action::Login,
+        harness: Harness::Claude,
+        label: "side".to_owned(),
+    };
+    assert_eq!(app.on_key(key(KeyCode::Char('l'))), Step::Run(login()));
+    app.finish(&login(), Ok(()));
+    let screen = text(&mut app);
+    assert!(!screen.contains("expired"), "{screen}");
+    assert!(app.message.as_ref().unwrap().text.contains("is signed in"));
+}

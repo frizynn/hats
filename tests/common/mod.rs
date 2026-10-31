@@ -29,12 +29,16 @@ esac
 /// The provider, as `curl` sees it: reads the request from its standard
 /// input, as hats sends it. A usage request answers
 /// `$FAKE_USAGE/<token>.json`, or 401 without one; a token renewal answers
-/// `renewed`, valid for an hour, and logs the request in `$FAKE_USAGE/renewals`.
+/// `renewed`, valid for an hour, and logs the request in `$FAKE_USAGE/renewals`,
+/// or answers the status in `$FAKE_USAGE/renewal-status` when there is one.
 const FAKE_CURL: &str = r#"#!/bin/sh
 config=$(cat)
 case "$config" in
   *oauth/token*)
     echo "$config" | grep '^data-binary' >> "$FAKE_USAGE/renewals"
+    if [ -f "$FAKE_USAGE/renewal-status" ]; then
+      printf '{"error":"invalid_grant"}\n%s' "$(cat "$FAKE_USAGE/renewal-status")"; exit 0
+    fi
     printf '{"access_token":"renewed","refresh_token":"refresh-renewed","expires_in":3600}\n200' ;;
   *)
     token=$(echo "$config" | sed -n 's/^header = "Authorization: Bearer \(.*\)"$/\1/p')
