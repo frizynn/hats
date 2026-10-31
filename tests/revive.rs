@@ -204,3 +204,45 @@ fn with_no_account_to_move_to_it_says_so_and_wakes_when_one_comes_back() {
     settle(&sb);
     assert_eq!(exited(&mut revive, 10), Some(2));
 }
+
+#[test]
+fn a_waiter_leaves_when_claude_code_is_gone() {
+    let sb = Sandbox::new();
+    sb.signed_in("work", "org-work");
+    sb.ok(&["use", "work"]);
+    settle(&sb);
+    // Claude Code (the outer shell) runs it through a shell that does not
+    // exec it; `kill -9` of Claude Code orphans that shell, not hats.
+    let hats = env!("CARGO_BIN_EXE_hats");
+    let sandbox = sb.cmd(&[]);
+    let mut claude = std::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            "/bin/sh -c '\"$0\" hook revive; true' \"$0\"; true",
+            hats,
+        ])
+        .env_clear()
+        .envs(sandbox.get_envs().filter_map(|(k, v)| Some((k, v?))))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    claude
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(failure("s-1", "rate_limit").as_bytes())
+        .unwrap();
+    let file = sb.home.join(".local/state/hats/revive/s-1");
+    until("waiting", || file.exists());
+    let pid: i32 = fs::read_to_string(&file).unwrap().trim().parse().unwrap();
+
+    claude.kill().unwrap();
+    claude.wait().unwrap();
+    until("the waiter left", || {
+        // SAFETY: kill(2) with signal 0 only checks.
+        unsafe { libc::kill(pid, 0) != 0 }
+    });
+    assert!(!file.exists());
+}

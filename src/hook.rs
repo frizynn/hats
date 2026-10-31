@@ -198,23 +198,29 @@ fn waiter_path(store: &Store, session: &str) -> PathBuf {
 }
 
 /// The waiter of `session`: this process, unless one still running already
-/// waits for it.
+/// waits for it. Files of waiters that are gone are removed.
 fn claim(path: &Path) -> Result<bool, String> {
     let me = std::process::id();
-    if let Some(pid) = fs::read_to_string(path)
-        .ok()
-        .and_then(|t| t.trim().parse::<u32>().ok())
-        && pid != me
-        && process::alive(pid)
-    {
+    let dir = path.parent().expect("in revive/");
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        if waiter(&entry.path()).is_some_and(|pid| !process::alive(pid)) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    if waiter(path).is_some_and(|pid| pid != me && process::alive(pid)) {
         return Ok(false);
     }
-    fs::create_dir_all(path.parent().expect("in revive/")).map_err(|e| e.to_string())?;
+    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let tmp = path.with_extension(format!("{me}.tmp"));
     fs::write(&tmp, me.to_string()).map_err(|e| e.to_string())?;
     fs::rename(&tmp, path).map_err(|e| e.to_string())?;
     // Two waiters started together: the last rename wins.
-    Ok(fs::read_to_string(path).is_ok_and(|t| t.trim() == me.to_string()))
+    Ok(waiter(path) == Some(me))
+}
+
+/// The pid in a waiter's file.
+fn waiter(path: &Path) -> Option<u32> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 /// `StopFailure` with `asyncRewake`: once the session cut by a rate limit or
@@ -241,16 +247,24 @@ pub fn revive(
     if !claim(&path)? {
         return Ok(None);
     }
-    // SAFETY: getppid(2) cannot fail.
-    let claude = unsafe { libc::getppid() };
+    // Claude Code runs the hook through `sh -c`, which may exec it or not:
+    // Claude Code is the parent or the one above. When either changes, it is
+    // gone (measured on 2.1.316: `/exit` ends the hook, `kill -9` leaves it
+    // running under the orphaned shell).
+    let ancestors = || {
+        let parent = std::os::unix::process::parent_id();
+        (parent, process::parent(parent))
+    };
+    let claude = ancestors();
     let in_seat = config_dir.as_ref().is_none_or(|d| d.is_empty());
     loop {
         std::thread::sleep(REVIVE_EVERY);
-        let mine =
-            fs::read_to_string(&path).is_ok_and(|t| t.trim() == std::process::id().to_string());
-        // SAFETY: as above.
-        if !mine || unsafe { libc::getppid() } != claude {
-            // A prompt took over, or Claude Code is gone.
+        if waiter(&path) != Some(std::process::id()) {
+            // A prompt took over.
+            return Ok(None);
+        }
+        if ancestors() != claude {
+            let _ = fs::remove_file(&path);
             return Ok(None);
         }
         let now = SystemTime::now();
