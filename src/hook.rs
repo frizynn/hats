@@ -5,26 +5,37 @@
 //!   a `hats run` parent's clock for closing. A resume under another account
 //!   writes a new line; the newest line wins.
 //! - `UserPromptSubmit`, `Stop`, `StopFailure`: tell a `hats run` parent when
-//!   the agent is working or idle; a rate limit error marks the account full
-//!   and moves the seat off it.
+//!   the agent is working or idle. A turn cut by a rate limit or by a login
+//!   the provider refused (`error` `rate_limit` or `authentication_failed`,
+//!   measured on 2.1.316 with a 401) marks the account and moves the seat off
+//!   it; with no account to move to, Claude Code shows a notification.
+//! - `StopFailure` again, run in the background with `asyncRewake`: `revive`
+//!   waits until the cut session has a working account and wakes it by
+//!   exiting 2 (measured on 2.1.316: the session runs a new turn with the new
+//!   login once its `.credentials.json` changed). One waiter per session; a
+//!   prompt typed meanwhile cancels it, and it leaves with Claude Code. Esc
+//!   runs no hook, so a turn the user cut is never woken.
 
 use std::ffi::OsString;
+use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
 
 use crate::account::{Account, Harness};
-use crate::config::HarnessConfig;
+use crate::config::{Config, HarnessConfig};
 use crate::limits;
 use crate::policy::Reason;
 use crate::registry::{self, Switch};
 use crate::store::Store;
-use crate::{auto, seat, supervisor};
+use crate::{auto, poll, process, seat, supervisor};
 
 /// Hook payloads are a few kilobytes; anything larger is not ours.
 const MAX_INPUT: u64 = 1 << 20;
+/// How often a waiting `revive` looks again.
+const REVIVE_EVERY: Duration = Duration::from_secs(1);
 
 #[derive(Deserialize)]
 struct HookInput {
@@ -93,8 +104,67 @@ fn record_account(
     registry::append(&store.registry(), &line).map_err(|e| e.to_string())
 }
 
-pub fn prompt(store: &Store) -> Result<(), String> {
-    supervisor::mark_busy(store).map_err(|e| e.to_string())
+/// The agent works again; a session the user took over is not woken.
+pub fn prompt(store: &Store, stdin: impl Read) -> Result<(), String> {
+    supervisor::mark_busy(store).map_err(|e| e.to_string())?;
+    if let Ok(input) = read_input(stdin) {
+        let _ = fs::remove_file(waiter_path(store, &input.session_id));
+    }
+    Ok(())
+}
+
+/// What cut a turn: an error moving to another account can fix.
+fn cut_by(input: &HookInput) -> Option<Reason> {
+    if input.hook_event_name.as_deref() != Some("StopFailure") {
+        return None;
+    }
+    match input.error.as_deref()? {
+        "rate_limit" => Some(Reason::Limit),
+        "authentication_failed" => Some(Reason::Login),
+        _ => None,
+    }
+}
+
+/// Marks the account a cut turn ran on and moves the seat off it. Returns
+/// whether it is stuck there: no other account to move to. Two sessions cut
+/// together change account once (see `auto::check_default`).
+fn handle_cut(
+    store: &Store,
+    config: &HarnessConfig,
+    config_dir: Option<OsString>,
+    reason: Reason,
+    now: SystemTime,
+) -> Result<bool, String> {
+    // Claude Code keeps a login it read for about 30 seconds: an error right
+    // after the seat changed hands may be the account that left.
+    let just_seated = config_dir.as_ref().is_none_or(|d| d.is_empty())
+        && seat::changed_at(store)
+            .and_then(|at| now.duration_since(at).ok())
+            .is_some_and(|since| since < seat::SETTLING);
+    if just_seated {
+        return Ok(false);
+    }
+    let account = session_account(store, config_dir);
+    // Known as unusable from now on, whether or not it is the default.
+    if let Some(id) = account.provider_id(store).map_err(|e| e.to_string())? {
+        let marked = match reason {
+            Reason::Login => limits::mark_refused(store, &account, &id, now),
+            _ => limits::mark_limited(store, &account, &id, now),
+        };
+        marked.map_err(|e| e.to_string())?;
+    }
+    auto::check_default(
+        store,
+        Harness::Claude,
+        config,
+        now,
+        Some(reason),
+        Some(&account.label),
+    )?;
+    let current = store.current(Harness::Claude)?;
+    let statuses = auto::statuses(store, Harness::Claude, config)?;
+    Ok(current.label == account.label
+        && !auto::has_destination(&statuses, &current.label, config, now))
 }
 
 pub fn stop(
@@ -105,29 +175,131 @@ pub fn stop(
     now: SystemTime,
 ) -> Result<(), String> {
     let input = read_input(stdin)?;
-    let rate_limited = input.hook_event_name.as_deref() == Some("StopFailure")
-        && input.error.as_deref() == Some("rate_limit");
-    // Claude Code keeps a login it read for about 30 seconds: an error right
-    // after the seat changed hands may be the account that left.
-    let just_seated = config_dir.as_ref().is_none_or(|d| d.is_empty())
-        && seat::changed_at(store)
-            .and_then(|at| now.duration_since(at).ok())
-            .is_some_and(|since| since < seat::SETTLING);
-    if rate_limited && !just_seated {
-        let account = session_account(store, config_dir);
-        // Known as full from now on, whether or not it is the default.
-        if let Some(id) = account.provider_id(store).map_err(|e| e.to_string())? {
-            limits::mark_limited(store, &account, &id, now).map_err(|e| e.to_string())?;
-        }
-        auto::check_default(
-            store,
-            Harness::Claude,
-            config,
-            now,
-            Some(Reason::Limit),
-            Some(&account.label),
-        )?;
+    if let Some(reason) = cut_by(&input)
+        && handle_cut(store, config, config_dir, reason, now)?
+    {
+        // Claude Code writes it to the terminal: a desktop notification.
+        let text =
+            "hats: no other account can take over; this session goes on by itself when one is free";
+        let sequence = format!("\u{1b}]9;{text}\u{7}\u{1b}]777;notify;hats;{text}\u{7}");
+        println!("{}", serde_json::json!({ "terminalSequence": sequence }));
     }
     let turn = supervisor::Turn::new(input.session_id, input.transcript_path, now);
     supervisor::mark_idle(store, &turn).map_err(|e| e.to_string())
+}
+
+fn waiter_path(store: &Store, session: &str) -> PathBuf {
+    // Session ids are UUIDs; anything else must not name a path.
+    let name: String = session
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    store.state.join("revive").join(name)
+}
+
+/// The waiter of `session`: this process, unless one still running already
+/// waits for it. Files of waiters that are gone are removed.
+fn claim(path: &Path) -> Result<bool, String> {
+    let me = std::process::id();
+    let dir = path.parent().expect("in revive/");
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        if waiter(&entry.path()).is_some_and(|pid| !process::alive(pid)) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    if waiter(path).is_some_and(|pid| pid != me && process::alive(pid)) {
+        return Ok(false);
+    }
+    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension(format!("{me}.tmp"));
+    fs::write(&tmp, me.to_string()).map_err(|e| e.to_string())?;
+    fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+    // Two waiters started together: the last rename wins.
+    Ok(waiter(path) == Some(me))
+}
+
+/// The pid in a waiter's file.
+fn waiter(path: &Path) -> Option<u32> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// `StopFailure` with `asyncRewake`: once the session cut by a rate limit or
+/// a refused login has a working account, the words that wake it (Claude Code
+/// shows them to the agent); `None` when it is not to be woken.
+pub fn revive(
+    store: &Store,
+    config_dir: Option<OsString>,
+    stdin: impl Read,
+) -> Result<Option<String>, String> {
+    let input = read_input(stdin)?;
+    let Some(reason) = cut_by(&input) else {
+        return Ok(None);
+    };
+    let config = Config::load(&store.config)?;
+    handle_cut(
+        store,
+        &config.claude,
+        config_dir.clone(),
+        reason,
+        SystemTime::now(),
+    )?;
+    let path = waiter_path(store, &input.session_id);
+    if !claim(&path)? {
+        return Ok(None);
+    }
+    // Claude Code runs the hook through `sh -c`, which may exec it or not:
+    // Claude Code is the parent or the one above. When either changes, it is
+    // gone (measured on 2.1.316: `/exit` ends the hook, `kill -9` leaves it
+    // running under the orphaned shell).
+    let ancestors = || {
+        let parent = std::os::unix::process::parent_id();
+        (parent, process::parent(parent))
+    };
+    let claude = ancestors();
+    let in_seat = config_dir.as_ref().is_none_or(|d| d.is_empty());
+    loop {
+        std::thread::sleep(REVIVE_EVERY);
+        if waiter(&path) != Some(std::process::id()) {
+            // A prompt took over.
+            return Ok(None);
+        }
+        if ancestors() != claude {
+            let _ = fs::remove_file(&path);
+            return Ok(None);
+        }
+        let now = SystemTime::now();
+        let config = Config::load(&store.config)?;
+        // Nothing else may run while every session is stopped: this asks for
+        // the limits, and moves the seat once an account has room.
+        if poll::due(store, now) {
+            poll::poll(store, &config.claude, now);
+        } else {
+            let _ = auto::check_default(store, Harness::Claude, &config.claude, now, None, None);
+        }
+        let account = if in_seat {
+            seat::current(store)
+        } else {
+            session_account(store, config_dir.clone())
+        };
+        let usable = auto::statuses(store, Harness::Claude, &config.claude)?
+            .iter()
+            .find(|s| s.account.label == account.label)
+            .is_some_and(|s| {
+                s.id.is_some() && !s.login_refused() && s.used(now).is_none_or(|u| u < 100.0)
+            });
+        let settled = seat::changed_at(store)
+            .and_then(|at| now.duration_since(at).ok())
+            .is_none_or(|since| since >= seat::SETTLING);
+        if usable && settled {
+            let _ = fs::remove_file(&path);
+            let why = match reason {
+                Reason::Login => "the provider refused the login of the account it ran on",
+                _ => "the account it ran on hit its limit",
+            };
+            return Ok(Some(format!(
+                "hats: this session stopped because {why}; it now runs on '{}'. Continue the task where it stopped.",
+                account.label
+            )));
+        }
+    }
 }

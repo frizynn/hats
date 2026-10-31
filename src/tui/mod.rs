@@ -54,12 +54,18 @@ pub fn run(store: &Store) -> Result<(), String> {
     result.map_err(|e| e.to_string())
 }
 
+/// Wakes the loop of `poll_while_open` before its minute is up.
+static POLL_NOW: std::sync::OnceLock<std::sync::mpsc::Sender<()>> = std::sync::OnceLock::new();
+
 /// Asks for the accounts' limits now and every minute while the view is
-/// open; the view redraws when they land in `limits.json`.
+/// open, and at once after `poll_now`; the view redraws when they land in
+/// `limits.json`.
 fn poll_while_open() {
     let Ok(me) = std::env::current_exe() else {
         return;
     };
+    let (now, asked) = std::sync::mpsc::channel();
+    let _ = POLL_NOW.set(now);
     std::thread::spawn(move || {
         loop {
             let _ = Command::new(&me)
@@ -68,9 +74,17 @@ fn poll_while_open() {
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status();
-            std::thread::sleep(crate::poll::EVERY);
+            let _ = asked.recv_timeout(crate::poll::EVERY);
         }
     });
+}
+
+/// Reads the limits now, as a new login wants: it shows at once whether the
+/// provider takes it. Nothing while the view does not poll (tests).
+fn poll_now() {
+    if let Some(now) = POLL_NOW.get() {
+        let _ = now.send(());
+    }
 }
 
 fn event_loop(app: &mut App, screen: &mut Screen) -> io::Result<()> {

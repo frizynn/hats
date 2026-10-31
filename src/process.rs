@@ -32,6 +32,11 @@ fn bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
 }
 
 #[cfg(target_os = "macos")]
+pub fn parent(pid: u32) -> Option<u32> {
+    bsd_info(pid).map(|info| info.pbi_ppid)
+}
+
+#[cfg(target_os = "macos")]
 pub fn children(pid: u32) -> Vec<u32> {
     let mut pids = [0 as libc::pid_t; 256];
     // SAFETY: the kernel writes at most the buffer's size in bytes and
@@ -115,6 +120,18 @@ pub fn started(pid: u32) -> Option<SystemTime> {
     let info = bsd_info(pid)?;
     let since = std::time::Duration::new(info.pbi_start_tvsec, info.pbi_start_tvusec as u32 * 1000);
     std::time::UNIX_EPOCH.checked_add(since)
+}
+
+#[cfg(target_os = "linux")]
+pub fn parent(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // After the name, in parentheses: the state, then the parent.
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
 }
 
 /// Each thread lists the children it started.

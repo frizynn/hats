@@ -397,3 +397,26 @@ fn auto_switching_never_moves_to_an_expired_login() {
     let auto = sb.ok(&["auto"]);
     assert!(auto.contains("Nothing to move to"), "{auto}");
 }
+
+#[test]
+fn a_login_signed_in_again_during_a_poll_is_not_marked_expired() {
+    let sb = Sandbox::new();
+    sb.signed_in("work", "org-work");
+    sb.signed_in("side", "org-side");
+    sb.ok(&["use", "work"]);
+    sb.provider_says("token-org-work", 10.0, 10.0);
+    expire(&sb, "side");
+    renewal_answers(&sb, Some(400));
+    // `hats login side` lands while the provider refuses the old login.
+    let fresh = sb.claude_dir("side").join(".credentials.json");
+    common::write_program(
+        &sb.home.join("provider/during-renewal"),
+        &format!(
+            "#!/bin/sh\nprintf '{{\"claudeAiOauth\":{{\"accessToken\":\"token-org-side\",\"expiresAt\":4102444800000}}}}' > '{}'\n",
+            fresh.display()
+        ),
+    );
+
+    sb.poll();
+    assert_eq!(listed(&sb, "side")["loginRefused"], false);
+}

@@ -64,9 +64,28 @@ fn installs_hooks_chained_status_line_and_shell_functions() {
             .unwrap()
             .ends_with("hook session-start")
     );
-    for event in ["UserPromptSubmit", "Stop", "StopFailure"] {
+    for event in ["UserPromptSubmit", "Stop"] {
         assert_eq!(v["hooks"][event].as_array().unwrap().len(), 1, "{event}");
     }
+    // The turn's end, and the waiter that wakes a cut session.
+    let failure = v["hooks"]["StopFailure"].as_array().unwrap();
+    assert_eq!(failure.len(), 2);
+    assert!(
+        failure[0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with("hook stop")
+    );
+    let revive = &failure[1];
+    assert_eq!(revive["matcher"], "rate_limit|authentication_failed");
+    assert!(
+        revive["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with("hook revive")
+    );
+    assert_eq!(revive["hooks"][0]["asyncRewake"], true);
+    assert_eq!(revive["hooks"][0]["timeout"], 86_400);
     let status = v["statusLine"]["command"].as_str().unwrap();
     assert!(
         status.ends_with("statusline -- /bin/sh -c 'bun /opt/demo/status.ts | head -1'"),
@@ -318,14 +337,20 @@ fn setup_from_a_moved_binary_updates_its_entries() {
 
     let v = json(&settings);
     let quoted = format!("'{}'", moved.display());
-    for event in ["SessionStart", "UserPromptSubmit", "Stop", "StopFailure"] {
+    for (event, args) in [
+        ("SessionStart", "hook session-start"),
+        ("UserPromptSubmit", "hook prompt"),
+        ("Stop", "hook stop"),
+        ("StopFailure", "hook stop"),
+        ("StopFailure", "hook revive"),
+    ] {
         let commands: Vec<&str> = v["hooks"][event]
             .as_array()
             .unwrap()
             .iter()
             .flat_map(|g| g["hooks"].as_array().unwrap())
             .map(|h| h["command"].as_str().unwrap())
-            .filter(|c| c.contains("hats"))
+            .filter(|c| c.contains("hats") && c.ends_with(args))
             .collect();
         assert_eq!(commands.len(), 1, "{event}: {commands:?}");
         assert!(commands[0].starts_with(&quoted), "{event}: {commands:?}");

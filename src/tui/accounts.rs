@@ -294,11 +294,13 @@ impl App<'_> {
                     .find(|s| s.account.label == *label && s.id.is_some())
                     .map(|s| (s.account.clone(), s.id.clone(), s.login_refused()));
                 if let Some((account, Some(id), refused)) = signed_in {
-                    // A new login; the next poll says whether the provider takes it.
+                    // A new login: no longer the refused one, and a poll now
+                    // says whether the provider takes it.
                     if refused {
                         let _ = limits::clear_refused(self.store, &account, &id);
                         self.reload();
                     }
+                    super::poll_now();
                     self.info(format!("'{label}' is signed in."));
                 } else {
                     self.fail(format!("'{label}' is still not signed in."));

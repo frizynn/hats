@@ -16,6 +16,8 @@ pub enum Reason {
     Limit,
     /// The user disabled the account in use.
     Disabled,
+    /// The provider refused the login of the account in use.
+    Login,
 }
 
 /// A candidate must sit this many points under the threshold, so two accounts

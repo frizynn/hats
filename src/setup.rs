@@ -2,8 +2,9 @@
 //! makes hats work without a resident process:
 //!
 //! - in `~/.claude/settings.json` (shared by every account): the
-//!   `SessionStart`, `UserPromptSubmit`, `Stop` and `StopFailure` hooks, and
-//!   the status line wrapper chained to the status line the user already has;
+//!   `SessionStart`, `UserPromptSubmit`, `Stop` and `StopFailure` hooks, the
+//!   `StopFailure` hook that wakes a cut session (see `hook::revive`), and the
+//!   status line wrapper chained to the status line the user already has;
 //! - in the shell's startup file: `claude` and `codex` functions that start
 //!   through `hats run`.
 //!
@@ -25,13 +26,65 @@ use crate::store::Store;
 const RC_START: &str = "# >>> hats >>>";
 const RC_END: &str = "# <<< hats <<<";
 const BACKUP_TAG: &str = "hats-backup-";
-/// What each hook runs after the binary: `'<path>/hats' hook stop`.
-const HOOKS: [(&str, &str); 4] = [
-    ("SessionStart", "hook session-start"),
-    ("UserPromptSubmit", "hook prompt"),
-    ("Stop", "hook stop"),
-    ("StopFailure", "hook stop"),
+/// One hook setup installs.
+struct Hook {
+    event: &'static str,
+    /// What it runs after the binary: `'<path>/hats' hook stop`.
+    args: &'static str,
+    /// Only for these `error`s, run in the background, woken on exit 2.
+    rewake: Option<&'static str>,
+}
+
+const HOOKS: [Hook; 5] = [
+    Hook {
+        event: "SessionStart",
+        args: "hook session-start",
+        rewake: None,
+    },
+    Hook {
+        event: "UserPromptSubmit",
+        args: "hook prompt",
+        rewake: None,
+    },
+    Hook {
+        event: "Stop",
+        args: "hook stop",
+        rewake: None,
+    },
+    Hook {
+        event: "StopFailure",
+        args: "hook stop",
+        rewake: None,
+    },
+    Hook {
+        event: "StopFailure",
+        args: "hook revive",
+        rewake: Some("rate_limit|authentication_failed"),
+    },
 ];
+
+/// How long a cut session may wait for an account: Claude Code ends an
+/// `asyncRewake` hook after its `timeout`. A day covers a 5-hour window and
+/// most of a weekly one.
+const REVIVE_TIMEOUT_SECS: u64 = 24 * 3600;
+
+impl Hook {
+    /// The group setup writes for it in `settings.json`.
+    fn group(&self, command: &str) -> Value {
+        match self.rewake {
+            None => json!({ "hooks": [{ "type": "command", "command": command }] }),
+            Some(errors) => json!({
+                "matcher": errors,
+                "hooks": [{
+                    "type": "command",
+                    "command": command,
+                    "asyncRewake": true,
+                    "timeout": REVIVE_TIMEOUT_SECS,
+                }],
+            }),
+        }
+    }
+}
 
 struct Plan {
     settings_path: PathBuf,
@@ -273,8 +326,10 @@ fn plan_install(store: &Store, exe: &str) -> Result<Plan, String> {
     let hooks_map = hooks_value
         .as_object_mut()
         .ok_or("settings.json: \"hooks\" is not an object")?;
-    for (event, args) in HOOKS {
+    for hook in &HOOKS {
+        let (event, args) = (hook.event, hook.args);
         let command = format!("{} {args}", shell_quote(exe));
+        let group = hook.group(&command);
         let groups = hooks_map.entry(event).or_insert_with(|| json!([]));
         let groups = groups
             .as_array_mut()
@@ -282,10 +337,10 @@ fn plan_install(store: &Store, exe: &str) -> Result<Plan, String> {
         // Replaces hooks from an earlier setup, even of a binary that moved.
         let mut updated = groups.clone();
         let removed = remove_hooks(&mut updated, args);
-        if removed == [command.as_str()] {
+        if removed == [command.as_str()] && groups.contains(&group) {
             continue;
         }
-        updated.push(json!({ "hooks": [{ "type": "command", "command": command }] }));
+        updated.push(group);
         *groups = updated;
         changes.push(match removed.first() {
             None => format!("{shown}: add {event} hook `{command}`"),
@@ -372,7 +427,7 @@ fn plan_undo(store: &Store) -> Result<Plan, String> {
         .ok_or("settings.json is not a JSON object")?;
 
     if let Some(Value::Object(hooks_map)) = root.get_mut("hooks") {
-        for (event, args) in HOOKS {
+        for &Hook { event, args, .. } in &HOOKS {
             let Some(Value::Array(groups)) = hooks_map.get_mut(event) else {
                 continue;
             };
