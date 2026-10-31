@@ -98,7 +98,7 @@ mark and bold only.
 ```
  1 Accounts  2 Usage  3 Settings  4 Activity                  tab next · q quit
 ────────────────────────────────────────────────────────────────────────────────
- Claude Code 5   Codex 2   every session runs on ● default
+ Claude Code 6   Codex 2   every session runs on ● default
 Auto: at 90 % of either limit, it moves to the account with the most room.
     ACCOUNT  5-HOUR LIMIT               WEEKLY LIMIT               UPDATED
 ▌ ● default  ▰▰▱▱▱▱▱▱▱▱  21% 17:42      ▰▰▱▱▱▱▱▱▱▱  15% Wed 18:30  2 min ago
@@ -106,6 +106,7 @@ Auto: at 90 % of either limit, it moves to the account with the most room.
     old off  ▱▱▱▱▱▱▱▱▱▱   0%            ▰▰▰▰▰▰▰▱▱▱  71% Mon 15:30  3 days ago
     side     no data yet: appears within a minute
     spare    not signed in: press l to sign in
+    temp     login expired: press l to sign in again
     work     ▰▰▰▰▰▰▰▰▰▰ 100% 17:00      ▰▰▰▰▰▰▱▱▱▱  64% Mon 20:30  10 min ago
 ─ default ──────────────────────────────────────────────────────────────────────
  Mail         dana@example.com
@@ -437,7 +438,12 @@ same way. No credentials, no account id.
 - `cwd`: the directory `hats run` started the session in.
 
 `limits.json` holds
-`{"v":1,"accounts":[{"harness","account","label","observedAt","windows":[{"name","usedPercent","resetsAt"}],"limitedUntil"?}]}`.
+`{"v":1,"accounts":[{"harness","account","label","observedAt","windows":[{"name","usedPercent","resetsAt"}],"limitedUntil"?,"loginRefusedAt"?}]}`.
+`loginRefusedAt` (Unix seconds) says the provider refused the account's
+login the last time its limits were asked for (expired or revoked): `hats
+list` and the view show it as `login expired` until a reading works again,
+and auto switching never moves to it. A provider that fails for a while
+(network, 429, 5xx) leaves no mark.
 
 ## Migrating from claude-swap
 

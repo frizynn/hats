@@ -318,7 +318,7 @@ fn state(
 
 /// How to sign in to `s`: the key in the interactive view, the command
 /// elsewhere.
-pub fn sign_in(s: &Status, harness: Harness, hints: Hints, again: &str) -> String {
+fn sign_in(s: &Status, harness: Harness, hints: Hints, again: &str) -> String {
     match hints {
         Hints::Keys => format!("press l to sign in{again}"),
         Hints::Commands => format!("hats{} login {}", flag(harness), s.account.label),
