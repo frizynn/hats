@@ -14,7 +14,7 @@ use super::{Action, App, Child, Step, Tab};
 use crate::account::{DEFAULT_LABEL, Harness};
 use crate::auto::{self, Status};
 use crate::config;
-use crate::limits::LimitWindow;
+use crate::limits::{self, LimitWindow};
 use crate::view::{self, Tone};
 
 /// Marks the selected row, before the text.
@@ -291,8 +291,14 @@ impl App<'_> {
                 let signed_in = self.groups[self.accounts.focus]
                     .statuses
                     .iter()
-                    .any(|s| s.account.label == *label && s.id.is_some());
-                if signed_in {
+                    .find(|s| s.account.label == *label && s.id.is_some())
+                    .map(|s| (s.account.clone(), s.id.clone(), s.login_refused()));
+                if let Some((account, Some(id), refused)) = signed_in {
+                    // A new login; the next poll says whether the provider takes it.
+                    if refused {
+                        let _ = limits::clear_refused(self.store, &account, &id);
+                        self.reload();
+                    }
                     self.info(format!("'{label}' is signed in."));
                 } else {
                     self.fail(format!("'{label}' is still not signed in."));
@@ -466,6 +472,18 @@ impl App<'_> {
                 Line::raw(super::tilde(self.store, &s.account.dir)),
             ),
         ];
+        if let Some(at) = s.reading.as_ref().and_then(|r| r.login_refused_at) {
+            rows.push((
+                "Login",
+                Line::styled(
+                    format!(
+                        "expired: the provider refused it at {} · press l to sign in again",
+                        view::clock(at, now)
+                    ),
+                    self.theme.fg(Color::Red),
+                ),
+            ));
+        }
         let reading = s.reading.as_ref();
         let windows = reading.map(|r| r.windows.as_slice()).unwrap_or_default();
         let resets: Vec<String> = [("five_hour", "5-hour"), ("seven_day", "weekly")]
@@ -483,7 +501,8 @@ impl App<'_> {
                 (true, false) => resets.join(" · "),
             }),
         ));
-        if let Some(r) = reading {
+        // Only numbers have an age; a refusal or a limit error alone has none.
+        if let Some(r) = reading.filter(|r| !r.windows.is_empty()) {
             rows.push(("Updated", Line::raw(view::age(r, now))));
         }
         let off = self.is_off(&s.account.label);
@@ -512,7 +531,8 @@ impl App<'_> {
             .into_iter()
             .map(|(name, value)| {
                 let mut spans = vec![Span::styled(format!(" {name:<13}"), self.dim())];
-                spans.extend(value.spans);
+                // The value's own color, such as the red of an expired login.
+                spans.extend(value.spans.into_iter().map(|s| s.patch_style(value.style)));
                 Line::from(spans)
             })
             .collect();

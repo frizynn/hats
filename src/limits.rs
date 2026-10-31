@@ -12,6 +12,10 @@
 //! `limitedUntil` (Unix seconds), when present, says a turn of that account
 //! ended with a rate limit error: it counts as full until then, or until its
 //! status line reports other numbers.
+//!
+//! `loginRefusedAt` (Unix seconds), when present, says the provider refused
+//! the account's login when its limits were last asked for (expired or
+//! revoked): it has to sign in again. The next reading that works clears it.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -59,6 +63,8 @@ pub struct Reading {
     pub limited_until: Option<i64>,
     /// The plan the reading names (Codex only), such as `Pro`.
     pub plan: Option<String>,
+    /// Unix seconds when the provider refused the login, until a reading works.
+    pub login_refused_at: Option<i64>,
 }
 
 impl Reading {
@@ -108,6 +114,12 @@ struct AccountLimits {
         skip_serializing_if = "Option::is_none"
     )]
     limited_until: Option<i64>,
+    #[serde(
+        rename = "loginRefusedAt",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    login_refused_at: Option<i64>,
 }
 
 impl AccountLimits {
@@ -119,6 +131,7 @@ impl AccountLimits {
             observed_at,
             windows,
             limited_until: None,
+            login_refused_at: None,
         }
     }
 }
@@ -146,15 +159,16 @@ pub fn claude_readings(store: &Store) -> HashMap<String, Reading> {
                 windows: a.windows,
                 limited_until: a.limited_until,
                 plan: None,
+                login_refused_at: a.login_refused_at,
             };
             (a.account, reading)
         })
         .collect()
 }
 
-/// Stores the reading of one account. Numbers that differ from the stored
-/// ones replace what a rate limit error taught; the same numbers only say
-/// they are still current.
+/// Stores the reading of one account, which also says its login works.
+/// Numbers that differ from the stored ones replace what a rate limit error
+/// taught; the same numbers only say they are still current.
 pub fn save(
     store: &Store,
     account: &Account,
@@ -165,7 +179,8 @@ pub fn save(
     let observed_at = unix_millis(now);
     update(store, account.harness, id, |entry| match entry {
         Some(old) if old.windows == windows && old.label == account.label => {
-            if observed_at < old.observed_at + REFRESH.as_millis() as u64 {
+            let refused = old.login_refused_at.take().is_some();
+            if !refused && observed_at < old.observed_at + REFRESH.as_millis() as u64 {
                 return false;
             }
             old.observed_at = observed_at;
@@ -215,6 +230,30 @@ pub fn mark_limited(store: &Store, account: &Account, id: &str, now: SystemTime)
             .max();
         entry.limited_until = Some(full_until.unwrap_or(now_secs + LIMIT_HOLD.as_secs() as i64));
         true
+    })
+}
+
+/// The provider refused the account's login: it shows as expired, and auto
+/// switching leaves it alone, until a reading works again. Keeps the first
+/// refusal's time.
+pub fn mark_refused(store: &Store, account: &Account, id: &str, now: SystemTime) -> io::Result<()> {
+    update(store, account.harness, id, |entry| {
+        let entry = entry
+            .get_or_insert_with(|| AccountLimits::new(account, id, unix_millis(now), Vec::new()));
+        if entry.login_refused_at.is_some() {
+            return false;
+        }
+        entry.login_refused_at = Some(unix_secs(now));
+        true
+    })
+}
+
+/// The account signed in again: its login is no longer the refused one.
+pub fn clear_refused(store: &Store, account: &Account, id: &str) -> io::Result<()> {
+    update(store, account.harness, id, |entry| {
+        entry
+            .as_mut()
+            .is_some_and(|e| e.login_refused_at.take().is_some())
     })
 }
 
@@ -325,6 +364,7 @@ pub fn codex_reading(sessions: &Path) -> io::Result<Option<Reading>> {
             windows,
             limited_until: None,
             plan,
+            login_refused_at: None,
         }));
     }
     Ok(None)

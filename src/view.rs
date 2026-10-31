@@ -271,20 +271,17 @@ fn state(
     hints: Hints,
 ) -> Row {
     let Some(_) = &s.id else {
-        let how = match hints {
-            Hints::Keys => "press l to sign in".to_owned(),
-            Hints::Commands => format!(
-                "hats{} login {}",
-                if harness == Harness::Codex {
-                    " --codex"
-                } else {
-                    ""
-                },
-                s.account.label
-            ),
-        };
-        return vec![cell(format!("not signed in: {how}"), Tone::Warn)];
+        return vec![cell(
+            format!("not signed in: {}", sign_in(s, harness, hints, "")),
+            Tone::Warn,
+        )];
     };
+    if s.login_refused() {
+        return vec![cell(
+            format!("login expired: {}", sign_in(s, harness, hints, " again")),
+            Tone::Bad,
+        )];
+    }
     let Some(r) = s.reading.as_ref().filter(|_| s.used(now).is_some()) else {
         return vec![cell("no data yet: appears within a minute", Tone::Dim)];
     };
@@ -317,6 +314,15 @@ fn state(
         if stale { Tone::Dim } else { Tone::Plain },
     ));
     row
+}
+
+/// How to sign in to `s`: the key in the interactive view, the command
+/// elsewhere.
+fn sign_in(s: &Status, harness: Harness, hints: Hints, again: &str) -> String {
+    match hints {
+        Hints::Keys => format!("press l to sign in{again}"),
+        Hints::Commands => format!("hats{} login {}", flag(harness), s.account.label),
+    }
 }
 
 fn window(w: &LimitWindow, bar_cells: usize, threshold: u8, stale: bool, now: SystemTime) -> Row {
@@ -517,7 +523,7 @@ pub fn chosen(harness: Harness, label: &str) -> String {
 /// Why auto mode cannot move off `current`.
 pub fn stuck(current: &str) -> String {
     format!(
-        "Nothing to move to: every other account is disabled or not signed in, so it stays in '{current}'."
+        "Nothing to move to: every other account is disabled, not signed in or its login expired, so it stays in '{current}'."
     )
 }
 

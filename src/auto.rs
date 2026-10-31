@@ -29,10 +29,18 @@ impl Status {
             .map(|r| r.binding_used(now))
     }
 
+    /// Whether the provider refused its login: it has to sign in again.
+    pub fn login_refused(&self) -> bool {
+        self.reading
+            .as_ref()
+            .is_some_and(|r| r.login_refused_at.is_some())
+    }
+
     fn candidate(&self, now: SystemTime) -> Candidate {
         Candidate {
             label: self.account.label.clone(),
-            logged_in: self.id.is_some(),
+            // A refused login would leave every session without one.
+            logged_in: self.id.is_some() && !self.login_refused(),
             used: self.used(now),
         }
     }
@@ -95,7 +103,7 @@ pub fn statuses(
 }
 
 /// Whether auto switching has an account to move to from `from`: one signed
-/// in and not turned off, whatever its room.
+/// in with a login the provider takes and not turned off, whatever its room.
 pub fn has_destination(
     statuses: &[Status],
     from: &str,

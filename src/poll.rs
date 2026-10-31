@@ -50,13 +50,41 @@ pub fn due(store: &Store, now: SystemTime) -> bool {
         .is_none_or(|age| age >= EVERY)
 }
 
+/// Makes the next `due` true: a new login wants its limits read at once.
+pub fn ask_soon(store: &Store) {
+    let _ = std::fs::remove_file(store.state.join(POLLED));
+}
+
 pub fn offline() -> bool {
     std::env::var_os("HATS_OFFLINE").is_some_and(|v| !v.is_empty())
 }
 
+/// Why an account's limits could not be read.
+enum Failed {
+    /// The provider refused the login: it expired or was revoked, and only
+    /// signing in again helps. Kept with the account's limits.
+    Refused(String),
+    /// Anything else (network, timeouts, the provider busy): the next poll
+    /// tries again, and nothing is kept.
+    Other(String),
+}
+
+impl From<String> for Failed {
+    fn from(why: String) -> Self {
+        Self::Other(why)
+    }
+}
+
+impl From<&str> for Failed {
+    fn from(why: &str) -> Self {
+        Self::Other(why.to_owned())
+    }
+}
+
 /// Asks for every signed-in account's limits at once, stores them, and lets
 /// auto switching act on them. Returns the accounts that could not be read,
-/// with why.
+/// with why. A refused login is kept with the account's limits (see
+/// `limits::mark_refused`).
 pub fn poll(store: &Store, config: &HarnessConfig, now: SystemTime) -> Vec<(String, String)> {
     if offline() {
         return Vec::new();
@@ -79,14 +107,20 @@ pub fn poll(store: &Store, config: &HarnessConfig, now: SystemTime) -> Vec<(Stri
             .iter()
             .map(|(account, id)| {
                 let seated = seat_id.as_deref() == Some(id.as_str());
-                scope.spawn(move || read_one(store, account, id, seated, now))
+                scope.spawn(move || {
+                    let result = read_one(store, account, id, seated, now);
+                    if let Err(Failed::Refused(_)) = &result {
+                        let _ = limits::mark_refused(store, account, id, now);
+                    }
+                    result
+                })
             })
             .collect();
         handles
             .into_iter()
             .zip(&accounts)
             .map(|(h, (account, _))| {
-                let result = h.join().unwrap_or_else(|_| Err("crashed".to_owned()));
+                let result = h.join().unwrap_or_else(|_| Err("crashed".into()));
                 (account.label.clone(), result)
             })
             .collect()
@@ -94,7 +128,10 @@ pub fn poll(store: &Store, config: &HarnessConfig, now: SystemTime) -> Vec<(Stri
     let _ = auto::check_default(store, Harness::Claude, config, now, None, None);
     results
         .into_iter()
-        .filter_map(|(label, r)| r.err().map(|e| (label, e)))
+        .filter_map(|(label, r)| match r {
+            Ok(()) => None,
+            Err(Failed::Refused(why) | Failed::Other(why)) => Some((label, why)),
+        })
         .collect()
 }
 
@@ -104,7 +141,7 @@ fn read_one(
     id: &str,
     seated: bool,
     now: SystemTime,
-) -> Result<(), String> {
+) -> Result<(), Failed> {
     // The seat holds the live login of the account sitting in it; its own
     // directory has an older copy.
     let source = if seated {
@@ -117,13 +154,13 @@ fn read_one(
         .ok_or("no stored login")?;
     if expired(&login, now) {
         if seated {
-            return Err("its token expired; Claude Code renews it on its next request".to_owned());
+            return Err("its token expired; Claude Code renews it on its next request".into());
         }
         login = renew(store, account, now)?;
     }
     let token = login["accessToken"].as_str().ok_or("no access token")?;
     let windows = usage(token)?;
-    limits::save(store, account, id, windows, now).map_err(|e| e.to_string())
+    limits::save(store, account, id, windows, now).map_err(|e| e.to_string().into())
 }
 
 fn expired(login: &Value, now: SystemTime) -> bool {
@@ -144,15 +181,17 @@ struct UsageWindow {
     resets_at: Option<String>,
 }
 
-fn usage(token: &str) -> Result<Vec<LimitWindow>, String> {
+fn usage(token: &str) -> Result<Vec<LimitWindow>, Failed> {
     let (status, body) = curl(&format!(
         "url = \"{USAGE_URL}\"\nheader = \"Authorization: Bearer {token}\"\nheader = \"anthropic-beta: {BETA}\"\n"
     ))?;
     if status == 401 {
-        return Err("the provider refused its login; sign in again with `hats login`".to_owned());
+        return Err(Failed::Refused(
+            "the provider refused its login; sign in again with `hats login`".to_owned(),
+        ));
     }
     if status != 200 {
-        return Err(format!("the provider answered {status}"));
+        return Err(format!("the provider answered {status}").into());
     }
     let usage: Usage = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
     Ok([
@@ -174,7 +213,7 @@ fn usage(token: &str) -> Result<Vec<LimitWindow>, String> {
 /// A new token for a parked login, saved back before it is used. Under the
 /// directory's refresh locks the login is read again: another refresh may
 /// have run meanwhile.
-fn renew(store: &Store, account: &Account, now: SystemTime) -> Result<Value, String> {
+fn renew(store: &Store, account: &Account, now: SystemTime) -> Result<Value, Failed> {
     let _refresh = Lock::take(account.dir.join(".oauth_refresh.lock"), seat::REFRESH_STALE)?;
     let _legacy = Lock::take(
         seat::with_suffix(&account.dir, ".lock"),
@@ -183,7 +222,7 @@ fn renew(store: &Store, account: &Account, now: SystemTime) -> Result<Value, Str
     // It may have taken the seat while this waited: a renewal now would
     // rotate the refresh token the seat's copy holds.
     if seat::current(store).label == account.label {
-        return Err("its token expired; Claude Code renews it on its next request".to_owned());
+        return Err("its token expired; Claude Code renews it on its next request".into());
     }
     let mut login = secret::login(store, account)
         .map_err(|e| e.to_string())?
@@ -202,12 +241,15 @@ fn renew(store: &Store, account: &Account, now: SystemTime) -> Result<Value, Str
         "url = \"{TOKEN_URL}\"\nheader = \"Content-Type: application/json\"\ndata-binary = \"{}\"\n",
         body.replace('\\', "\\\\").replace('"', "\\\"")
     ))?;
+    // OAuth answers an expired or revoked refresh token with 400
+    // (`invalid_grant`); 429 and the 5xx pass.
+    if matches!(status, 400 | 401) {
+        return Err(Failed::Refused(
+            "its login expired; sign in again with `hats login`".to_owned(),
+        ));
+    }
     if status != 200 {
-        return Err(if (400..500).contains(&status) {
-            "its login expired; sign in again with `hats login`".to_owned()
-        } else {
-            format!("the provider answered {status} to renew its token")
-        });
+        return Err(format!("the provider answered {status} to renew its token").into());
     }
     let answer: Value = serde_json::from_slice(&answer).map_err(|e| e.to_string())?;
     let access = answer["access_token"].as_str().ok_or("no access token")?;

@@ -296,3 +296,104 @@ fn signing_in_again_to_the_account_in_use_survives_the_next_change() {
     let parked = read_json(&sb.claude_dir("work").join(".credentials.json"));
     assert_eq!(parked["claudeAiOauth"]["accessToken"], "token-org-work");
 }
+
+/// `label`'s parked login, expired, so the next poll has to renew it.
+fn expire(sb: &Sandbox, label: &str) {
+    fs::write(
+        sb.claude_dir(label).join(".credentials.json"),
+        format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"old-{label}","refreshToken":"refresh-{label}","expiresAt":1000}}}}"#
+        ),
+    )
+    .unwrap();
+}
+
+fn renewal_answers(sb: &Sandbox, status: Option<u16>) {
+    let path = sb.home.join("provider/renewal-status");
+    match status {
+        Some(status) => fs::write(path, status.to_string()).unwrap(),
+        None => fs::remove_file(path).unwrap(),
+    }
+}
+
+#[test]
+fn a_login_the_provider_refuses_shows_in_list_until_it_works_again() {
+    let sb = Sandbox::new();
+    sb.signed_in("work", "org-work");
+    sb.signed_in("side", "org-side");
+    sb.ok(&["use", "work"]);
+    sb.provider_says("token-org-work", 10.0, 10.0);
+    sb.provider_says("token-org-side", 0.0, 0.0);
+    common::assert_success(&sb.poll(), &["poll"]);
+
+    expire(&sb, "side");
+    renewal_answers(&sb, Some(400));
+    sb.poll();
+    let list = sb.ok(&["list"]);
+    let row = list.lines().find(|l| l.contains("side")).unwrap();
+    assert!(row.contains("login expired: hats login side"), "{list}");
+    assert!(!row.contains('%'), "no old numbers on it: {row}");
+    assert_eq!(listed(&sb, "side")["loginRefused"], true);
+    let state = fs::read_to_string(sb.home.join(".local/state/hats/limits.json")).unwrap();
+    assert!(
+        !state.contains("refresh-side") && !state.contains("old-side"),
+        "{state}"
+    );
+
+    // Signed in again: the next reading that works clears it.
+    renewal_answers(&sb, None);
+    sb.provider_says("renewed", 30.0, 5.0);
+    common::assert_success(&sb.poll(), &["poll"]);
+    let list = sb.ok(&["list"]);
+    assert!(!list.contains("expired"), "{list}");
+    assert_eq!(listed(&sb, "side")["loginRefused"], false);
+}
+
+#[test]
+fn a_provider_that_fails_for_a_while_is_no_expired_login() {
+    let sb = Sandbox::new();
+    sb.signed_in("work", "org-work");
+    sb.signed_in("side", "org-side");
+    sb.ok(&["use", "work"]);
+    sb.provider_says("token-org-work", 10.0, 10.0);
+    sb.provider_says("token-org-side", 0.0, 0.0);
+    common::assert_success(&sb.poll(), &["poll"]);
+
+    expire(&sb, "side");
+    for status in [429, 500, 503] {
+        renewal_answers(&sb, Some(status));
+        sb.poll();
+        let list = sb.ok(&["list"]);
+        assert!(!list.contains("expired"), "{status}: {list}");
+        assert_eq!(listed(&sb, "side")["loginRefused"], false);
+    }
+}
+
+#[test]
+fn auto_switching_never_moves_to_an_expired_login() {
+    let sb = Sandbox::new();
+    sb.signed_in("work", "org-work");
+    sb.signed_in("side", "org-side");
+    sb.signed_in("spare", "org-spare");
+    sb.ok(&["use", "work"]);
+    sb.provider_says("token-org-work", 50.0, 10.0);
+    sb.provider_says("token-org-side", 0.0, 0.0);
+    sb.provider_says("token-org-spare", 60.0, 0.0);
+    common::assert_success(&sb.poll(), &["poll"]);
+    // `side` reads emptiest, but its login is gone.
+    expire(&sb, "side");
+    renewal_answers(&sb, Some(400));
+    sb.poll();
+
+    sb.provider_says("token-org-work", 95.0, 10.0);
+    sb.poll();
+    assert_eq!(sb.current(), "spare");
+
+    // With `spare` off too, there is nowhere to go.
+    sb.ok(&["use", "work"]);
+    sb.ok(&["disable", "spare"]);
+    sb.poll();
+    assert_eq!(sb.current(), "work");
+    let auto = sb.ok(&["auto"]);
+    assert!(auto.contains("Nothing to move to"), "{auto}");
+}

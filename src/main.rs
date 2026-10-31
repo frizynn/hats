@@ -299,6 +299,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
             if harness == Harness::Claude && seat::current(&store).label == account.label {
                 account = seat::seat(&store);
             }
+            // The next `hats list` asks the provider, so a login it refused
+            // shows as working again.
+            poll::ask_soon(&store);
             let mut cmd = Command::new(harness.program());
             cmd.args(harness.login_args()).args(args);
             return Err(exec(cmd, &account).into());
@@ -445,7 +448,7 @@ fn enable(store: &Store, harness: Harness, label: &str, enabled: bool) -> Result
     let statuses = auto::statuses(store, harness, settings)?;
     if !auto::has_destination(&statuses, &current.label, settings, SystemTime::now()) {
         println!(
-            "Every other {} account is disabled or not signed in: auto switching has nowhere to move from '{}'.",
+            "Every other {} account is disabled, not signed in or its login expired: auto switching has nowhere to move from '{}'.",
             harness.name(),
             current.label
         );
@@ -566,6 +569,7 @@ fn list(store: &Store, json: bool) -> Result<(), Failure> {
                     "label": s.account.label,
                     "account": s.id,
                     "signedIn": s.id.is_some(),
+                    "loginRefused": s.login_refused(),
                     "enabled": !settings.disabled.contains(&s.account.label),
                     "current": current.as_deref() == Some(s.account.label.as_str()),
                     "configDir": s.account.dir,
