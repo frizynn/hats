@@ -795,9 +795,19 @@ fn remove(store: &Store, account: Account) -> Result<(), Failure> {
     Ok(())
 }
 
+/// This binary's path. After `cargo install` replaces it, Linux names the
+/// running one `<path> (deleted)`; the new one is at `<path>`.
+pub(crate) fn me() -> io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    Ok(match exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+        Some(path) => PathBuf::from(path),
+        None => exe,
+    })
+}
+
 /// `hats poll` on its own, so the status line never waits for the network.
 fn poll_in_background() {
-    let Ok(me) = std::env::current_exe() else {
+    let Ok(me) = me() else {
         return;
     };
     let mut cmd = Command::new(me);
