@@ -2,6 +2,8 @@ mod account;
 mod auto;
 mod background;
 mod config;
+mod estimate;
+mod history;
 mod hook;
 mod import;
 mod limits;
@@ -594,6 +596,9 @@ fn list(store: &Store, json: bool) -> Result<(), Failure> {
                             "observedAt": r.observed_at,
                             "windows": r.windows,
                         });
+                        if !r.gifts.is_empty() {
+                            limits["gifts"] = serde_json::json!(r.gifts);
+                        }
                         if let Some(until) = r.limited_until {
                             limits["limitedUntil"] = until.into();
                         }
@@ -611,6 +616,11 @@ fn list(store: &Store, json: bool) -> Result<(), Failure> {
             &layout,
             now,
             view::Hints::Commands,
+        )
+        .with_estimate(
+            estimate::read(store, harness, &statuses, settings, now).as_ref(),
+            width,
+            now,
         );
         for row in block.header.iter().chain(block.accounts.iter().flatten()) {
             writeln!(out, "{}", view::plain(row))?;

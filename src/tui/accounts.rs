@@ -14,6 +14,7 @@ use super::{Action, App, Child, Step, Tab};
 use crate::account::{DEFAULT_LABEL, Harness};
 use crate::auto::{self, Status};
 use crate::config;
+use crate::estimate;
 use crate::limits::{self, LimitWindow};
 use crate::view::{self, Tone};
 
@@ -333,6 +334,11 @@ impl App<'_> {
             &layout,
             now,
             view::Hints::Keys,
+        )
+        .with_estimate(
+            estimate::read(self.store, group.harness, &group.statuses, config, now).as_ref(),
+            width,
+            now,
         );
         let mut header = vec![self.harnesses()];
         // The first header line names the harness; the selector says it.
@@ -503,6 +509,35 @@ impl App<'_> {
                 (true, false) => resets.join(" · "),
             }),
         ));
+        for w in windows.iter().filter(|w| limits::is_scoped(&w.name)) {
+            let model = w.name.trim_start_matches("seven_day_");
+            let mut name = model.to_owned();
+            name[..1].make_ascii_uppercase();
+            rows.push((
+                "Model limit",
+                Line::raw(format!(
+                    "{name} weekly {} · only {name} stops there; other models go on",
+                    self::resets(w, now)
+                )),
+            ));
+        }
+        if let Some(r) = reading.filter(|r| !r.gifts.is_empty()) {
+            rows.push(("Free resets", Line::raw(gifts(&r.gifts, now))));
+        }
+        let threshold = self.config.for_harness(s.account.harness).threshold;
+        if let Some(p) = estimate::pace(s, threshold, now) {
+            let ending = match p.full_at {
+                Some(at) => format!("at that pace it fills by {}", view::clock(at, now)),
+                None => format!("at that pace it ends its week near {:.0} %", p.at_reset),
+            };
+            rows.push((
+                "Pace",
+                Line::raw(format!(
+                    "{:.1} % a day this week · {ending}",
+                    p.per_hour * 24.0
+                )),
+            ));
+        }
         // Only numbers have an age; a refusal or a limit error alone has none.
         if let Some(r) = reading.filter(|r| !r.windows.is_empty()) {
             rows.push(("Updated", Line::raw(view::age(r, now))));
@@ -588,6 +623,34 @@ impl App<'_> {
             Tone::Warn => self.theme.fg(Color::Yellow),
             Tone::Bad => self.theme.fg(Color::Red),
         }
+    }
+}
+
+/// `1 full reset left, use by Thu 10 Dec · 1 Fable reset left, use by ...`.
+fn gifts(gifts: &[limits::Gift], now: SystemTime) -> String {
+    let now_secs = limits::unix_secs(now);
+    let live: Vec<String> = gifts
+        .iter()
+        .filter(|g| g.left > 0 && (g.ends_at == 0 || g.ends_at > now_secs))
+        .map(|g| {
+            let what = if g.clears_weekly() {
+                "full reset (5-hour and weekly)"
+            } else {
+                "5-hour and Fable weekly reset"
+            };
+            let by = if g.ends_at == 0 {
+                String::new()
+            } else {
+                format!(", use by {}", view::date(g.ends_at))
+            };
+            let now = if g.usable_now { "" } else { ", not usable now" };
+            format!("{} {what}{by}{now}", g.left)
+        })
+        .collect();
+    if live.is_empty() {
+        "none left".to_owned()
+    } else {
+        live.join(" · ")
     }
 }
 

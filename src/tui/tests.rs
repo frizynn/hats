@@ -46,7 +46,7 @@ fn account(store: &Store, label: &str, used: Option<f64>) -> Account {
             resets_at: unix_secs(now) + 3600,
         };
         let windows = vec![window("five_hour", used), window("seven_day", 12.0)];
-        limits::save(store, &account, &id, windows, now).unwrap();
+        limits::save(store, &account, &id, windows, None, now).unwrap();
     }
     account
 }
@@ -191,6 +191,58 @@ fn accounts_show_one_line_each_and_the_selected_ones_details() {
     let screen = text(&mut app);
     assert!(screen.contains("No codex accounts yet"), "{screen}");
     assert!(screen.lines().last().unwrap().contains("←→ claude"));
+}
+
+#[test]
+fn a_model_limit_and_gifted_resets_show_and_outlive_the_status_line() {
+    let (_dir, store) = sandbox();
+    let work = account(&store, "work", Some(42.0));
+    let id = work.provider_id(&store).unwrap().unwrap();
+    auto::choose(&store, &work, &id, SystemTime::now()).unwrap();
+    let now = SystemTime::now();
+    let at = |hours: i64| unix_secs(now) + hours * 3600;
+    let window = |name: &str, used_percent, resets_at| LimitWindow {
+        name: name.to_owned(),
+        used_percent,
+        resets_at,
+    };
+    let gift = limits::Gift {
+        label: "One full limit reset".to_owned(),
+        left: 1,
+        total: 1,
+        ends_at: at(24 * 20),
+        clears: vec!["five_hour".to_owned(), "seven_day".to_owned()],
+        usable_now: true,
+    };
+    // What a poll reads from the provider.
+    let polled = vec![
+        window("five_hour", 42.0, at(1)),
+        window("seven_day", 50.0, at(24 * 3)),
+        window("seven_day_fable", 99.0, at(24 * 3)),
+    ];
+    limits::save(&store, &work, &id, polled, Some(vec![gift]), now).unwrap();
+    // The status line knows only two windows and no gifts.
+    let repaint = vec![
+        window("five_hour", 43.0, at(1)),
+        window("seven_day", 50.0, at(24 * 3)),
+    ];
+    limits::save(&store, &work, &id, repaint, None, now).unwrap();
+
+    let mut app = App::new(&store, DARK);
+    let screen = text_at(&mut app, 160, 30);
+    assert!(line_with(&screen, "ACCOUNT").contains("FABLE"), "{screen}");
+    assert!(line_with(&screen, "▌ ● work").contains(" 99%"), "{screen}");
+    assert!(line_with(&screen, "Model limit").contains("Fable weekly 99 % until"));
+    assert!(line_with(&screen, "Free resets").contains("1 full reset (5-hour and weekly), use by"));
+    assert!(
+        line_with(&screen, "Pace").contains("% a day this week"),
+        "{screen}"
+    );
+    assert!(screen.contains("Estimate: spends about"), "{screen}");
+    // A full Fable limit alone does not count the account as full.
+    let statuses = auto::statuses(&store, Harness::Claude, &config(&store).claude).unwrap();
+    let work = statuses.iter().find(|s| s.account.label == "work").unwrap();
+    assert_eq!(work.used(now), Some(50.0));
 }
 
 #[test]

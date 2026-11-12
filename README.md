@@ -409,6 +409,7 @@ The Settings tab of the view changes the same keys in place.
 | Registry of account changes | `$XDG_STATE_HOME/hats/switches.jsonl` (default `~/.local/state/hats`), or `$HATS_STATE_DIR` | 0600 |
 | Sessions closed for going unused | `$XDG_STATE_HOME/hats/closes.jsonl` | 0600 |
 | Last limits per account | `$XDG_STATE_HOME/hats/limits.json` | 0600 |
+| Weekly use over time, for the estimate | `$XDG_STATE_HOME/hats/history.jsonl` | 0600 |
 | Current account per harness | `$XDG_STATE_HOME/hats/current-claude`, `current-codex` | |
 | What each `hats run` parent is told by the hooks | `$XDG_STATE_HOME/hats/run/<pid>/`, removed when the parent ends; one a killed parent left is removed by the next `hats run`, `hats use` or `hats` | 0700 |
 | Token totals and scan offsets | `$XDG_STATE_HOME/hats/usage/` | 0600 |
@@ -455,12 +456,34 @@ same way. No credentials, no account id.
 - `cwd`: the directory `hats run` started the session in.
 
 `limits.json` holds
-`{"v":1,"accounts":[{"harness","account","label","observedAt","windows":[{"name","usedPercent","resetsAt"}],"limitedUntil"?,"loginRefusedAt"?}]}`.
+`{"v":1,"accounts":[{"harness","account","label","observedAt","windows":[{"name","usedPercent","resetsAt"}],"limitedUntil"?,"loginRefusedAt"?,"gifts"?}]}`.
+A window named `seven_day_<model>`, such as `seven_day_fable`, is the weekly
+limit of that model only: it gets its own column and never switches accounts,
+since other models still run there. `gifts` are the limit resets the provider
+gave the account (`{"label","left","total","endsAt","clears","usableNow"}`);
+the provider lists them only to Claude Code's command line, so the poll asks
+with its user agent.
 `loginRefusedAt` (Unix seconds) says the provider refused the account's
 login the last time its limits were asked for (expired or revoked): `hats
 list` and the view show it as `login expired` until a reading works again,
 and auto switching never moves to it. A provider that fails for a while
 (network, 429, 5xx) leaves no mark.
+
+### The estimate
+
+Above the Claude accounts, one line says how many accounts' weekly limits
+they spend together in a week, how much room is left under the threshold,
+and whether it lasts the next 7 days. It steps the accounts forward at that
+pace, spending on the one with the most room as auto switching does, with
+each weekly limit coming back at its reset; when they run out first, it also
+says how far the unused gifted full resets reach.
+
+The pace is what every weekly window rose over the last week in
+`history.jsonl`, divided by the time the history covers. Until a day of
+history exists it is a floor: what the current weekly windows hold, over a
+week. 5-hour limits are left out: they come back within hours. Each
+account's details add its own pace this week and where it ends its week at
+that pace.
 
 ## Migrating from claude-swap
 

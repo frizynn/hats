@@ -94,7 +94,7 @@ fn apply(
     let Some(id) = account.provider_id(store).map_err(|e| e.to_string())? else {
         return Ok(());
     };
-    limits::save(store, account, &id, windows, now).map_err(|e| e.to_string())?;
+    limits::save(store, account, &id, windows, None, now).map_err(|e| e.to_string())?;
     auto::check_default(
         store,
         Harness::Claude,
