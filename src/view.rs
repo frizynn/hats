@@ -211,46 +211,61 @@ pub fn title(harness: Harness) -> &'static str {
     }
 }
 
-/// The estimate in one or two sentences: `Spends about 6.2 accounts a week
-/// (measured over 3 days); 8 usable, 3.4 accounts of room now. Lasts the
-/// next 7 days at this pace.`
-pub fn estimate_sentence(f: &Fleet, now: SystemTime) -> String {
-    let over = match f.measured_over {
+/// The estimate as short facts: a name, its value and how it looks.
+pub fn estimate_facts(f: &Fleet, now: SystemTime) -> Vec<(&'static str, String, Tone)> {
+    let basis = match f.measured_over {
         Some(secs) if secs >= 2 * 86_400 => format!("measured over {} days", secs / 86_400),
         Some(secs) => format!("measured over {} h", secs / 3600),
-        None => "at least: from this week's limits until a day of history exists".to_owned(),
+        None => "at least; measured after a day of history".to_owned(),
     };
-    let mut text = format!(
-        "Estimate: spends about {:.1} accounts a week ({over}); {} usable, {:.1} accounts of room now.",
-        f.accounts_a_week(),
-        f.accounts,
-        f.room
-    );
-    match (f.runs_out, f.runs_out_with_gifts) {
-        (None, _) => text += " Lasts the next 7 days at this pace.",
-        (Some(out), with) => {
-            text += &format!(" At this pace every account fills by {}", clock(out, now));
-            if f.full_gifts > 0 {
-                text += &match with {
-                    Some(t) => format!(
-                        "; the {} unused gifted resets reach {}.",
-                        f.full_gifts,
-                        clock(t, now)
-                    ),
-                    None => format!(
-                        "; the {} unused gifted resets cover the week.",
-                        f.full_gifts
-                    ),
-                };
-            } else {
-                text += ".";
-            }
+    let mut facts = vec![
+        (
+            "Spends",
+            format!("{:.1} accounts a week ({basis})", f.accounts_a_week()),
+            Tone::Plain,
+        ),
+        (
+            "Room now",
+            format!("{:.1} of {} accounts", f.room, f.accounts),
+            Tone::Plain,
+        ),
+    ];
+    facts.push(match f.runs_out {
+        None => (
+            "Lasts",
+            "the whole week at this pace".to_owned(),
+            Tone::Good,
+        ),
+        Some(out) => {
+            let gifts = match (f.full_gifts, f.runs_out_with_gifts) {
+                (0, _) => String::new(),
+                (_, Some(t)) => format!(" · free resets stretch it to {}", clock(t, now)),
+                (_, None) => " · free resets cover the rest of the week".to_owned(),
+            };
+            (
+                "Lasts",
+                format!("until {}{gifts}", clock(out, now)),
+                Tone::Warn,
+            )
         }
+    });
+    if f.full_gifts > 0 {
+        facts.push((
+            "Free resets",
+            format!("{} full resets unused", f.full_gifts),
+            Tone::Plain,
+        ));
     }
-    if f.full_gifts > 0 && f.runs_out.is_none() {
-        text += &format!(" {} gifted full resets unused.", f.full_gifts);
-    }
-    text
+    facts
+}
+
+/// The estimate on one line, for `hats list`.
+pub fn estimate_sentence(f: &Fleet, now: SystemTime) -> String {
+    let facts: Vec<String> = estimate_facts(f, now)
+        .into_iter()
+        .map(|(name, value, _)| format!("{} {value}", name.to_lowercase()))
+        .collect();
+    format!("Next 7 days: {}", facts.join(" · "))
 }
 
 /// What auto mode does, in one sentence.

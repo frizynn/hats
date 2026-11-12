@@ -45,6 +45,9 @@ pub struct Fleet {
     pub full_gifts: u32,
     /// `runs_out` when those gifts are used as accounts fill.
     pub runs_out_with_gifts: Option<i64>,
+    /// Room left under the threshold, in accounts, every `STEP` from now
+    /// over the next week: hours from now and room.
+    pub curve: Vec<(f64, f64)>,
 }
 
 impl Fleet {
@@ -126,17 +129,33 @@ struct Seat {
     gifts: u32,
 }
 
+fn room(seats: &[Seat], threshold: f64) -> f64 {
+    seats
+        .iter()
+        .map(|s| (threshold - s.used).max(0.0))
+        .sum::<f64>()
+        / 100.0
+}
+
 /// Steps the accounts forward, spending `per_hour` on the one with the most
 /// room as auto switching does, and returns when none has room left.
-fn run_out(
+fn run_out(seats: Vec<Seat>, per_hour: f64, threshold: f64, gifts: bool, now: i64) -> Option<i64> {
+    simulate(seats, per_hour, threshold, gifts, now, &mut Vec::new())
+}
+
+/// `run_out`, recording the room left at every step in `curve`.
+fn simulate(
     mut seats: Vec<Seat>,
     per_hour: f64,
     threshold: f64,
     gifts: bool,
     now: i64,
+    curve: &mut Vec<(f64, f64)>,
 ) -> Option<i64> {
     let per_step = per_hour * STEP as f64 / HOUR as f64;
     let mut t = now;
+    curve.push((0.0, room(&seats, threshold)));
+    let mut out = None;
     while t < now + WEEK {
         t += STEP;
         for s in &mut seats {
@@ -159,14 +178,16 @@ fn run_out(
                 .filter(|s| s.used < threshold)
                 .max_by(|a, b| (threshold - a.used).total_cmp(&(threshold - b.used)));
             let Some(best) = best else {
-                return Some(t);
+                out = out.or(Some(t));
+                break;
             };
             let take = need.min(threshold - best.used);
             best.used += take;
             need -= take;
         }
+        curve.push(((t - now) as f64 / HOUR as f64, room(&seats, threshold)));
     }
-    None
+    out
 }
 
 fn full_gifts(gifts: &[Gift], now: i64) -> u32 {
@@ -232,23 +253,21 @@ pub fn fleet(
             .sum();
         (held / (WEEK / HOUR) as f64, None)
     };
-    let room = seats
-        .iter()
-        .map(|s| (threshold - s.used).max(0.0))
-        .sum::<f64>()
-        / 100.0;
+    let room = room(&seats, threshold);
     let full_gifts = seats.iter().map(|s| s.gifts).sum();
     let copy = |s: &Seat| Seat {
         used: s.used,
         resets_at: s.resets_at,
         gifts: s.gifts,
     };
-    let runs_out = run_out(
+    let mut curve = Vec::new();
+    let runs_out = simulate(
         seats.iter().map(copy).collect(),
         per_hour,
         threshold,
         false,
         now,
+        &mut curve,
     );
     let runs_out_with_gifts = runs_out.and(run_out(seats, per_hour, threshold, true, now));
     Some(Fleet {
@@ -259,6 +278,7 @@ pub fn fleet(
         runs_out,
         full_gifts,
         runs_out_with_gifts,
+        curve,
     })
 }
 

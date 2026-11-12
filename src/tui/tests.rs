@@ -229,16 +229,20 @@ fn a_model_limit_and_gifted_resets_show_and_outlive_the_status_line() {
     limits::save(&store, &work, &id, repaint, None, now).unwrap();
 
     let mut app = App::new(&store, DARK);
-    let screen = text_at(&mut app, 160, 30);
+    let screen = text_at(&mut app, 160, 50);
     assert!(line_with(&screen, "ACCOUNT").contains("FABLE"), "{screen}");
     assert!(line_with(&screen, "▌ ● work").contains(" 99%"), "{screen}");
     assert!(line_with(&screen, "Model limit").contains("Fable weekly 99 % until"));
-    assert!(line_with(&screen, "Free resets").contains("1 full reset (5-hour and weekly), use by"));
+    assert!(line_with(&screen, "Free resets").contains("1 full reset (use by"));
     assert!(
         line_with(&screen, "Pace").contains("% a day this week"),
         "{screen}"
     );
-    assert!(screen.contains("Estimate: spends about"), "{screen}");
+    // The estimate sits at the bottom, with its chart over the next 7 days.
+    assert!(line_with(&screen, "Next 7 days").starts_with("─"), "{screen}");
+    assert!(line_with(&screen, "Spends").contains("accounts a week"));
+    assert!(line_with(&screen, "Lasts").contains("the whole week"));
+    assert!(line_with(&screen, "  now ").contains("Thu") || screen.contains(" now "));
     // A full Fable limit alone does not count the account as full.
     let statuses = auto::statuses(&store, Harness::Claude, &config(&store).claude).unwrap();
     let work = statuses.iter().find(|s| s.account.label == "work").unwrap();

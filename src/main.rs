@@ -799,10 +799,12 @@ fn remove(store: &Store, account: Account) -> Result<(), Failure> {
 /// running one `<path> (deleted)`; the new one is at `<path>`.
 pub(crate) fn me() -> io::Result<PathBuf> {
     let exe = std::env::current_exe()?;
-    Ok(match exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
-        Some(path) => PathBuf::from(path),
-        None => exe,
-    })
+    Ok(
+        match exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+            Some(path) => PathBuf::from(path),
+            None => exe,
+        },
+    )
 }
 
 /// `hats poll` on its own, so the status line never waits for the network.

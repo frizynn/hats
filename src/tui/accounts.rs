@@ -7,8 +7,11 @@ use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Style};
+use ratatui::symbols;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, HighlightSpacing, List, ListState, Paragraph};
+use ratatui::widgets::{
+    Axis, Block, Borders, Chart, Dataset, GraphType, HighlightSpacing, List, ListState, Paragraph,
+};
 
 use super::{Action, App, Child, Step, Tab};
 use crate::account::{DEFAULT_LABEL, Harness};
@@ -334,12 +337,8 @@ impl App<'_> {
             &layout,
             now,
             view::Hints::Keys,
-        )
-        .with_estimate(
-            estimate::read(self.store, group.harness, &group.statuses, config, now).as_ref(),
-            width,
-            now,
         );
+        let fleet = estimate::read(self.store, group.harness, &group.statuses, config, now);
         let mut header = vec![self.harnesses()];
         // The first header line names the harness; the selector says it.
         for row in block.header.iter().skip(1) {
@@ -394,8 +393,23 @@ impl App<'_> {
             let mut state = ListState::default().with_selected(Some(self.accounts.selected));
             frame.render_stateful_widget(list_widget, list, &mut state);
         }
+        // The estimate takes the bottom when the details still fit above it.
+        let (details, forecast) = match &fleet {
+            Some(_) if details.height >= DETAILS_HEIGHT + FORECAST_MIN => {
+                let [d, f] = Layout::vertical([
+                    Constraint::Length(DETAILS_HEIGHT),
+                    Constraint::Min(FORECAST_MIN),
+                ])
+                .areas(details);
+                (d, Some(f))
+            }
+            _ => (details, None),
+        };
         if let Some(s) = self.selected_status() {
             self.draw_details(frame, details, s, now);
+        }
+        if let (Some(f), Some(area)) = (&fleet, forecast) {
+            self.draw_forecast(frame, area, f, now);
         }
         self.draw_prompt(frame, message);
         match &self.accounts.prompt {
@@ -452,6 +466,102 @@ impl App<'_> {
             self.bold(),
         ));
         Line::from(spans)
+    }
+
+    /// The next 7 days: the estimate's facts and a chart of the room left.
+    fn draw_forecast(&self, frame: &mut Frame, area: Rect, f: &estimate::Fleet, now: SystemTime) {
+        let facts = view::estimate_facts(f, now);
+        let mut lines: Vec<Line> = facts
+            .iter()
+            .map(|(name, value, tone)| {
+                Line::from(vec![
+                    Span::styled(format!(" {name:<13}"), self.dim()),
+                    Span::styled(value.clone(), self.tone(*tone)),
+                ])
+            })
+            .collect();
+        lines.push(Line::default());
+        lines.push(Line::styled(
+            " Room left under the threshold, in accounts: it drops as they are spent and jumps when one resets",
+            self.dim(),
+        ));
+        let title = Line::from(vec![
+            Span::raw("─ "),
+            Span::styled("Next 7 days", self.bold()),
+            Span::raw(" "),
+        ]);
+        let block = Block::new()
+            .borders(Borders::TOP)
+            .border_style(self.dim())
+            .title(title);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let [text, chart] =
+            Layout::vertical([Constraint::Length(lines.len() as u16), Constraint::Min(0)])
+                .areas(inner);
+        frame.render_widget(Paragraph::new(lines), text);
+        if chart.height < 5 {
+            return;
+        }
+        let top = f.curve.iter().map(|p| p.1).fold(1.0, f64::max).ceil();
+        let color = if f.runs_out.is_some() {
+            Color::Yellow
+        } else {
+            Color::Cyan
+        };
+        let data = Dataset::default()
+            .marker(symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(self.theme.fg(color))
+            .data(&f.curve);
+        let y_labels = [
+            "0".to_owned(),
+            format!("{:.0}", top / 2.0),
+            format!("{top:.0}"),
+        ];
+        let label_width = y_labels.iter().map(String::len).max().unwrap_or(1) as u16;
+        let [plot, axis] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(chart);
+        let widget = Chart::new(vec![data])
+            .x_axis(Axis::default().bounds([0.0, 168.0]).style(self.dim()))
+            .y_axis(
+                Axis::default()
+                    .bounds([0.0, top])
+                    .labels(y_labels.map(|l| Line::styled(l, self.dim())))
+                    .style(self.dim()),
+            );
+        frame.render_widget(widget, plot);
+        // Each day under its own place on the time axis: the plot starts
+        // after the labels and the axis line.
+        let start = usize::from(label_width) + 1;
+        let span = usize::from(plot.width).saturating_sub(start + 1).max(1);
+        let now_secs = limits::unix_secs(now);
+        let mut row = vec![' '; usize::from(axis.width)];
+        for d in 0..=7 {
+            let label = if d == 0 {
+                "now".to_owned()
+            } else {
+                view::clock(now_secs + d * 86_400, now)
+                    .split(' ')
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            let at = start + span * d as usize / 7;
+            let at = at.min(row.len().saturating_sub(label.len()));
+            for (k, c) in label.chars().enumerate() {
+                if let Some(cell) = row.get_mut(at + k) {
+                    *cell = c;
+                }
+            }
+        }
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                row.into_iter().collect::<String>(),
+                self.dim(),
+            )),
+            axis,
+        );
     }
 
     fn draw_details(&self, frame: &mut Frame, area: Rect, s: &Status, now: SystemTime) {
@@ -516,7 +626,7 @@ impl App<'_> {
             rows.push((
                 "Model limit",
                 Line::raw(format!(
-                    "{name} weekly {} · only {name} stops there; other models go on",
+                    "{name} weekly {} · other models are not affected",
                     self::resets(w, now)
                 )),
             ));
@@ -626,7 +736,12 @@ impl App<'_> {
     }
 }
 
-/// `1 full reset left, use by Thu 10 Dec · 1 Fable reset left, use by ...`.
+/// Rows the details of one account take, with their title.
+const DETAILS_HEIGHT: u16 = 14;
+/// The estimate's facts, the chart's caption and a chart worth reading.
+const FORECAST_MIN: u16 = 13;
+
+/// `1 full reset (use by 10 Dec 2026) · 1 Fable reset (use by 9 Mar 2027)`.
 fn gifts(gifts: &[limits::Gift], now: SystemTime) -> String {
     let now_secs = limits::unix_secs(now);
     let live: Vec<String> = gifts
@@ -634,17 +749,17 @@ fn gifts(gifts: &[limits::Gift], now: SystemTime) -> String {
         .filter(|g| g.left > 0 && (g.ends_at == 0 || g.ends_at > now_secs))
         .map(|g| {
             let what = if g.clears_weekly() {
-                "full reset (5-hour and weekly)"
+                "full reset"
             } else {
-                "5-hour and Fable weekly reset"
+                "Fable reset"
             };
             let by = if g.ends_at == 0 {
                 String::new()
             } else {
-                format!(", use by {}", view::date(g.ends_at))
+                format!(" by {}", view::date(g.ends_at))
             };
-            let now = if g.usable_now { "" } else { ", not usable now" };
-            format!("{} {what}{by}{now}", g.left)
+            let not_now = if g.usable_now { "" } else { ", not usable now" };
+            format!("{} {what} (use{by}{not_now})", g.left)
         })
         .collect();
     if live.is_empty() {
