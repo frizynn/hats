@@ -70,6 +70,9 @@ pub struct LimitWindow {
 /// Claude Code, until `ends_at`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Gift {
+    /// The provider's id for it, which claiming it names.
+    #[serde(default)]
+    pub id: String,
     pub label: String,
     pub left: u32,
     pub total: u32,
@@ -84,6 +87,11 @@ pub struct Gift {
 }
 
 impl Gift {
+    /// Whether it can still be claimed: some left and not past its end.
+    pub fn live(&self, now: i64) -> bool {
+        self.left > 0 && !self.id.is_empty() && (self.ends_at == 0 || self.ends_at > now)
+    }
+
     /// Whether it clears the weekly limit of every model.
     pub fn clears_weekly(&self) -> bool {
         self.clears.iter().any(|c| c == "seven_day")

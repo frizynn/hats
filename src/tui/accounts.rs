@@ -38,6 +38,15 @@ pub enum Prompt {
     Add(String),
     /// Waiting for y/n before removing this label.
     Remove(String),
+    /// Choosing which of this account's gifted resets to use.
+    PickReset(String, Vec<limits::Gift>),
+    /// Waiting for y before spending this gifted reset of this account; the
+    /// second time (`again`) spends it.
+    UseReset {
+        label: String,
+        gift: limits::Gift,
+        again: bool,
+    },
 }
 
 impl State {
@@ -83,6 +92,10 @@ impl App<'_> {
         match self.accounts.prompt.take() {
             Some(Prompt::Add(input)) => return self.add_key(input, key),
             Some(Prompt::Remove(label)) => return self.remove_key(label, key),
+            Some(Prompt::PickReset(label, gifts)) => return self.pick_reset_key(label, gifts, key),
+            Some(Prompt::UseReset { label, gift, again }) => {
+                return self.use_reset_key(label, gift, again, key);
+            }
             None => {}
         }
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -113,6 +126,7 @@ impl App<'_> {
                 None => self.nothing_selected(),
             },
             KeyCode::Char('d') => self.ask_remove(),
+            KeyCode::Char('f') => self.ask_reset(),
             _ => Step::Idle,
         }
     }
@@ -152,6 +166,118 @@ impl App<'_> {
             }),
             _ => Step::Redraw,
         }
+    }
+
+    /// The selected account's gifted resets that can still be used.
+    fn live_gifts(&self) -> Option<(String, Vec<limits::Gift>)> {
+        let s = self.selected_status()?;
+        let now = limits::unix_secs(SystemTime::now());
+        let gifts: Vec<limits::Gift> = s
+            .reading
+            .as_ref()?
+            .gifts
+            .iter()
+            .filter(|g| g.live(now))
+            .cloned()
+            .collect();
+        Some((s.account.label.clone(), gifts))
+    }
+
+    /// Starts using a gifted reset: picks it when there are several, then
+    /// asks twice.
+    fn ask_reset(&mut self) -> Step {
+        let Some((label, mut gifts)) = self.live_gifts() else {
+            return self.nothing_selected();
+        };
+        match gifts.len() {
+            0 => {
+                self.fail(format!("'{label}' has no free resets left."));
+                Step::Redraw
+            }
+            1 => {
+                let gift = gifts.remove(0);
+                self.accounts.prompt = Some(Prompt::UseReset {
+                    label,
+                    gift,
+                    again: false,
+                });
+                Step::Redraw
+            }
+            _ => {
+                self.accounts.prompt = Some(Prompt::PickReset(label, gifts));
+                Step::Redraw
+            }
+        }
+    }
+
+    fn pick_reset_key(
+        &mut self,
+        label: String,
+        mut gifts: Vec<limits::Gift>,
+        key: KeyEvent,
+    ) -> Step {
+        let picked = match key.code {
+            KeyCode::Char(c) => c.to_digit(10).map(|d| d as usize),
+            _ => None,
+        };
+        match picked {
+            Some(n) if (1..=gifts.len()).contains(&n) => {
+                let gift = gifts.swap_remove(n - 1);
+                self.accounts.prompt = Some(Prompt::UseReset {
+                    label,
+                    gift,
+                    again: false,
+                });
+            }
+            _ => {}
+        }
+        Step::Redraw
+    }
+
+    fn use_reset_key(
+        &mut self,
+        label: String,
+        gift: limits::Gift,
+        again: bool,
+        key: KeyEvent,
+    ) -> Step {
+        if !matches!(key.code, KeyCode::Char('y' | 'Y')) {
+            self.info(format!("Kept {label}'s {}.", reset_name(&gift)));
+            return Step::Redraw;
+        }
+        if !again {
+            self.accounts.prompt = Some(Prompt::UseReset {
+                label,
+                gift,
+                again: true,
+            });
+            return Step::Redraw;
+        }
+        let account = self.groups[self.accounts.focus]
+            .statuses
+            .iter()
+            .find(|s| s.account.label == label)
+            .map(|s| s.account.clone());
+        let Some(account) = account else {
+            self.fail(format!("'{label}' is gone."));
+            return Step::Redraw;
+        };
+        match crate::poll::claim(self.store, &account, &gift.id, SystemTime::now()) {
+            Ok(c) if c.result == "reset" => {
+                super::poll_now();
+                self.info(format!(
+                    "Used {label}'s {}: its limits are back to 0.",
+                    reset_name(&gift)
+                ));
+            }
+            Ok(c) => self.fail(format!(
+                "The provider did not reset '{label}': {}.",
+                c.result.replace('_', " ")
+            )),
+            Err(e) => self.fail(format!("Could not use {label}'s reset: {e}.")),
+        }
+        self.reload();
+        Step::Redraw
     }
 
     fn move_selection(&mut self, by: isize) -> Step {
@@ -415,6 +541,9 @@ impl App<'_> {
         match &self.accounts.prompt {
             Some(Prompt::Add(_)) => vec![("enter", "create"), ("esc", "cancel")],
             Some(Prompt::Remove(_)) => vec![("y", "remove"), ("n", "keep")],
+            Some(Prompt::PickReset(..)) => vec![("1-9", "choose"), ("esc", "cancel")],
+            Some(Prompt::UseReset { again: false, .. }) => vec![("y", "continue"), ("n", "keep")],
+            Some(Prompt::UseReset { again: true, .. }) => vec![("y", "use it"), ("n", "keep")],
             None => {
                 let other = match group.harness {
                     Harness::Claude => "codex",
@@ -433,6 +562,7 @@ impl App<'_> {
                     ("a", "add"),
                     ("l", "login"),
                     ("d", "remove"),
+                    ("f", "free reset"),
                 ]
             }
         }
@@ -710,6 +840,44 @@ impl App<'_> {
                 format!("Remove '{label}'? It signs out and deletes its directory. y/n"),
                 self.bold().patch(self.theme.fg(Color::Yellow)),
             ),
+            Some(Prompt::PickReset(label, gifts)) => {
+                let choices: Vec<String> = gifts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, g)| format!("{} {}", i + 1, gift_text(g)))
+                    .collect();
+                Line::styled(
+                    format!(
+                        "Which free reset of '{label}'?  {}  · esc cancels",
+                        choices.join("  ")
+                    ),
+                    self.bold().patch(self.theme.fg(Color::Yellow)),
+                )
+            }
+            Some(Prompt::UseReset {
+                label,
+                gift,
+                again: false,
+            }) => Line::styled(
+                format!(
+                    "Use {label}'s {} now? It clears {}. y/n",
+                    reset_name(gift),
+                    clears_text(gift)
+                ),
+                self.bold().patch(self.theme.fg(Color::Yellow)),
+            ),
+            Some(Prompt::UseReset {
+                label,
+                gift,
+                again: true,
+            }) => Line::styled(
+                format!(
+                    "Sure? This spends it for good: {label} keeps {} {} after. y to use it, any other key keeps it",
+                    gift.left.saturating_sub(1),
+                    if gift.left == 2 { "reset" } else { "resets" }
+                ),
+                self.bold().patch(self.theme.fg(Color::Red)),
+            ),
             None => return,
         };
         frame.render_widget(Paragraph::new(line), area);
@@ -736,6 +904,33 @@ impl App<'_> {
     }
 }
 
+/// `full reset` or `Fable reset`.
+fn reset_name(g: &limits::Gift) -> &'static str {
+    if g.clears_weekly() {
+        "full reset"
+    } else {
+        "Fable reset"
+    }
+}
+
+/// What a reset clears, in words.
+fn clears_text(g: &limits::Gift) -> &'static str {
+    if g.clears_weekly() {
+        "its 5-hour and weekly limits"
+    } else {
+        "its 5-hour limit and Fable's weekly limit"
+    }
+}
+
+/// `full reset (use by 10 Dec 2026)`.
+fn gift_text(g: &limits::Gift) -> String {
+    if g.ends_at == 0 {
+        reset_name(g).to_owned()
+    } else {
+        format!("{} (use by {})", reset_name(g), view::date(g.ends_at))
+    }
+}
+
 /// Rows the details of one account take, with their title.
 const DETAILS_HEIGHT: u16 = 14;
 /// The estimate's facts, the chart's caption and a chart worth reading.
@@ -746,13 +941,9 @@ fn gifts(gifts: &[limits::Gift], now: SystemTime) -> String {
     let now_secs = limits::unix_secs(now);
     let live: Vec<String> = gifts
         .iter()
-        .filter(|g| g.left > 0 && (g.ends_at == 0 || g.ends_at > now_secs))
+        .filter(|g| g.live(now_secs))
         .map(|g| {
-            let what = if g.clears_weekly() {
-                "full reset"
-            } else {
-                "Fable reset"
-            };
+            let what = reset_name(g);
             let by = if g.ends_at == 0 {
                 String::new()
             } else {

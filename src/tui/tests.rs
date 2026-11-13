@@ -207,6 +207,7 @@ fn a_model_limit_and_gifted_resets_show_and_outlive_the_status_line() {
         resets_at,
     };
     let gift = limits::Gift {
+        id: "full-reset-2611".to_owned(),
         label: "One full limit reset".to_owned(),
         left: 1,
         total: 1,
@@ -239,7 +240,10 @@ fn a_model_limit_and_gifted_resets_show_and_outlive_the_status_line() {
         "{screen}"
     );
     // The estimate sits at the bottom, with its chart over the next 7 days.
-    assert!(line_with(&screen, "Next 7 days").starts_with("─"), "{screen}");
+    assert!(
+        line_with(&screen, "Next 7 days").starts_with("─"),
+        "{screen}"
+    );
     assert!(line_with(&screen, "Spends").contains("accounts a week"));
     assert!(line_with(&screen, "Lasts").contains("the whole week"));
     assert!(line_with(&screen, "  now ").contains("Thu") || screen.contains(" now "));
@@ -247,6 +251,52 @@ fn a_model_limit_and_gifted_resets_show_and_outlive_the_status_line() {
     let statuses = auto::statuses(&store, Harness::Claude, &config(&store).claude).unwrap();
     let work = statuses.iter().find(|s| s.account.label == "work").unwrap();
     assert_eq!(work.used(now), Some(50.0));
+}
+
+#[test]
+fn a_free_reset_asks_twice_and_any_other_key_keeps_it() {
+    let (_dir, store) = sandbox();
+    let work = account(&store, "work", Some(42.0));
+    let id = work.provider_id(&store).unwrap().unwrap();
+    let now = SystemTime::now();
+    let gift = |id: &str, clears: &[&str]| limits::Gift {
+        id: id.to_owned(),
+        label: id.to_owned(),
+        left: 1,
+        total: 1,
+        ends_at: unix_secs(now) + 86_400 * 20,
+        clears: clears.iter().map(|c| (*c).to_owned()).collect(),
+        usable_now: true,
+    };
+    let windows = vec![LimitWindow {
+        name: "seven_day".to_owned(),
+        used_percent: 97.0,
+        resets_at: unix_secs(now) + 3600,
+    }];
+    let gifts = vec![
+        gift("full", &["five_hour", "seven_day"]),
+        gift("fable", &["five_hour", "seven_day_overage_included"]),
+    ];
+    limits::save(&store, &work, &id, windows, Some(gifts), now).unwrap();
+
+    let mut app = App::new(&store, DARK);
+    app.on_key(key(KeyCode::Char('f')));
+    let screen = text_at(&mut app, 160, 40);
+    assert!(
+        line_with(&screen, "Which free reset of 'work'?").contains("1 full reset (use by"),
+        "{screen}"
+    );
+    app.on_key(key(KeyCode::Char('1')));
+    let screen = text_at(&mut app, 160, 40);
+    assert!(line_with(&screen, "Use work's full reset now?").contains("5-hour and weekly"));
+    app.on_key(key(KeyCode::Char('y')));
+    let screen = text_at(&mut app, 160, 40);
+    assert!(line_with(&screen, "Sure? This spends it for good").contains("keeps 0 resets"));
+    // Anything but y at the last step keeps it, and nothing was sent.
+    app.on_key(key(KeyCode::Char('n')));
+    let screen = text_at(&mut app, 160, 40);
+    assert!(screen.contains("Kept work's full reset."), "{screen}");
+    assert!(!screen.contains("Sure?"));
 }
 
 #[test]

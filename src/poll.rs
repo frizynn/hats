@@ -227,6 +227,7 @@ struct Gifts {
 
 #[derive(Deserialize)]
 struct Grant {
+    id: Option<String>,
     label: Option<String>,
     resets_total: Option<u32>,
     resets_left: Option<u32>,
@@ -283,6 +284,7 @@ fn read_usage(usage: Usage) -> (Vec<LimitWindow>, Option<Vec<Gift>>) {
         g.grants
             .into_iter()
             .map(|g| Gift {
+                id: g.id.unwrap_or_default(),
                 label: g.label.unwrap_or_default(),
                 left: g.resets_left.unwrap_or(0),
                 total: g.resets_total.unwrap_or(0),
@@ -293,6 +295,104 @@ fn read_usage(usage: Usage) -> (Vec<LimitWindow>, Option<Vec<Gift>>) {
             .collect()
     });
     (windows, gifts)
+}
+
+/// What the provider answered to a claim: `reset` when it cleared the
+/// limits; otherwise why not, such as `already_used`, `cooldown` or
+/// `ineligible`.
+#[derive(Debug, Deserialize)]
+pub struct Claimed {
+    pub result: String,
+}
+
+/// Spends one of `account`'s gifted limit resets, `grant` being its id, the
+/// way Claude Code does (measured on Claude Code 2.1.323): it cannot be
+/// undone. A reset the provider takes asks for the limits again at once.
+pub fn claim(
+    store: &Store,
+    account: &Account,
+    grant: &str,
+    now: SystemTime,
+) -> Result<Claimed, String> {
+    let valid = |text: &str, max: usize| {
+        !text.is_empty()
+            && text.len() <= max
+            && text
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    };
+    if !valid(grant, 40) {
+        return Err(format!("'{grant}' is not a reset's id"));
+    }
+    let id = account
+        .provider_id(store)
+        .map_err(|e| e.to_string())?
+        .ok_or("not signed in")?;
+    let org = account
+        .organization_uuid(store)
+        .map_err(|e| e.to_string())?
+        .ok_or("its login names no organization")?;
+    let seated = seat::seat(store)
+        .provider_id(store)
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some(id.as_str());
+    let source = if seated {
+        seat::seat(store)
+    } else {
+        account.clone()
+    };
+    let mut login = secret::login(store, &source)
+        .map_err(|e| e.to_string())?
+        .ok_or("no stored login")?;
+    if expired(&login, now) {
+        if seated {
+            return Err("its token expired; Claude Code renews it on its next request, try again in a minute".into());
+        }
+        login = renew(store, account, now).map_err(|f| match f {
+            Failed::Refused(why) | Failed::Other(why) => why,
+        })?;
+    }
+    let token = login["accessToken"].as_str().ok_or("no access token")?;
+    let body = serde_json::json!({
+        "program": "cedar_ember",
+        "grant_id": grant,
+        "request_id": request_id(),
+    })
+    .to_string();
+    let url = format!("https://api.anthropic.com/api/organizations/{org}/reset_rate_limits");
+    let (status, answer) = curl(&format!(
+        "url = \"{url}\"\nheader = \"Authorization: Bearer {token}\"\nheader = \"anthropic-beta: {BETA}\"\nheader = \"User-Agent: {CLI_AGENT}\"\nheader = \"Content-Type: application/json\"\nmax-time = 25\ndata-binary = \"{}\"\n",
+        body.replace('\\', "\\\\").replace('"', "\\\"")
+    ))?;
+    if status == 401 {
+        return Err("the provider refused its login; sign in again with `hats login`".to_owned());
+    }
+    if status != 200 {
+        return Err(format!("the provider answered {status}"));
+    }
+    let claimed: Claimed = serde_json::from_slice(&answer).map_err(|e| e.to_string())?;
+    if claimed.result == "reset" {
+        ask_soon(store);
+    }
+    Ok(claimed)
+}
+
+/// 32 random hex digits: the provider takes one claim per request id.
+fn request_id() -> String {
+    let mut bytes = [0u8; 16];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| io::Read::read_exact(&mut f, &mut bytes))
+        .is_err()
+    {
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        bytes = (nanos ^ u128::from(std::process::id())).to_le_bytes();
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// A new token for a parked login, saved back before it is used. Under the

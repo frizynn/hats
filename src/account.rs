@@ -269,6 +269,25 @@ impl Account {
         }
     }
 
+    /// The organization a Claude login belongs to, which limit resets are
+    /// claimed for; `None` before login.
+    pub fn organization_uuid(&self, store: &Store) -> io::Result<Option<String>> {
+        if self.harness != Harness::Claude {
+            return Ok(None);
+        }
+        let bytes = match fs::read(self.claude_global_config(store)) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let config: ClaudeGlobalConfig =
+            serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+        Ok(config
+            .oauth_account
+            .and_then(|a| a.organization_uuid)
+            .filter(|u| !u.is_empty()))
+    }
+
     /// Claude Code keeps its global config at `$CLAUDE_CONFIG_DIR/.claude.json`,
     /// or at `~/.claude.json` when the variable is unset.
     fn claude_global_config(&self, store: &Store) -> PathBuf {

@@ -252,7 +252,11 @@ pub fn estimate_facts(f: &Fleet, now: SystemTime) -> Vec<(&'static str, String, 
     if f.full_gifts > 0 {
         facts.push((
             "Free resets",
-            format!("{} full resets unused", f.full_gifts),
+            format!(
+                "{} full {} unused",
+                f.full_gifts,
+                if f.full_gifts == 1 { "reset" } else { "resets" }
+            ),
             Tone::Plain,
         ));
     }

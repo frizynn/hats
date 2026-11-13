@@ -469,6 +469,15 @@ list` and the view show it as `login expired` until a reading works again,
 and auto switching never moves to it. A provider that fails for a while
 (network, 429, 5xx) leaves no mark.
 
+### Free resets
+
+Anthropic sometimes gives an account limit resets, such as one full reset a
+month or a Fable reset when Fable launched. Each account's details list the
+ones left and when each must be used by. In the accounts tab, `f` uses one of
+the selected account's: it asks which when there are several, then asks
+twice, since a used reset does not come back. hats claims it the way Claude
+Code does and reads the limits again at once.
+
 ### The estimate
 
 Above the Claude accounts, one line says how many accounts' weekly limits
