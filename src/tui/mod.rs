@@ -61,7 +61,7 @@ static POLL_NOW: std::sync::OnceLock<std::sync::mpsc::Sender<()>> = std::sync::O
 /// open, and at once after `poll_now`; the view redraws when they land in
 /// `limits.json`.
 fn poll_while_open() {
-    let Ok(me) = std::env::current_exe() else {
+    let Ok(me) = crate::me() else {
         return;
     };
     let (now, asked) = std::sync::mpsc::channel();
@@ -214,7 +214,7 @@ struct Child {
 
 impl Child {
     fn command(&self) -> io::Result<Command> {
-        let mut cmd = Command::new(std::env::current_exe()?);
+        let mut cmd = Command::new(crate::me()?);
         if self.harness == Harness::Codex {
             cmd.arg("--codex");
         }

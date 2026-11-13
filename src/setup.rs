@@ -97,7 +97,7 @@ struct Plan {
 }
 
 pub fn run(store: &Store, dry_run: bool, undo: bool) -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = crate::me().map_err(|e| e.to_string())?;
     let exe = exe.to_string_lossy().into_owned();
     let plan = if undo {
         plan_undo(store)?

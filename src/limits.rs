@@ -16,6 +16,16 @@
 //! `loginRefusedAt` (Unix seconds), when present, says the provider refused
 //! the account's login when its limits were last asked for (expired or
 //! revoked): it has to sign in again. The next reading that works clears it.
+//!
+//! Besides `five_hour` and `seven_day`, a window named `seven_day_<model>`
+//! (such as `seven_day_fable`) is a weekly limit of one model only. It is
+//! shown but never switches accounts: other models still run there.
+//!
+//! `gifts`, when present, are the limit resets the provider gave the account
+//! and when each must be used by (see `Gift`).
+//!
+//! Every change of a `seven_day` window is also appended to `history.jsonl`
+//! (see `history`), which the estimate reads.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -27,6 +37,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::account::{Account, Harness, newest_rollout};
+use crate::history;
 use crate::store::Store;
 
 pub const FILE_NAME: &str = "limits.json";
@@ -54,6 +65,44 @@ pub struct LimitWindow {
     pub resets_at: i64,
 }
 
+/// Limit resets the provider gave an account, such as `One full limit reset
+/// (November 2026)`: it clears the limits named in `clears` when claimed in
+/// Claude Code, until `ends_at`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Gift {
+    /// The provider's id for it, which claiming it names.
+    #[serde(default)]
+    pub id: String,
+    pub label: String,
+    pub left: u32,
+    pub total: u32,
+    /// Unix seconds; 0 when the provider gives no end.
+    #[serde(rename = "endsAt")]
+    pub ends_at: i64,
+    /// Windows it clears: `five_hour`, `seven_day`, `seven_day_overage_included`.
+    pub clears: Vec<String>,
+    /// Whether the provider would honor it now.
+    #[serde(rename = "usableNow")]
+    pub usable_now: bool,
+}
+
+impl Gift {
+    /// Whether it can still be claimed: some left and not past its end.
+    pub fn live(&self, now: i64) -> bool {
+        self.left > 0 && !self.id.is_empty() && (self.ends_at == 0 || self.ends_at > now)
+    }
+
+    /// Whether it clears the weekly limit of every model.
+    pub fn clears_weekly(&self) -> bool {
+        self.clears.iter().any(|c| c == "seven_day")
+    }
+}
+
+/// Whether `name` is the window of one model only, such as `seven_day_fable`.
+pub fn is_scoped(name: &str) -> bool {
+    name.starts_with("seven_day_")
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Reading {
     /// Unix milliseconds.
@@ -65,6 +114,7 @@ pub struct Reading {
     pub plan: Option<String>,
     /// Unix seconds when the provider refused the login, until a reading works.
     pub login_refused_at: Option<i64>,
+    pub gifts: Vec<Gift>,
 }
 
 impl Reading {
@@ -74,8 +124,9 @@ impl Reading {
             .is_some_and(|until| until > unix_secs(now))
     }
 
-    /// Highest use across windows, counting a window that already reset as
-    /// empty: an old reading still says when its limit came back.
+    /// Highest use across the windows of every model, counting a window that
+    /// already reset as empty: an old reading still says when its limit came
+    /// back.
     pub fn binding_used(&self, now: SystemTime) -> f64 {
         if self.limited(now) {
             return 100.0;
@@ -83,6 +134,7 @@ impl Reading {
         let now = unix_secs(now);
         self.windows
             .iter()
+            .filter(|w| !is_scoped(&w.name))
             .map(|w| {
                 if w.resets_at <= now {
                     0.0
@@ -120,6 +172,8 @@ struct AccountLimits {
         skip_serializing_if = "Option::is_none"
     )]
     login_refused_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    gifts: Vec<Gift>,
 }
 
 impl AccountLimits {
@@ -132,6 +186,7 @@ impl AccountLimits {
             windows,
             limited_until: None,
             login_refused_at: None,
+            gifts: Vec::new(),
         }
     }
 }
@@ -160,6 +215,7 @@ pub fn claude_readings(store: &Store) -> HashMap<String, Reading> {
                 limited_until: a.limited_until,
                 plan: None,
                 login_refused_at: a.login_refused_at,
+                gifts: a.gifts,
             };
             (a.account, reading)
         })
@@ -169,28 +225,70 @@ pub fn claude_readings(store: &Store) -> HashMap<String, Reading> {
 /// Stores the reading of one account, which also says its login works.
 /// Numbers that differ from the stored ones replace what a rate limit error
 /// taught; the same numbers only say they are still current.
+///
+/// A reading without a window the stored one has (the status line knows only
+/// `five_hour` and `seven_day`) keeps that window until it resets, and
+/// `gifts` of `None` keeps the stored ones.
 pub fn save(
     store: &Store,
     account: &Account,
     id: &str,
-    windows: Vec<LimitWindow>,
+    mut windows: Vec<LimitWindow>,
+    gifts: Option<Vec<Gift>>,
     now: SystemTime,
 ) -> io::Result<()> {
     let observed_at = unix_millis(now);
-    update(store, account.harness, id, |entry| match entry {
-        Some(old) if old.windows == windows && old.label == account.label => {
-            let refused = old.login_refused_at.take().is_some();
-            if !refused && observed_at < old.observed_at + REFRESH.as_millis() as u64 {
-                return false;
+    let mut weekly_changed = None;
+    update(store, account.harness, id, |entry| {
+        if let Some(old) = entry.as_ref() {
+            let kept: Vec<_> = old
+                .windows
+                .iter()
+                .filter(|o| o.resets_at > unix_secs(now))
+                .filter(|o| !windows.iter().any(|w| w.name == o.name))
+                .cloned()
+                .collect();
+            windows.extend(kept);
+        }
+        let gifts = gifts
+            .clone()
+            .or_else(|| entry.as_ref().map(|o| o.gifts.clone()))
+            .unwrap_or_default();
+        let weekly = |ws: &[LimitWindow]| ws.iter().find(|w| w.name == "seven_day").cloned();
+        let new_weekly = weekly(&windows);
+        if new_weekly.is_some() && new_weekly != entry.as_ref().and_then(|o| weekly(&o.windows)) {
+            weekly_changed = new_weekly;
+        }
+        match entry {
+            Some(old)
+                if same_windows(&old.windows, &windows)
+                    && old.gifts == gifts
+                    && old.label == account.label =>
+            {
+                let refused = old.login_refused_at.take().is_some();
+                if !refused && observed_at < old.observed_at + REFRESH.as_millis() as u64 {
+                    return false;
+                }
+                old.observed_at = observed_at;
+                true
             }
-            old.observed_at = observed_at;
-            true
+            _ => {
+                let mut fresh = AccountLimits::new(account, id, observed_at, windows.clone());
+                fresh.gifts = gifts;
+                *entry = Some(fresh);
+                true
+            }
         }
-        _ => {
-            *entry = Some(AccountLimits::new(account, id, observed_at, windows));
-            true
-        }
-    })
+    })?;
+    if let (Some(w), Harness::Claude) = (weekly_changed, account.harness) {
+        history::append(store, id, &account.label, &w, now)?;
+    }
+    Ok(())
+}
+
+/// The same windows, in any order.
+fn same_windows(a: &[LimitWindow], b: &[LimitWindow]) -> bool {
+    a.len() == b.len() && a.iter().all(|w| b.contains(w))
 }
 
 /// Stores a reading taken elsewhere at `observed_at` (Unix milliseconds),
@@ -365,6 +463,7 @@ pub fn codex_reading(sessions: &Path) -> io::Result<Option<Reading>> {
             limited_until: None,
             plan,
             login_refused_at: None,
+            gifts: Vec::new(),
         }));
     }
     Ok(None)

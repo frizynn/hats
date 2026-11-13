@@ -7,13 +7,17 @@ use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Style};
+use ratatui::symbols;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, HighlightSpacing, List, ListState, Paragraph};
+use ratatui::widgets::{
+    Axis, Block, Borders, Chart, Dataset, GraphType, HighlightSpacing, List, ListState, Paragraph,
+};
 
 use super::{Action, App, Child, Step, Tab};
 use crate::account::{DEFAULT_LABEL, Harness};
 use crate::auto::{self, Status};
 use crate::config;
+use crate::estimate;
 use crate::limits::{self, LimitWindow};
 use crate::view::{self, Tone};
 
@@ -34,6 +38,15 @@ pub enum Prompt {
     Add(String),
     /// Waiting for y/n before removing this label.
     Remove(String),
+    /// Choosing which of this account's gifted resets to use.
+    PickReset(String, Vec<limits::Gift>),
+    /// Waiting for y before spending this gifted reset of this account; the
+    /// second time (`again`) spends it.
+    UseReset {
+        label: String,
+        gift: limits::Gift,
+        again: bool,
+    },
 }
 
 impl State {
@@ -79,6 +92,10 @@ impl App<'_> {
         match self.accounts.prompt.take() {
             Some(Prompt::Add(input)) => return self.add_key(input, key),
             Some(Prompt::Remove(label)) => return self.remove_key(label, key),
+            Some(Prompt::PickReset(label, gifts)) => return self.pick_reset_key(label, gifts, key),
+            Some(Prompt::UseReset { label, gift, again }) => {
+                return self.use_reset_key(label, gift, again, key);
+            }
             None => {}
         }
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -109,6 +126,7 @@ impl App<'_> {
                 None => self.nothing_selected(),
             },
             KeyCode::Char('d') => self.ask_remove(),
+            KeyCode::Char('f') => self.ask_reset(),
             _ => Step::Idle,
         }
     }
@@ -148,6 +166,118 @@ impl App<'_> {
             }),
             _ => Step::Redraw,
         }
+    }
+
+    /// The selected account's gifted resets that the provider would honor now.
+    fn live_gifts(&self) -> Option<(String, Vec<limits::Gift>)> {
+        let s = self.selected_status()?;
+        let now = limits::unix_secs(SystemTime::now());
+        let gifts: Vec<limits::Gift> = s
+            .reading
+            .as_ref()?
+            .gifts
+            .iter()
+            .filter(|g| g.live(now) && g.usable_now)
+            .cloned()
+            .collect();
+        Some((s.account.label.clone(), gifts))
+    }
+
+    /// Starts using a gifted reset: picks it when there are several, then
+    /// asks twice.
+    fn ask_reset(&mut self) -> Step {
+        let Some((label, mut gifts)) = self.live_gifts() else {
+            return self.nothing_selected();
+        };
+        match gifts.len() {
+            0 => {
+                self.fail(format!("'{label}' has no free reset to use now."));
+                Step::Redraw
+            }
+            1 => {
+                let gift = gifts.remove(0);
+                self.accounts.prompt = Some(Prompt::UseReset {
+                    label,
+                    gift,
+                    again: false,
+                });
+                Step::Redraw
+            }
+            _ => {
+                self.accounts.prompt = Some(Prompt::PickReset(label, gifts));
+                Step::Redraw
+            }
+        }
+    }
+
+    fn pick_reset_key(
+        &mut self,
+        label: String,
+        mut gifts: Vec<limits::Gift>,
+        key: KeyEvent,
+    ) -> Step {
+        let picked = match key.code {
+            KeyCode::Char(c) => c.to_digit(10).map(|d| d as usize),
+            _ => None,
+        };
+        match picked {
+            Some(n) if (1..=gifts.len()).contains(&n) => {
+                let gift = gifts.swap_remove(n - 1);
+                self.accounts.prompt = Some(Prompt::UseReset {
+                    label,
+                    gift,
+                    again: false,
+                });
+            }
+            _ => {}
+        }
+        Step::Redraw
+    }
+
+    fn use_reset_key(
+        &mut self,
+        label: String,
+        gift: limits::Gift,
+        again: bool,
+        key: KeyEvent,
+    ) -> Step {
+        if !matches!(key.code, KeyCode::Char('y' | 'Y')) {
+            self.info(format!("Kept {label}'s {}.", reset_name(&gift)));
+            return Step::Redraw;
+        }
+        if !again {
+            self.accounts.prompt = Some(Prompt::UseReset {
+                label,
+                gift,
+                again: true,
+            });
+            return Step::Redraw;
+        }
+        let account = self.groups[self.accounts.focus]
+            .statuses
+            .iter()
+            .find(|s| s.account.label == label)
+            .map(|s| s.account.clone());
+        let Some(account) = account else {
+            self.fail(format!("'{label}' is gone."));
+            return Step::Redraw;
+        };
+        match crate::poll::claim(self.store, &account, &gift.id, SystemTime::now()) {
+            Ok(c) if c.result == "reset" => {
+                super::poll_now();
+                self.info(format!(
+                    "Used {label}'s {}: its limits are back to 0.",
+                    reset_name(&gift)
+                ));
+            }
+            Ok(c) => self.fail(format!(
+                "The provider did not reset '{label}': {}.",
+                c.result.replace('_', " ")
+            )),
+            Err(e) => self.fail(format!("Could not use {label}'s reset: {e}.")),
+        }
+        self.reload();
+        Step::Redraw
     }
 
     fn move_selection(&mut self, by: isize) -> Step {
@@ -334,6 +464,7 @@ impl App<'_> {
             now,
             view::Hints::Keys,
         );
+        let fleet = estimate::read(self.store, group.harness, &group.statuses, config, now);
         let mut header = vec![self.harnesses()];
         // The first header line names the harness; the selector says it.
         for row in block.header.iter().skip(1) {
@@ -388,13 +519,31 @@ impl App<'_> {
             let mut state = ListState::default().with_selected(Some(self.accounts.selected));
             frame.render_stateful_widget(list_widget, list, &mut state);
         }
+        // The estimate takes the bottom when the details still fit above it.
+        let (details, forecast) = match &fleet {
+            Some(_) if details.height >= DETAILS_HEIGHT + FORECAST_MIN => {
+                let [d, f] = Layout::vertical([
+                    Constraint::Length(DETAILS_HEIGHT),
+                    Constraint::Min(FORECAST_MIN),
+                ])
+                .areas(details);
+                (d, Some(f))
+            }
+            _ => (details, None),
+        };
         if let Some(s) = self.selected_status() {
             self.draw_details(frame, details, s, now);
+        }
+        if let (Some(f), Some(area)) = (&fleet, forecast) {
+            self.draw_forecast(frame, area, f, now);
         }
         self.draw_prompt(frame, message);
         match &self.accounts.prompt {
             Some(Prompt::Add(_)) => vec![("enter", "create"), ("esc", "cancel")],
             Some(Prompt::Remove(_)) => vec![("y", "remove"), ("n", "keep")],
+            Some(Prompt::PickReset(..)) => vec![("1-9", "choose"), ("esc", "cancel")],
+            Some(Prompt::UseReset { again: false, .. }) => vec![("y", "continue"), ("n", "keep")],
+            Some(Prompt::UseReset { again: true, .. }) => vec![("y", "use it"), ("n", "keep")],
             None => {
                 let other = match group.harness {
                     Harness::Claude => "codex",
@@ -404,7 +553,7 @@ impl App<'_> {
                     Some(s) if self.is_off(&s.account.label) => "enable",
                     _ => "disable",
                 };
-                vec![
+                let mut keys = vec![
                     ("↑↓", "move"),
                     ("←→", other),
                     ("enter", "use"),
@@ -413,7 +562,11 @@ impl App<'_> {
                     ("a", "add"),
                     ("l", "login"),
                     ("d", "remove"),
-                ]
+                ];
+                if self.live_gifts().is_some_and(|(_, g)| !g.is_empty()) {
+                    keys.push(("f", "free reset"));
+                }
+                keys
             }
         }
     }
@@ -446,6 +599,102 @@ impl App<'_> {
             self.bold(),
         ));
         Line::from(spans)
+    }
+
+    /// The next 7 days: the estimate's facts and a chart of the room left.
+    fn draw_forecast(&self, frame: &mut Frame, area: Rect, f: &estimate::Fleet, now: SystemTime) {
+        let facts = view::estimate_facts(f, now);
+        let mut lines: Vec<Line> = facts
+            .iter()
+            .map(|(name, value, tone)| {
+                Line::from(vec![
+                    Span::styled(format!(" {name:<13}"), self.dim()),
+                    Span::styled(value.clone(), self.tone(*tone)),
+                ])
+            })
+            .collect();
+        lines.push(Line::default());
+        lines.push(Line::styled(
+            " Room left under the threshold, in accounts: it drops as they are spent and jumps when one resets",
+            self.dim(),
+        ));
+        let title = Line::from(vec![
+            Span::raw("─ "),
+            Span::styled("Next 7 days", self.bold()),
+            Span::raw(" "),
+        ]);
+        let block = Block::new()
+            .borders(Borders::TOP)
+            .border_style(self.dim())
+            .title(title);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let [text, chart] =
+            Layout::vertical([Constraint::Length(lines.len() as u16), Constraint::Min(0)])
+                .areas(inner);
+        frame.render_widget(Paragraph::new(lines), text);
+        if chart.height < 5 {
+            return;
+        }
+        let top = f.curve.iter().map(|p| p.1).fold(1.0, f64::max).ceil();
+        let color = if f.runs_out.is_some() {
+            Color::Yellow
+        } else {
+            Color::Cyan
+        };
+        let data = Dataset::default()
+            .marker(symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(self.theme.fg(color))
+            .data(&f.curve);
+        let y_labels = [
+            "0".to_owned(),
+            format!("{:.0}", top / 2.0),
+            format!("{top:.0}"),
+        ];
+        let label_width = y_labels.iter().map(String::len).max().unwrap_or(1) as u16;
+        let [plot, axis] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(chart);
+        let widget = Chart::new(vec![data])
+            .x_axis(Axis::default().bounds([0.0, 168.0]).style(self.dim()))
+            .y_axis(
+                Axis::default()
+                    .bounds([0.0, top])
+                    .labels(y_labels.map(|l| Line::styled(l, self.dim())))
+                    .style(self.dim()),
+            );
+        frame.render_widget(widget, plot);
+        // Each day under its own place on the time axis: the plot starts
+        // after the labels and the axis line.
+        let start = usize::from(label_width) + 1;
+        let span = usize::from(plot.width).saturating_sub(start + 1).max(1);
+        let now_secs = limits::unix_secs(now);
+        let mut row = vec![' '; usize::from(axis.width)];
+        for d in 0..=7 {
+            let label = if d == 0 {
+                "now".to_owned()
+            } else {
+                view::clock(now_secs + d * 86_400, now)
+                    .split(' ')
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            let at = start + span * d as usize / 7;
+            let at = at.min(row.len().saturating_sub(label.len()));
+            for (k, c) in label.chars().enumerate() {
+                if let Some(cell) = row.get_mut(at + k) {
+                    *cell = c;
+                }
+            }
+        }
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                row.into_iter().collect::<String>(),
+                self.dim(),
+            )),
+            axis,
+        );
     }
 
     fn draw_details(&self, frame: &mut Frame, area: Rect, s: &Status, now: SystemTime) {
@@ -503,6 +752,35 @@ impl App<'_> {
                 (true, false) => resets.join(" · "),
             }),
         ));
+        for w in windows.iter().filter(|w| limits::is_scoped(&w.name)) {
+            let model = w.name.trim_start_matches("seven_day_");
+            let mut name = model.to_owned();
+            name[..1].make_ascii_uppercase();
+            rows.push((
+                "Model limit",
+                Line::raw(format!(
+                    "{name} weekly {} · other models are not affected",
+                    self::resets(w, now)
+                )),
+            ));
+        }
+        if let Some(r) = reading.filter(|r| !r.gifts.is_empty()) {
+            rows.push(("Free resets", Line::raw(gifts(&r.gifts, now))));
+        }
+        let threshold = self.config.for_harness(s.account.harness).threshold;
+        if let Some(p) = estimate::pace(s, threshold, now) {
+            let ending = match p.full_at {
+                Some(at) => format!("at that pace it fills by {}", view::clock(at, now)),
+                None => format!("at that pace it ends its week near {:.0} %", p.at_reset),
+            };
+            rows.push((
+                "Pace",
+                Line::raw(format!(
+                    "{:.1} % a day this week · {ending}",
+                    p.per_hour * 24.0
+                )),
+            ));
+        }
         // Only numbers have an age; a refusal or a limit error alone has none.
         if let Some(r) = reading.filter(|r| !r.windows.is_empty()) {
             rows.push(("Updated", Line::raw(view::age(r, now))));
@@ -565,6 +843,44 @@ impl App<'_> {
                 format!("Remove '{label}'? It signs out and deletes its directory. y/n"),
                 self.bold().patch(self.theme.fg(Color::Yellow)),
             ),
+            Some(Prompt::PickReset(label, gifts)) => {
+                let choices: Vec<String> = gifts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, g)| format!("{} {}", i + 1, gift_text(g)))
+                    .collect();
+                Line::styled(
+                    format!(
+                        "Which free reset of '{label}'?  {}  · esc cancels",
+                        choices.join("  ")
+                    ),
+                    self.bold().patch(self.theme.fg(Color::Yellow)),
+                )
+            }
+            Some(Prompt::UseReset {
+                label,
+                gift,
+                again: false,
+            }) => Line::styled(
+                format!(
+                    "Use {label}'s {} now? It clears {}. y/n",
+                    reset_name(gift),
+                    clears_text(gift)
+                ),
+                self.bold().patch(self.theme.fg(Color::Yellow)),
+            ),
+            Some(Prompt::UseReset {
+                label,
+                gift,
+                again: true,
+            }) => Line::styled(
+                format!(
+                    "Sure? This spends it for good: {label} keeps {} {} after. y to use it, any other key keeps it",
+                    gift.left.saturating_sub(1),
+                    if gift.left == 2 { "reset" } else { "resets" }
+                ),
+                self.bold().patch(self.theme.fg(Color::Red)),
+            ),
             None => return,
         };
         frame.render_widget(Paragraph::new(line), area);
@@ -588,6 +904,62 @@ impl App<'_> {
             Tone::Warn => self.theme.fg(Color::Yellow),
             Tone::Bad => self.theme.fg(Color::Red),
         }
+    }
+}
+
+/// `full reset` or `Fable reset`.
+fn reset_name(g: &limits::Gift) -> &'static str {
+    if g.clears_weekly() {
+        "full reset"
+    } else {
+        "Fable reset"
+    }
+}
+
+/// What a reset clears, in words.
+fn clears_text(g: &limits::Gift) -> &'static str {
+    if g.clears_weekly() {
+        "its 5-hour and weekly limits"
+    } else {
+        "its 5-hour limit and Fable's weekly limit"
+    }
+}
+
+/// `full reset (use by 10 Dec 2026)`.
+fn gift_text(g: &limits::Gift) -> String {
+    if g.ends_at == 0 {
+        reset_name(g).to_owned()
+    } else {
+        format!("{} (use by {})", reset_name(g), view::date(g.ends_at))
+    }
+}
+
+/// Rows the details of one account take, with their title.
+const DETAILS_HEIGHT: u16 = 14;
+/// The estimate's facts, the chart's caption and a chart worth reading.
+const FORECAST_MIN: u16 = 13;
+
+/// `1 full reset (use by 10 Dec 2026) · 1 Fable reset (use by 9 Mar 2027)`.
+fn gifts(gifts: &[limits::Gift], now: SystemTime) -> String {
+    let now_secs = limits::unix_secs(now);
+    let live: Vec<String> = gifts
+        .iter()
+        .filter(|g| g.live(now_secs))
+        .map(|g| {
+            let what = reset_name(g);
+            let by = if g.ends_at == 0 {
+                String::new()
+            } else {
+                format!(" by {}", view::date(g.ends_at))
+            };
+            let not_now = if g.usable_now { "" } else { ", not usable now" };
+            format!("{} {what} (use{by}{not_now})", g.left)
+        })
+        .collect();
+    if live.is_empty() {
+        "none left".to_owned()
+    } else {
+        live.join(" · ")
     }
 }
 

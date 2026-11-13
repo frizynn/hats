@@ -7,7 +7,8 @@ use std::time::SystemTime;
 use crate::account::Harness;
 use crate::auto::Status;
 use crate::config::{HarnessConfig, Mode, Strategy};
-use crate::limits::{LIMIT_HOLD, LimitWindow, Reading, unix_secs};
+use crate::estimate::Fleet;
+use crate::limits::{LIMIT_HOLD, LimitWindow, Reading, is_scoped, unix_secs};
 use crate::policy::{self, Reason};
 use crate::registry::Change;
 
@@ -69,6 +70,25 @@ pub struct Block {
     pub accounts: Vec<Vec<Row>>,
 }
 
+impl Block {
+    /// Adds the estimate under the sentence on auto mode, above the titles.
+    pub fn with_estimate(mut self, fleet: Option<&Fleet>, width: usize, now: SystemTime) -> Self {
+        if let Some(f) = fleet {
+            let tone = if f.runs_out.is_some() {
+                Tone::Warn
+            } else {
+                Tone::Plain
+            };
+            let at = self.header.len().saturating_sub(1);
+            let rows: Vec<Row> = wrap(&estimate_sentence(f, now), width)
+                .map(|line| vec![cell(line, tone)])
+                .collect();
+            self.header.splice(at..at, rows);
+        }
+        self
+    }
+}
+
 /// Column widths, shared by the blocks on one screen so they line up.
 pub struct Layout {
     width: usize,
@@ -80,6 +100,8 @@ pub struct Layout {
     /// Who it is goes under the account when it has no column; the
     /// interactive view shows it apart instead.
     second_line: bool,
+    /// Windows of one model, such as `seven_day_fable`: a column each.
+    models: Vec<String>,
 }
 
 impl Layout {
@@ -88,15 +110,24 @@ impl Layout {
         width: usize,
     ) -> Self {
         let (mut label, mut who) = ("ACCOUNT".len(), "SIGNED IN AS".len());
+        let mut models: Vec<String> = Vec::new();
         for (harness, config, statuses) in groups {
             for s in statuses {
+                for w in s.reading.iter().flat_map(|r| &r.windows) {
+                    if is_scoped(&w.name) && !models.contains(&w.name) {
+                        models.push(w.name.clone());
+                    }
+                }
                 let off = if is_off(config, s) { OFF.len() } else { 0 };
                 label = label.max(s.account.label.chars().count() + off);
                 who = who.max(self::who(s, harness).chars().count());
             }
         }
-        // Marker, label, two windows, age, and the gaps between them.
-        let fixed = 2 + label + 3 * GAP.len() + 2 * WINDOW_TEXT + GAP.len() + AGE_WIDTH;
+        models.sort();
+        let model_cols: usize = models.iter().map(|m| model_width(m) + GAP.len()).sum();
+        // Marker, label, two windows, the models, age, and the gaps between them.
+        let fixed =
+            2 + label + 3 * GAP.len() + 2 * WINDOW_TEXT + GAP.len() + AGE_WIDTH + model_cols;
         let bars = |room: usize| room / 2;
         let wide = fixed + who + GAP.len();
         if width >= wide + 2 * 6 {
@@ -106,6 +137,7 @@ impl Layout {
                 who: Some(who),
                 bar: bars(width - wide).min(10),
                 second_line: true,
+                models,
             }
         } else {
             Self {
@@ -114,6 +146,7 @@ impl Layout {
                 who: None,
                 bar: bars(width.saturating_sub(fixed)).clamp(3, 10),
                 second_line: true,
+                models,
             }
         }
     }
@@ -127,6 +160,16 @@ impl Layout {
     fn window(&self) -> usize {
         self.bar + WINDOW_TEXT
     }
+}
+
+/// `FABLE` for `seven_day_fable`.
+fn model_title(name: &str) -> String {
+    name.trim_start_matches("seven_day_").to_uppercase()
+}
+
+/// A model's column: its title, or ` 100%`.
+fn model_width(name: &str) -> usize {
+    model_title(name).len().max(5)
 }
 
 /// Follows the label of an account auto switching never moves to.
@@ -166,6 +209,67 @@ pub fn title(harness: Harness) -> &'static str {
         Harness::Claude => "CLAUDE CODE",
         Harness::Codex => "CODEX",
     }
+}
+
+/// The estimate as short facts: a name, its value and how it looks.
+pub fn estimate_facts(f: &Fleet, now: SystemTime) -> Vec<(&'static str, String, Tone)> {
+    let basis = match f.measured_over {
+        Some(secs) if secs >= 2 * 86_400 => format!("measured over {} days", secs / 86_400),
+        Some(secs) => format!("measured over {} h", secs / 3600),
+        None => "at least; measured after a day of history".to_owned(),
+    };
+    let mut facts = vec![
+        (
+            "Spends",
+            format!("{:.1} accounts a week ({basis})", f.accounts_a_week()),
+            Tone::Plain,
+        ),
+        (
+            "Room now",
+            format!("{:.1} of {} accounts", f.room, f.accounts),
+            Tone::Plain,
+        ),
+    ];
+    facts.push(match f.runs_out {
+        None => (
+            "Lasts",
+            "the whole week at this pace".to_owned(),
+            Tone::Good,
+        ),
+        Some(out) => {
+            let gifts = match (f.full_gifts, f.runs_out_with_gifts) {
+                (0, _) => String::new(),
+                (_, Some(t)) => format!(" · free resets stretch it to {}", clock(t, now)),
+                (_, None) => " · free resets cover the rest of the week".to_owned(),
+            };
+            (
+                "Lasts",
+                format!("until {}{gifts}", clock(out, now)),
+                Tone::Warn,
+            )
+        }
+    });
+    if f.full_gifts > 0 {
+        facts.push((
+            "Free resets",
+            format!(
+                "{} full {} unused",
+                f.full_gifts,
+                if f.full_gifts == 1 { "reset" } else { "resets" }
+            ),
+            Tone::Plain,
+        ));
+    }
+    facts
+}
+
+/// The estimate on one line, for `hats list`.
+pub fn estimate_sentence(f: &Fleet, now: SystemTime) -> String {
+    let facts: Vec<String> = estimate_facts(f, now)
+        .into_iter()
+        .map(|(name, value, _)| format!("{} {value}", name.to_lowercase()))
+        .collect();
+    format!("Next 7 days: {}", facts.join(" · "))
 }
 
 /// What auto mode does, in one sentence.
@@ -213,10 +317,11 @@ pub fn block(
         titles += &format!("{:<w$}{GAP}", "SIGNED IN AS");
     }
     let w = layout.window();
-    titles += &format!(
-        "{:<w$}{GAP}{:<w$}{GAP}UPDATED",
-        "5-HOUR LIMIT", "WEEKLY LIMIT"
-    );
+    titles += &format!("{:<w$}{GAP}{:<w$}{GAP}", "5-HOUR LIMIT", "WEEKLY LIMIT");
+    for m in &layout.models {
+        titles += &format!("{:<w$}{GAP}", model_title(m), w = model_width(m));
+    }
+    titles += "UPDATED";
     header.push(vec![cell(titles, Tone::Dim)]);
 
     let accounts = statuses
@@ -309,6 +414,24 @@ fn state(
         }
         row.push(cell(GAP, Tone::Plain));
     }
+    for m in &layout.models {
+        let w = model_width(m);
+        match r.windows.iter().find(|x| &x.name == m) {
+            Some(x) => {
+                let used = used_now(x, now);
+                row.push(cell(
+                    format!("{:>w$}", format!("{used:.0}%")),
+                    if stale || x.resets_at <= unix_secs(now) {
+                        Tone::Dim
+                    } else {
+                        level(used, config.threshold)
+                    },
+                ));
+            }
+            None => row.push(cell(format!("{:>w$}", "–"), Tone::Dim)),
+        }
+        row.push(cell(GAP, Tone::Plain));
+    }
     row.push(cell(
         age(r, now),
         if stale { Tone::Dim } else { Tone::Plain },
@@ -394,6 +517,21 @@ pub fn clock(secs: i64, now: SystemTime) -> String {
         const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
         format!("{} {hm}", DAYS[at.tm_wday.rem_euclid(7) as usize])
     }
+}
+
+/// A local date: `10 Dec 2026`.
+pub fn date(secs: i64) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    local(secs).map_or_else(String::new, |t| {
+        format!(
+            "{} {} {}",
+            t.tm_mday,
+            MONTHS[t.tm_mon.rem_euclid(12) as usize],
+            t.tm_year + 1900
+        )
+    })
 }
 
 /// How old a reading is: `just now`, `5 min ago`, `3 h ago`, `2 days ago`.

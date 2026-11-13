@@ -46,7 +46,7 @@ fn account(store: &Store, label: &str, used: Option<f64>) -> Account {
             resets_at: unix_secs(now) + 3600,
         };
         let windows = vec![window("five_hour", used), window("seven_day", 12.0)];
-        limits::save(store, &account, &id, windows, now).unwrap();
+        limits::save(store, &account, &id, windows, None, now).unwrap();
     }
     account
 }
@@ -191,6 +191,133 @@ fn accounts_show_one_line_each_and_the_selected_ones_details() {
     let screen = text(&mut app);
     assert!(screen.contains("No codex accounts yet"), "{screen}");
     assert!(screen.lines().last().unwrap().contains("←→ claude"));
+}
+
+#[test]
+fn a_model_limit_and_gifted_resets_show_and_outlive_the_status_line() {
+    let (_dir, store) = sandbox();
+    let work = account(&store, "work", Some(42.0));
+    let id = work.provider_id(&store).unwrap().unwrap();
+    auto::choose(&store, &work, &id, SystemTime::now()).unwrap();
+    let now = SystemTime::now();
+    let at = |hours: i64| unix_secs(now) + hours * 3600;
+    let window = |name: &str, used_percent, resets_at| LimitWindow {
+        name: name.to_owned(),
+        used_percent,
+        resets_at,
+    };
+    let gift = limits::Gift {
+        id: "full-reset-2611".to_owned(),
+        label: "One full limit reset".to_owned(),
+        left: 1,
+        total: 1,
+        ends_at: at(24 * 20),
+        clears: vec!["five_hour".to_owned(), "seven_day".to_owned()],
+        usable_now: true,
+    };
+    // What a poll reads from the provider.
+    let polled = vec![
+        window("five_hour", 42.0, at(1)),
+        window("seven_day", 50.0, at(24 * 3)),
+        window("seven_day_fable", 99.0, at(24 * 3)),
+    ];
+    limits::save(&store, &work, &id, polled, Some(vec![gift]), now).unwrap();
+    // The status line knows only two windows and no gifts.
+    let repaint = vec![
+        window("five_hour", 43.0, at(1)),
+        window("seven_day", 50.0, at(24 * 3)),
+    ];
+    limits::save(&store, &work, &id, repaint, None, now).unwrap();
+
+    let mut app = App::new(&store, DARK);
+    let screen = text_at(&mut app, 160, 50);
+    assert!(line_with(&screen, "ACCOUNT").contains("FABLE"), "{screen}");
+    assert!(line_with(&screen, "▌ ● work").contains(" 99%"), "{screen}");
+    assert!(line_with(&screen, "Model limit").contains("Fable weekly 99 % until"));
+    assert!(line_with(&screen, "Free resets").contains("1 full reset (use by"));
+    assert!(
+        line_with(&screen, "Pace").contains("% a day this week"),
+        "{screen}"
+    );
+    // The estimate sits at the bottom, with its chart over the next 7 days.
+    assert!(
+        line_with(&screen, "Next 7 days").starts_with("─"),
+        "{screen}"
+    );
+    assert!(line_with(&screen, "Spends").contains("accounts a week"));
+    assert!(line_with(&screen, "Lasts").contains("the whole week"));
+    assert!(line_with(&screen, "  now ").contains("Thu") || screen.contains(" now "));
+    // A full Fable limit alone does not count the account as full.
+    let statuses = auto::statuses(&store, Harness::Claude, &config(&store).claude).unwrap();
+    let work = statuses.iter().find(|s| s.account.label == "work").unwrap();
+    assert_eq!(work.used(now), Some(50.0));
+}
+
+#[test]
+fn a_free_reset_asks_twice_and_any_other_key_keeps_it() {
+    let (_dir, store) = sandbox();
+    let work = account(&store, "work", Some(42.0));
+    let id = work.provider_id(&store).unwrap().unwrap();
+    let now = SystemTime::now();
+    let gift = |id: &str, clears: &[&str]| limits::Gift {
+        id: id.to_owned(),
+        label: id.to_owned(),
+        left: 1,
+        total: 1,
+        ends_at: unix_secs(now) + 86_400 * 20,
+        clears: clears.iter().map(|c| (*c).to_owned()).collect(),
+        usable_now: true,
+    };
+    let windows = vec![LimitWindow {
+        name: "seven_day".to_owned(),
+        used_percent: 97.0,
+        resets_at: unix_secs(now) + 3600,
+    }];
+    let gifts = vec![
+        gift("full", &["five_hour", "seven_day"]),
+        gift("fable", &["five_hour", "seven_day_overage_included"]),
+    ];
+    limits::save(&store, &work, &id, windows, Some(gifts), now).unwrap();
+
+    let mut app = App::new(&store, DARK);
+    assert!(
+        text(&mut app)
+            .lines()
+            .last()
+            .unwrap()
+            .contains("f free reset")
+    );
+    app.on_key(key(KeyCode::Char('f')));
+    let screen = text_at(&mut app, 160, 40);
+    assert!(
+        line_with(&screen, "Which free reset of 'work'?").contains("1 full reset (use by"),
+        "{screen}"
+    );
+    app.on_key(key(KeyCode::Char('1')));
+    let screen = text_at(&mut app, 160, 40);
+    assert!(line_with(&screen, "Use work's full reset now?").contains("5-hour and weekly"));
+    app.on_key(key(KeyCode::Char('y')));
+    let screen = text_at(&mut app, 160, 40);
+    assert!(line_with(&screen, "Sure? This spends it for good").contains("keeps 0 resets"));
+    // Anything but y at the last step keeps it, and nothing was sent.
+    app.on_key(key(KeyCode::Char('n')));
+    let screen = text_at(&mut app, 160, 40);
+    assert!(screen.contains("Kept work's full reset."), "{screen}");
+    assert!(!screen.contains("Sure?"));
+}
+
+#[test]
+fn f_shows_only_on_an_account_with_a_reset_to_use() {
+    let (_dir, store) = sandbox();
+    account(&store, "work", Some(42.0));
+    let mut app = App::new(&store, DARK);
+    let screen = text(&mut app);
+    assert!(
+        !screen.lines().last().unwrap().contains("free reset"),
+        "{screen}"
+    );
+    app.on_key(key(KeyCode::Char('f')));
+    assert!(text(&mut app).contains("'work' has no free reset to use now."));
 }
 
 #[test]
