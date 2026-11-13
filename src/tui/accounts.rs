@@ -168,7 +168,7 @@ impl App<'_> {
         }
     }
 
-    /// The selected account's gifted resets that can still be used.
+    /// The selected account's gifted resets that the provider would honor now.
     fn live_gifts(&self) -> Option<(String, Vec<limits::Gift>)> {
         let s = self.selected_status()?;
         let now = limits::unix_secs(SystemTime::now());
@@ -177,7 +177,7 @@ impl App<'_> {
             .as_ref()?
             .gifts
             .iter()
-            .filter(|g| g.live(now))
+            .filter(|g| g.live(now) && g.usable_now)
             .cloned()
             .collect();
         Some((s.account.label.clone(), gifts))
@@ -191,7 +191,7 @@ impl App<'_> {
         };
         match gifts.len() {
             0 => {
-                self.fail(format!("'{label}' has no free resets left."));
+                self.fail(format!("'{label}' has no free reset to use now."));
                 Step::Redraw
             }
             1 => {
@@ -553,7 +553,7 @@ impl App<'_> {
                     Some(s) if self.is_off(&s.account.label) => "enable",
                     _ => "disable",
                 };
-                vec![
+                let mut keys = vec![
                     ("↑↓", "move"),
                     ("←→", other),
                     ("enter", "use"),
@@ -562,8 +562,11 @@ impl App<'_> {
                     ("a", "add"),
                     ("l", "login"),
                     ("d", "remove"),
-                    ("f", "free reset"),
-                ]
+                ];
+                if self.live_gifts().is_some_and(|(_, g)| !g.is_empty()) {
+                    keys.push(("f", "free reset"));
+                }
+                keys
             }
         }
     }

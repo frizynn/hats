@@ -280,6 +280,13 @@ fn a_free_reset_asks_twice_and_any_other_key_keeps_it() {
     limits::save(&store, &work, &id, windows, Some(gifts), now).unwrap();
 
     let mut app = App::new(&store, DARK);
+    assert!(
+        text(&mut app)
+            .lines()
+            .last()
+            .unwrap()
+            .contains("f free reset")
+    );
     app.on_key(key(KeyCode::Char('f')));
     let screen = text_at(&mut app, 160, 40);
     assert!(
@@ -297,6 +304,20 @@ fn a_free_reset_asks_twice_and_any_other_key_keeps_it() {
     let screen = text_at(&mut app, 160, 40);
     assert!(screen.contains("Kept work's full reset."), "{screen}");
     assert!(!screen.contains("Sure?"));
+}
+
+#[test]
+fn f_shows_only_on_an_account_with_a_reset_to_use() {
+    let (_dir, store) = sandbox();
+    account(&store, "work", Some(42.0));
+    let mut app = App::new(&store, DARK);
+    let screen = text(&mut app);
+    assert!(
+        !screen.lines().last().unwrap().contains("free reset"),
+        "{screen}"
+    );
+    app.on_key(key(KeyCode::Char('f')));
+    assert!(text(&mut app).contains("'work' has no free reset to use now."));
 }
 
 #[test]
